@@ -5,7 +5,7 @@
 3. `bash telegram-dispatcher/tasks.sh next` 找下一個可做的 task。
 4. 讀該 task 的 `description`／`acceptance_criteria`／`risk_notes` 三個欄位（`risk_notes` 常附真實案例或 file:line，不是空話）。
 5. `bash telegram-dispatcher/tasks.sh set <id> in_progress`。
-6. 實作，完成後逐條對照 `acceptance_criteria` 驗證。
+6. 實作，完成後逐條對照 `acceptance_criteria` 驗證；標 done 前先派至少三個 review agents 檢驗、並實際跑起來測試（高風險 task 先跟我討論怎麼測，別自己單方面決定）——完整規則見 HOW-TO-CONTINUE.md。
 7. `bash telegram-dispatcher/tasks.sh set <id> done`（卡住做不完就 `blocked`，並講清楚卡在哪）。
 8. commit（程式碼＋tasks.json 狀態變更一起，訊息開頭帶 task id）。
 9. 可以一次做多個 task（重複 3–8），直到沒有可做的、或告一段落。
