@@ -134,7 +134,7 @@
       "id": "T6",
       "module": "notion-integration",
       "title": "以人為單位查詢 Notion 候選單（people.contains）",
-      "status": "todo",
+      "status": "done",
       "depends_on": [
         "T1"
       ],
