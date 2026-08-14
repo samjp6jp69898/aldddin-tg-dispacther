@@ -1,9 +1,12 @@
 // Telegram dispatcher — webhook server 入口。
-// 白名單、inline keyboard、認領流程等留給後續 task（見 tasks.json）。
+// inline keyboard、認領流程等留給後續 task（見 tasks.json）。
 
 import { Hono } from 'hono'
 import { webhookCallback } from 'grammy'
 import { bot } from './lib/webhook-server/bot.ts'
+import { registerHandlers } from './lib/security/whitelist.ts'
+
+registerHandlers(bot)
 
 const app = new Hono()
 

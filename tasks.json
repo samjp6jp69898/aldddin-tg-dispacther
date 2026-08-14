@@ -85,7 +85,7 @@
       "id": "T3",
       "module": "security",
       "title": "chat_id 白名單檢查",
-      "status": "todo",
+      "status": "done",
       "depends_on": [
         "T2"
       ],
