@@ -31,6 +31,10 @@
     {
       "date": "2026-08-14",
       "note": "T12 review（3 agent）挖到一個真實 bug 並修正：分類器原本把 result.includes(\"SKIPPED\") 放第一位無條件判斷，會被 create-mr.md Step 9 完成報告裡「chat_id 同步: {tg_chatid_sync_result}」這行誤觸——這個中繼變數在沒有新 chat_id 要同步時就是字面 SKIPPED，跟真正的早退 SKIPPED（Step 0.1/0.5）是兩件事，結果導致完全成功/failed/needs_qa 的 pipeline 只要當次 chat_id 同步剛好無新資料，就會被整個誤判成 skipped。改成用錨定 regex（/^- Pipeline status:\\s*(\\S+)/m）直接抓 Step 9 模板固定那行的值來判斷，不再依賴子字串比對順序，真正的早退 SKIPPED 用 startsWith(\"SKIPPED:\") 錨定辨識。同時採納 review 建議治本：T11 的 spawnDetachedProcess 改成 stdout/stderr 分開寫成兩個獨立檔案（原本共用一個 log 檔，--output-format json 的 stdout 保證是單一乾淨 JSON，混了 stderr 雜訊才需要脆弱的正則去猜 JSON 邊界，那個正則本身也被 review 實測證實會誤判），T12 直接對純 stdout 內容 JSON.parse，移除了原本的 regex fallback。另外用 events.find(type===\"result\") 取代原本依賴陣列最後一個 index 的寫法。已補一份 lib/pipeline-runner/classify-result.test.ts（Bun 內建 test runner，零額外依賴）留在 repo 供回歸測試。T13 risk_notes 補記兩個 review 發現的設計缺口：(1) T13 現有描述沒提到 infra_failure/cli_failure 這兩類要不要補發通知；(2) success 標籤底下的 already_fixed/i18n_manual_handoff 子情況 create-mr 內部不會主動發 TG，T13 不能只看 success 標籤就斷定已通知過。"
+    },
+    {
+      "date": "2026-08-14",
+      "note": "T13 實作前跟使用者確認兩點並定案：(1) T12 補記的 infra_failure/cli_failure 併入補發通知範圍（跟 unknown_failure/skipped 同一組，理由：CLI 這層都沒跑完，create-mr 更沒機會通知）；(2) release 鎖延續 T11 review 的結論，改成 bash EXIT trap 內的安全網呼叫（idempotent、對已釋放的 ticket 是 no-op），不是唯一釋放點——create-mr.md Step 8 本身仍是主要釋放點，trap 只補 claude -p 被 timeout/crash 打斷、create-mr 根本跑不到自己 Step 8 的那個縫。already_fixed/i18n_manual_handoff 子情況：判定沿用 'failed' 既有邏輯（create-mr 只留 Notion 留言、不發 TG 的都不重複補發），非本次新決策，不需要另外問使用者。實作改用 bash -c 位置參數（$1/$2）包住原本直接 spawn 的 timeout+claude，避免 Node 側監聽 child exit（那樣會綁定 webhook server 存活與否，違背 T11 detached+unref 的設計初衷）。新增 lib/pipeline-runner/post-run-notify.ts 做分類讀取＋條件式補發，其 execFileSync 呼叫（resolve-reviewer.sh／tg-notify.sh）依 review 建議加上 30s timeout（兩支腳本內部的 curl 都沒有 --max-time，避免無上界卡住）。實測：手動建構 3 個情境腳本（timeout 124、payload 被 kill -9 導致 137、正常 exit 0）驗證 EXIT trap 皆觸發、bug-lock.sh release 皆生效（用 status 驗證鎖從 LOCKED 轉 FREE）、stdout log 未被 trap 自身輸出污染；並用真實 Notion 資料（FAQ-4616，指派給使用者本人）跑過 infra_failure 與 skipped 兩種分類的端對端補發，真的呼叫 tg-notify.sh 送到使用者本人 chat_id（經使用者本人在 AskUserQuestion 同意這個測試方式）；另用不存在的假單號驗證『解析不到 assignee 就記 log 放棄、不丟例外』的路徑。已知未處理限制（記錄在 post-run-notify.ts 註解，非本 task 範圍）：mr-pusher push 成功但 glab mr create 失敗的部分成功情境，Step 9 報告的 Pipeline status 仍是 success，不會被本 task 的補發邏輯攔到。"
     }
   ],
   "architecture_summary": "Telegram → ngrok 固定 domain (unrefreshing-trudy-subsequently.ngrok-free.dev) → 本機常駐 Bun+Hono+grammy webhook server（獨立 TG_DISPATCH_BOT_TOKEN，走 grammy 官方 'hono' adapter + secretToken 驗證）→ chat_id 白名單（tech-users.csv）→ 反查 notion_user_id → 用 people.contains filter 正向查該人在 Notion Bug List 的候選單並以 Notion『狀態』欄位（仍有問題/待處理）為唯一可認領判準（僅走 scripts/notion.sh；不再拿 tracker.sh row 的 pending/rerun 狀態做二次篩選——這是使用者明確定案，見 changelog）→ inline keyboard 呈現（Bug 工單 + 需求池 UI 佔位，後者按下固定回「開發中」不接查詢）→ 使用者按下工單 → 同步 bug-lock.sh claim（mkdir 原子鎖，單一 syscall 無 TOCTOU，per-ticket 鎖仍保留，防兩人重複認領同一張單）→ 成功才回「已開始」，先幫這張單同步一行到 tracker.md（純技術性，滿足 /create-mr 內部 Step 0 既有的 tracker 存在性檢查，dispatcher 自己完全不讀這個狀態），再 fire-and-forget 背景 spawn `claude -p \"/create-mr {ticket}\" --permission-mode bypassPermissions`（cwd=某個為此次觸發全新建立、完全獨立的 worktree，所有涉及 repo 含 rajah 一律真隔離不走 symlink，stdio 明確導向檔案，外包 timeout，避免 pipe buffer deadlock 與無限期卡死）→ webhook handler 立即返回，不維護 job 狀態、不輪詢 → 背景 process 用 trap 保證無論成功/失敗/中斷都執行 bug-lock.sh release、刪除該次 worktree（保留 git 分支），並解析 claude -p 輸出分類結果，只在 create-mr 自己不會通知的情境（未知失敗、Step 0.1/0.5 早退 SKIPPED）用 tg-notify.sh 補發通知，避免重複騷擾。Notion 狀態/留言寫回全由 create-mr pipeline 既有 agent 負責，dispatcher 不碰。上線（launchd 常駐 + ngrok tunnel + 對 Telegram 註冊 webhook）是唯一需要使用者最終確認的步驟，且必須排在所有程式模組完成、安全檢查通過、且做過一次真實 dry-run 之後。",
@@ -267,7 +271,7 @@
       "id": "T13",
       "module": "notify",
       "title": "背景流程收尾：release 鎖 + 條件式補發通知",
-      "status": "todo",
+      "status": "done",
       "depends_on": [
         "T12"
       ],
