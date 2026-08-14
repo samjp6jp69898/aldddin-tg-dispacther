@@ -19,10 +19,16 @@ const TICKET_RE = /^FAQ-\d+$/
  * webhook server process（review 實測驗證過）。這裡接住並寫進獨立的錯誤
  * log，換掉「整台 bot 陪葬」的後果。
  */
-export function spawnDetachedProcess(command: string, args: string[], opts: { cwd: string; logPath: string }): number | undefined {
-  mkdirSync(dirname(opts.logPath), { recursive: true })
-  const outFd = openSync(opts.logPath, 'a')
-  const errFd = openSync(opts.logPath, 'a')
+export function spawnDetachedProcess(command: string, args: string[], opts: { cwd: string; stdoutPath: string; stderrPath: string }): number | undefined {
+  // stdout/stderr 分開兩個檔案（不是同一個檔案輪流寫）：--output-format json
+  // 的 stdout 保證是單一乾淨的 JSON 陣列（實測驗證過），跟 stderr 雜訊混在
+  // 同一檔會讓 T12 的分類器得用脆弱的正則去猜 JSON 邊界，遇到雜訊裡剛好有
+  // 方括號（如 `[HH:MM:SS]`、`[eslint]` 這類常見前綴）就可能誤判——分開寫
+  // 從根本解掉這個問題，T12 直接 JSON.parse(stdout 內容) 即可。
+  mkdirSync(dirname(opts.stdoutPath), { recursive: true })
+  mkdirSync(dirname(opts.stderrPath), { recursive: true })
+  const outFd = openSync(opts.stdoutPath, 'a')
+  const errFd = openSync(opts.stderrPath, 'a')
 
   const child = spawn(command, args, {
     cwd: opts.cwd,
@@ -60,11 +66,15 @@ export function spawnCreateMr(ticket: string): number | undefined {
   }
 
   const timestamp = new Date().toISOString().replace(/[:.]/g, '-')
-  const logPath = join(LOG_DIR, `${ticket}.${timestamp}.log`)
+  const base = `${ticket}.${timestamp}`
 
   return spawnDetachedProcess(
     'timeout',
     ['3600', 'claude', '-p', `/create-mr ${ticket}`, '--permission-mode', 'bypassPermissions', '--output-format', 'json'],
-    { cwd: '/Users/user/aladdin', logPath },
+    {
+      cwd: '/Users/user/aladdin',
+      stdoutPath: join(LOG_DIR, `${base}.stdout.log`),
+      stderrPath: join(LOG_DIR, `${base}.stderr.log`),
+    },
   )
 }
