@@ -18,7 +18,11 @@ console.error(`telegram-dispatcher: bot initialized as @${bot.botInfo.username}`
 
 const app = new Hono()
 
-app.get('/', c => c.text('telegram-dispatcher: placeholder ok', 200))
+// T19 review 順帶發現並修正：這裡原本回明文 'telegram-dispatcher: placeholder
+// ok'——跟 webhook 路徑、/health 一樣不驗證任何東西，卻直接把專案名稱洩漏
+// 出去，讓 /health 刻意不透露身分的用心失去意義（換個路徑就查得到）。跟
+// /health 一致，只回最基本、不帶專案識別資訊的內容。
+app.get('/', c => c.text('ok', 200))
 
 // T19：跟 webhook 路徑不同，這個 endpoint 刻意不驗證 secret_token（供外部
 // 監控探測），內容只能是最基本的存活資訊——絕不能出現 ticket 編號、
