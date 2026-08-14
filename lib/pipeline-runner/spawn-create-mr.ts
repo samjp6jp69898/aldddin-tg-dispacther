@@ -19,7 +19,11 @@ const TICKET_RE = /^FAQ-\d+$/
  * webhook server process（review 實測驗證過）。這裡接住並寫進獨立的錯誤
  * log，換掉「整台 bot 陪葬」的後果。
  */
-export function spawnDetachedProcess(command: string, args: string[], opts: { cwd: string; stdoutPath: string; stderrPath: string }): number | undefined {
+export function spawnDetachedProcess(
+  command: string,
+  args: string[],
+  opts: { cwd: string; stdoutPath: string; stderrPath: string; env?: NodeJS.ProcessEnv },
+): number | undefined {
   // stdout/stderr 分開兩個檔案（不是同一個檔案輪流寫）：--output-format json
   // 的 stdout 保證是單一乾淨的 JSON 陣列（實測驗證過），跟 stderr 雜訊混在
   // 同一檔會讓 T12 的分類器得用脆弱的正則去猜 JSON 邊界，遇到雜訊裡剛好有
@@ -34,6 +38,14 @@ export function spawnDetachedProcess(command: string, args: string[], opts: { cw
     cwd: opts.cwd,
     stdio: ['ignore', outFd, errFd],
     detached: true,
+    // T16 需要多帶 DISPATCHER_TRIGGERED 這一個 key，這裡永遠明確展開
+    // { ...process.env, ...opts.env }（不是把 env 設成 undefined 交給
+    // runtime 預設），確保 TG_DISPATCH_BOT_TOKEN 這類既有必要環境變數不會
+    // 被意外丟掉。刻意不依賴「省略 env 時預設繼承」這個行為：這個專案實際
+    // 跑在 Bun 上，Bun 的 spawn 對「省略/undefined」的 env 走的是行程啟動
+    // 時的環境快照（不是呼叫當下即時讀 process.env），跟 Node 的語意不完全
+    // 一樣（review 實測發現）——明確展開才是兩邊 runtime 都驗證過正確的寫法。
+    env: opts.env ? { ...process.env, ...opts.env } : undefined,
   })
 
   // fd 已經 dup2 進子行程、子行程有自己的獨立複本——parent 這邊用不到了，
@@ -89,8 +101,12 @@ timeout 3600 claude -p "/create-mr $1" --permission-mode bypassPermissions --out
  * T11：CLAIMED 後 fire-and-forget 觸發 /create-mr 背景流程。
  * cwd 維持 /Users/user/aladdin（不是 dispatcher 自己建 worktree）——實際的
  * worktree 建立仍由 /create-mr 內部呼叫既有的 setup-worktree.sh 完成；T16
- * 規範的『全部涉及 repo 真隔離』透過調整 setup-worktree.sh 達成，不是本函式
- * 的職責。用 timeout 外包逾時（claude -p 本身無內建 timeout/輪次上限）——
+ * 規範的『全部涉及 repo 真隔離』主要邏輯在 setup-worktree.sh 那邊（AFFECTED
+ * 強制展開成全部 MAIN_REPOS），本函式只負責傳遞 DISPATCHER_TRIGGERED=1 這個
+ * 訊號——env 沿著 bash 子行程繼承鏈一路傳下去（spawn 的 bash → claude -p →
+ * 它自己執行 Step 4 setup-worktree.sh 時的 Bash 呼叫），不需要改
+ * create-mr.md 呼叫 setup-worktree.sh 的語法本身。用 timeout 外包逾時
+ * （claude -p 本身無內建 timeout/輪次上限）——
  * 這裡的 timeout 是 GNU coreutils 版本，macOS 原生不附，本機透過 Homebrew
  * 安裝（`brew install coreutils`，通常在 /opt/homebrew/bin/timeout）；缺失時
  * `timeout`/`claude` command not found 是 bash script **內部**執行才知道的事
@@ -120,5 +136,10 @@ export function spawnCreateMr(ticket: string): number | undefined {
     cwd: '/Users/user/aladdin',
     stdoutPath,
     stderrPath,
+    // T16：告訴這條背景流程「我是被 dispatcher 觸發的」，setup-worktree.sh
+    // 收到這個訊號後強制全部 repo 真隔離（見該腳本內對應註解），根除多人
+    // 同時觸發時共用主 repo symlink 的 bootstrap 碰撞風險。單線 /create-mr、
+    // /create-mrs 不會設這個環境變數，行為不受影響。
+    env: { DISPATCHER_TRIGGERED: '1' },
   })
 }
