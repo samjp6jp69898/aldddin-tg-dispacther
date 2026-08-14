@@ -1,5 +1,6 @@
 import type { Bot } from 'grammy'
 import { resolveTechUserByChatId } from '../user-resolution/tech-user.ts'
+import { sendTopLevelMenu } from '../webhook-server/top-menu.ts'
 import { sendTicketList } from '../webhook-server/ticket-list.ts'
 import { handleReqPoolNoop } from '../webhook-server/reqpool.ts'
 import { handleClaim } from '../locking/claim.ts'
@@ -11,8 +12,9 @@ import { handleClaim } from '../locking/claim.ts'
 /**
  * 掛載 bot.on('message') 與 bot.on('callback_query:data')，白名單外的 chat_id
  * 一律靜默 return，不執行任何後續 Notion/tracker 查詢或 keyboard 組裝。
- * 白名單內的 chat_id 通過後往下流動——callback_query 依 callback_data 分流
- * reqpool:noop（T9）/ claim:{ticket}（T10）。
+ * 白名單內的 chat_id 通過後往下流動——收到訊息先回頂層選單（T29，不查任何
+ * Notion）；callback_query 依 callback_data 分流 menu:bug（T29，才觸發 T6/T8
+ * 查詢列清單）/ reqpool:noop（T9）/ claim:{ticket}（T10）。
  */
 export function registerHandlers(bot: Bot): void {
   bot.on('message', async ctx => {
@@ -20,8 +22,7 @@ export function registerHandlers(bot: Bot): void {
     const techUser = resolveTechUserByChatId(chatId)
     if (techUser === null) return // 白名單外：靜默 return
 
-    await ctx.replyWithChatAction('typing')
-    await sendTicketList(ctx, techUser)
+    await sendTopLevelMenu(ctx)
   })
 
   bot.on('callback_query:data', async ctx => {
@@ -35,6 +36,12 @@ export function registerHandlers(bot: Bot): void {
     }
 
     const data = ctx.callbackQuery.data
+    if (data === 'menu:bug') {
+      await ctx.answerCallbackQuery()
+      await ctx.replyWithChatAction('typing') // 這裡才是真的打 Notion 查詢的地方（T6），先給讀取中提示
+      await sendTicketList(ctx, techUser)
+      return
+    }
     if (data === 'reqpool:noop') {
       await handleReqPoolNoop(ctx)
       return
