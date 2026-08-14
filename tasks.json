@@ -4,17 +4,50 @@
   "created_at": "2026-08-14",
   "updated_at": "2026-08-14",
   "changelog": [
-    { "date": "2026-08-14", "note": "初版：6 面向 feasibility workflow 合成 T1-T23（security-hardening 面向該次執行 StructuredOutput 失敗，該面向的 task 是從其他面向散落的風險筆記拼出來的替代品）" },
-    { "date": "2026-08-14", "note": "補跑 security-hardening 調查（純文字報告，非 workflow），發現 body size 限制／rate limit／全域併發上限／update_id 重放去重 四項完全未覆蓋，新增 T24-T27；並補強 T14/T18/T19/T20 的 acceptance_criteria、修正 T21/T22 的 depends_on 使其涵蓋新增的安全 task（T22 先前只在 description 文字提到需等 T16 完成，但 depends_on 陣列漏列，已補上）" },
-    { "date": "2026-08-14", "note": "使用者明確定案兩件事，改寫相關 task：(1) 可認領判斷完全只信 Notion 狀態，不再拿 tracker.sh row 的 pending/rerun 狀態當篩選依據——T7 角色從『候選單篩選』改為『觸發前的技術性 tracker.md 同步』（純粹滿足 /create-mr 內部 Step 0 既有的 tracker 存在性檢查，不影響 dispatcher 自己的判斷邏輯，不改動共用的 create-mr.md）。(2) 明確要求多人真正同時使用、每個觸發都要拿到完全獨立的 worktree，這正是 T16 原本列的方案 (b)：強制所有涉及 repo（含 rajah）都取得真隔離，不再走 symlink 回主 repo 那條路，T16 描述已收斂為單一做法。另外新增 T28：背景流程結束後刪除 worktree、保留 git 分支。bug-lock.sh 的 per-ticket 鎖維持不變（使用者選擇保留，防止兩人重複認領同一張單，跟 worktree 隔不隔離是兩件事）。" }
+    {
+      "date": "2026-08-14",
+      "note": "初版：6 面向 feasibility workflow 合成 T1-T23（security-hardening 面向該次執行 StructuredOutput 失敗，該面向的 task 是從其他面向散落的風險筆記拼出來的替代品）"
+    },
+    {
+      "date": "2026-08-14",
+      "note": "補跑 security-hardening 調查（純文字報告，非 workflow），發現 body size 限制／rate limit／全域併發上限／update_id 重放去重 四項完全未覆蓋，新增 T24-T27；並補強 T14/T18/T19/T20 的 acceptance_criteria、修正 T21/T22 的 depends_on 使其涵蓋新增的安全 task（T22 先前只在 description 文字提到需等 T16 完成，但 depends_on 陣列漏列，已補上）"
+    },
+    {
+      "date": "2026-08-14",
+      "note": "使用者明確定案兩件事，改寫相關 task：(1) 可認領判斷完全只信 Notion 狀態，不再拿 tracker.sh row 的 pending/rerun 狀態當篩選依據——T7 角色從『候選單篩選』改為『觸發前的技術性 tracker.md 同步』（純粹滿足 /create-mr 內部 Step 0 既有的 tracker 存在性檢查，不影響 dispatcher 自己的判斷邏輯，不改動共用的 create-mr.md）。(2) 明確要求多人真正同時使用、每個觸發都要拿到完全獨立的 worktree，這正是 T16 原本列的方案 (b)：強制所有涉及 repo（含 rajah）都取得真隔離，不再走 symlink 回主 repo 那條路，T16 描述已收斂為單一做法。另外新增 T28：背景流程結束後刪除 worktree、保留 git 分支。bug-lock.sh 的 per-ticket 鎖維持不變（使用者選擇保留，防止兩人重複認領同一張單，跟 worktree 隔不隔離是兩件事）。"
+    },
+    {
+      "date": "2026-08-14",
+      "note": "使用者追問『能不能完全不碰 tracker』：讀 create-mr.md 原始碼確認 tracker 不只在 Step 0.1 Claim 檢查，Step 8（解鎖+tracker終態）明文『所有出口路徑必經』，真要完全不用 tracker 得同時改 Step 0.1 與 Step 8，屬 doctrine 40-maintenance-protocol.md 明訂的紅區（claim/lock 協議、tracker 狀態集合、出口路徑表）。列了三個選項（C：維持 T7 現狀的技術性同步，不改 create-mr.md；A：改 create-mr.md 加 bypass 分支；B：另寫一套不經 tracker 的平行流程）問使用者。使用者回覆：這個問題跟 dispatcher 底層框架無關——tracker 依賴是被觸發的 /create-mr 這個 pipeline 自己的內部細節，這個 pipeline 隨時可以替換掉，只在 claude -p 那個 session 內部生效；目前先不處理這個決定。結論：T7 維持現有設計（等同選項 C，不改 create-mr.md、不算紅區），視為暫緩而非定案——之後若把被觸發的 pipeline 換成別的（不是 /create-mr），這個 task 可能直接不再需要。"
+    }
   ],
   "architecture_summary": "Telegram → ngrok 固定 domain (unrefreshing-trudy-subsequently.ngrok-free.dev) → 本機常駐 Bun+Hono+grammy webhook server（獨立 TG_DISPATCH_BOT_TOKEN，走 grammy 官方 'hono' adapter + secretToken 驗證）→ chat_id 白名單（tech-users.csv）→ 反查 notion_user_id → 用 people.contains filter 正向查該人在 Notion Bug List 的候選單並以 Notion『狀態』欄位（仍有問題/待處理）為唯一可認領判準（僅走 scripts/notion.sh；不再拿 tracker.sh row 的 pending/rerun 狀態做二次篩選——這是使用者明確定案，見 changelog）→ inline keyboard 呈現（Bug 工單 + 需求池 UI 佔位，後者按下固定回「開發中」不接查詢）→ 使用者按下工單 → 同步 bug-lock.sh claim（mkdir 原子鎖，單一 syscall 無 TOCTOU，per-ticket 鎖仍保留，防兩人重複認領同一張單）→ 成功才回「已開始」，先幫這張單同步一行到 tracker.md（純技術性，滿足 /create-mr 內部 Step 0 既有的 tracker 存在性檢查，dispatcher 自己完全不讀這個狀態），再 fire-and-forget 背景 spawn `claude -p \"/create-mr {ticket}\" --permission-mode bypassPermissions`（cwd=某個為此次觸發全新建立、完全獨立的 worktree，所有涉及 repo 含 rajah 一律真隔離不走 symlink，stdio 明確導向檔案，外包 timeout，避免 pipe buffer deadlock 與無限期卡死）→ webhook handler 立即返回，不維護 job 狀態、不輪詢 → 背景 process 用 trap 保證無論成功/失敗/中斷都執行 bug-lock.sh release、刪除該次 worktree（保留 git 分支），並解析 claude -p 輸出分類結果，只在 create-mr 自己不會通知的情境（未知失敗、Step 0.1/0.5 早退 SKIPPED）用 tg-notify.sh 補發通知，避免重複騷擾。Notion 狀態/留言寫回全由 create-mr pipeline 既有 agent 負責，dispatcher 不碰。上線（launchd 常駐 + ngrok tunnel + 對 Telegram 註冊 webhook）是唯一需要使用者最終確認的步驟，且必須排在所有程式模組完成、安全檢查通過、且做過一次真實 dry-run 之後。",
   "prerequisites_done": [
-    { "item": "新 bot token 已建立並寫入 .env 的 TG_DISPATCH_BOT_TOKEN", "done": true },
-    { "item": "ngrok 固定 domain unrefreshing-trudy-subsequently.ngrok-free.dev 已可用", "done": true },
-    { "item": "telegram-dispatcher/ 目錄已建立，位於 feature/telegram-dispatcher 分支", "done": true }
+    {
+      "item": "新 bot token 已建立並寫入 .env 的 TG_DISPATCH_BOT_TOKEN",
+      "done": true
+    },
+    {
+      "item": "ngrok 固定 domain unrefreshing-trudy-subsequently.ngrok-free.dev 已可用",
+      "done": true
+    },
+    {
+      "item": "telegram-dispatcher/ 目錄已建立，位於 feature/telegram-dispatcher 分支",
+      "done": true
+    }
   ],
-  "modules": ["webhook-server", "user-resolution", "notion-integration", "ticket-listing", "locking", "pipeline-runner", "notify", "persistence", "security", "docs"],
+  "modules": [
+    "webhook-server",
+    "user-resolution",
+    "notion-integration",
+    "ticket-listing",
+    "locking",
+    "pipeline-runner",
+    "notify",
+    "persistence",
+    "security",
+    "docs"
+  ],
   "tasks": [
     {
       "id": "T1",
@@ -36,7 +69,9 @@
       "module": "webhook-server",
       "title": "grammy + Hono webhook server 骨架（hono adapter）",
       "status": "todo",
-      "depends_on": ["T1"],
+      "depends_on": [
+        "T1"
+      ],
       "description": "依 webhook-transport 調查結果的 recommendation 骨架實作：new Bot(token) 不覆寫 client.canUseWebhookReply（保持預設 false）；app.post 掛上 webhookCallback(bot,'hono',{secretToken}) 這條路由；export default { fetch: app.fetch, port } 供 Bun.serve 使用。token 一律從 process.env.TG_DISPATCH_BOT_TOKEN 讀，不寫死、不印出。",
       "acceptance_criteria": [
         "本機用 bun run server.ts 啟動後可監聽指定 port",
@@ -51,7 +86,9 @@
       "module": "security",
       "title": "chat_id 白名單檢查",
       "status": "todo",
-      "depends_on": ["T2"],
+      "depends_on": [
+        "T2"
+      ],
       "description": "在 bot.on('message') 與 bot.on('callback_query:data') 這層，用 chat_id 比對 tech-users.csv 的 tg_chat_id 欄位，不在名單內一律靜默 return 或回覆無權限，不往下執行任何 Notion/tracker 查詢或 keyboard 組裝。",
       "acceptance_criteria": [
         "白名單外的 chat_id 送訊息不會觸發任何 Notion API 呼叫或 bug-lock 操作",
@@ -65,7 +102,9 @@
       "module": "webhook-server",
       "title": "啟動時預先 bot.init()",
       "status": "todo",
-      "depends_on": ["T2"],
+      "depends_on": [
+        "T2"
+      ],
       "description": "在 server 啟動流程中（Bun.serve 之前）明確 await bot.init() 一次，避免把冷啟動的 getMe() 延遲疊加到第一個真實使用者請求上。",
       "acceptance_criteria": [
         "server 啟動 log 可見一次成功的 bot.init()（或 getMe 成功訊息）",
@@ -79,7 +118,9 @@
       "module": "user-resolution",
       "title": "chat_id 反查 tech-users.csv",
       "status": "todo",
-      "depends_on": ["T1"],
+      "depends_on": [
+        "T1"
+      ],
       "description": "寫一個純函式模組：輸入 chat_id，讀取 /Users/user/aladdin/obsidian/commands/create-mr/references/tech-users.csv，回傳 {notion_user_id, notion_user_name, email} 或 null。此模組同時服務 T3 的白名單判斷與後續 Notion 查詢。",
       "acceptance_criteria": [
         "對已知白名單 chat_id 能正確回傳對應的 notion_user_id",
@@ -94,7 +135,9 @@
       "module": "notion-integration",
       "title": "以人為單位查詢 Notion 候選單（people.contains）",
       "status": "todo",
-      "depends_on": ["T1"],
+      "depends_on": [
+        "T1"
+      ],
       "description": "依 notion-assignee-filter 調查的 recommendation，寫一個模組：輸入 notion_user_id，透過 scripts/notion.sh query-datasource（data source 21c87d78-618a-817f-ae71-000baa9ab11b）帶 people:{contains:<id>} filter，只查該人正向候選單，回傳單號集合（如 FAQ-4616）。全程只能呼叫 scripts/notion.sh，禁止自己寫 curl 或讀 NOTION_TOKEN。",
       "acceptance_criteria": [
         "對已知有候選單的 notion_user_id 能正確回傳精簡的單號清單，數量遠小於全庫候選數（驗證非 client-side 過濾假象）",
@@ -109,7 +152,9 @@
       "module": "pipeline-runner",
       "title": "觸發前同步 tracker.md（技術性，非判斷依據）",
       "status": "todo",
-      "depends_on": ["T10"],
+      "depends_on": [
+        "T10"
+      ],
       "description": "使用者定案：可認領判斷完全只信 Notion『狀態』欄位（T6 已過濾），不再拿 tracker.sh row 的 pending/rerun 狀態做二次篩選；此 task 角色因此從『候選單篩選』改為『觸發 /create-mr 前的純技術同步』。原因：/create-mr 內部 Step 0 仍會硬性檢查 tracker.sh row {ticket} 必須是 pending/rerun，沒有這行或狀態不對就直接 SKIPPED——這是共用 create-mr.md 的既有邏輯，不能改也不該改（其他人也在用）。所以在 T10 claim 成功、真正觸發 T11 之前，本 task 要確保 tracker.md 有這張單、且狀態是 pending。tracker.sh 目前沒有『新增一行』的子命令（只有 next/row/set/counts/log-fail，set 對不存在的單會 NOT_FOUND），需要幫 tracker.sh 新增一個 upsert 風格的子命令（例如 `tracker.sh ensure-pending {ticket} {notion_link}`：存在就 set 成 pending、不存在就沿用既有 SETLOCK 機制安全地 append 一行新資料，格式比照現有 6 欄 markdown table），沿用同一套鎖，不繞過腳本直接改檔案（硬規則：tracker.md 禁止 Edit 直改）。dispatcher 自己完全不讀這裡的狀態、不用它做任何決策。",
       "acceptance_criteria": [
         "tracker.sh 新增的子命令對『Notion 有、tracker 完全沒有』的單（如 FAQ-4616 情境）能正確新增一行並設為 pending",
@@ -117,7 +162,7 @@
         "新增/更新過程沿用既有 SETLOCK 機制，兩個不同 ticket 同時呼叫不會互相覆蓋整檔",
         "本 task 完成後，任何經 dispatcher 觸發的 ticket，/create-mr 的 Step 0 tracker 檢查一定會通過（不會因為 tracker 缺行/狀態不對而 SKIPPED）"
       ],
-      "risk_notes": "notion-assignee-filter 調查用真資料證實 Notion 狀態與 tracker 狀態會不同步（FAQ-2122/FAQ-4616）；使用者已明確選擇接受這個風險、只信 Notion。此 task 不是重新引入 tracker 當判斷依據，純粹是滿足 /create-mr 既有機制的技術前提。",
+      "risk_notes": "notion-assignee-filter 調查用真資料證實 Notion 狀態與 tracker 狀態會不同步（FAQ-2122/FAQ-4616）；使用者已明確選擇接受這個風險、只信 Notion。此 task 不是重新引入 tracker 當判斷依據，純粹是滿足 /create-mr 既有機制的技術前提。 【暫緩，非定案】使用者已確認：是否完全不碰 tracker 這件事跟 dispatcher 底層架構無關，純粹是目前被觸發的 /create-mr 這個 pipeline 自己的內部依賴（該 pipeline 隨時可替換）。本 task 目前採最低成本做法（不改共用的 create-mr.md），若未來把被觸發的 pipeline 換掉，此 task 可能直接失效不用做。",
       "suggested_agent": "general-purpose"
     },
     {
@@ -125,7 +170,11 @@
       "module": "webhook-server",
       "title": "組裝 inline keyboard（Bug 工單清單）",
       "status": "todo",
-      "depends_on": ["T3", "T5", "T6"],
+      "depends_on": [
+        "T3",
+        "T5",
+        "T6"
+      ],
       "description": "在 bot.on('message') handler 內，白名單通過後串接 T5→T6，把 Notion 查到、狀態符合的候選單直接組成 InlineKeyboard（不再經過 tracker 篩選，T7 已改為觸發前才做的技術同步，不影響清單內容），每顆按鈕 callback_data 格式 claim:{ticket}，回覆給使用者。",
       "acceptance_criteria": [
         "白名單使用者發訊息後，能收到只屬於自己的可認領工單列表",
@@ -139,7 +188,9 @@
       "module": "webhook-server",
       "title": "需求池按鈕（UI 佔位）",
       "status": "todo",
-      "depends_on": ["T8"],
+      "depends_on": [
+        "T8"
+      ],
       "description": "在同一份 inline keyboard 最下方加一顆固定的『需求池』按鈕，callback_data 用 reqpool:noop。按下時 answerCallbackQuery 後固定回覆『開發中』文字，不接任何查詢或後續邏輯。這是本輪唯一要做的需求池相關程式碼，完整功能見 T23（deferred）。",
       "acceptance_criteria": [
         "點擊需求池按鈕必回覆固定文字『開發中』",
@@ -153,7 +204,10 @@
       "module": "locking",
       "title": "工單認領 callback handler（claim + 分支回覆）",
       "status": "todo",
-      "depends_on": ["T9", "T6"],
+      "depends_on": [
+        "T9",
+        "T6"
+      ],
       "description": "依 concurrency-and-locking 調查的 recommendation 實作 claim:{ticket} 的 callback_query handler：(1) 先 answerCallbackQuery；(2) 防禦性重驗 chat_id 白名單，並重查一次 Notion（該 ticket 的『當前指派』仍是此人、『狀態』仍是仍有問題/待處理——訊息可能是舊的，畫面上的單這期間可能已被別人處理完）；(3) 同步呼叫 bug-lock.sh claim {ticket} 並讀 exit code；(4) exit 1（LOCKED）→ 立刻回覆明確失敗訊息，絕不啟動背景流程；(5) exit 0（CLAIMED）→ 回覆『已開始處理 {ticket}』後才觸發 T7（tracker.md 技術同步）與 T11 的 fire-and-forget 流程。",
       "acceptance_criteria": [
         "對同一 ticket 模擬兩次幾乎同時的 claim callback，恰好一邊看到『已開始』、另一邊看到明確的『已被認領/失敗』訊息，不會兩邊都顯示已開始",
@@ -168,7 +222,10 @@
       "module": "pipeline-runner",
       "title": "fire-and-forget 觸發 /create-mr 背景流程",
       "status": "todo",
-      "depends_on": ["T10", "T7"],
+      "depends_on": [
+        "T10",
+        "T7"
+      ],
       "description": "在 T10 的 CLAIMED 分支、且 T7 已確保 tracker.md 有這張單並設為 pending 之後，spawn 一個完全脫離 webhook request 生命週期的背景 process：`cd /Users/user/aladdin && timeout 3600 claude -p \"/create-mr {ticket}\" --permission-mode bypassPermissions --output-format json`，stdout/stderr 明確導向獨立 log 檔（不可裸接 pipe 給呼叫端），並確保該 process 用 detached/unref 或等效機制真正脫離父行程，不被 webhook server 未來的重啟/崩潰連坐殺掉。webhook handler 本身不 await 這個 process。cwd 維持 /Users/user/aladdin（不是 dispatcher 自己去建 worktree）——實際的 worktree 建立仍由 /create-mr 內部呼叫既有的 setup-worktree.sh 完成；T16 規範的『全部涉及 repo 真隔離』是透過調整 setup-worktree.sh 的 affected_repo 判斷邏輯達成，不是本 task 的職責，此 task 只需確保背景呼叫本身不會干擾 setup-worktree.sh 的既有運作。",
       "acceptance_criteria": [
         "spawn 呼叫立即返回，webhook handler 能馬上完成 request-response 週期",
@@ -183,7 +240,9 @@
       "module": "pipeline-runner",
       "title": "claude -p 輸出結果分類",
       "status": "todo",
-      "depends_on": ["T11"],
+      "depends_on": [
+        "T11"
+      ],
       "description": "依 headless-pipeline 調查 recommendation 的判斷規則，寫一支腳本/模組解析 T11 產生的 log 檔：先看外層 exit code（非 0 尤其 124 直接判 infra failure）；再用 jq 讀 .subtype/.is_error 判 CLI 層級失敗；再用 jq -r .result 依序比對 SKIPPED / success（含 already_fixed / i18n_manual_handoff）/ needs_qa_clarification / failed / 皆未命中（未知失敗）五種分類，供 T13 決定是否補發通知。",
       "acceptance_criteria": [
         "對五種分類各準備一份模擬 log 內容測試，分類函式回傳正確標籤",
@@ -197,7 +256,9 @@
       "module": "notify",
       "title": "背景流程收尾：release 鎖 + 條件式補發通知",
       "status": "todo",
-      "depends_on": ["T12"],
+      "depends_on": [
+        "T12"
+      ],
       "description": "在 T11 觸發的背景流程外層包一層 shell trap（或等效機制），保證無論 claude -p 成功、失敗、逾時被 kill，都會執行到 bug-lock.sh release {ticket}。收尾後依 T12 的分類結果決定是否呼叫 tg-notify.sh：success/failed/needs_qa_clarification 三類 create-mr 自己已通知過，不重複發；只在『未知失敗』與『SKIPPED 早退（Step 0.1/0.5 NOT_TECH，這些分支不會觸發任何 TG 通知）』這兩種情境補發，訊息需附上 log 檔路徑方便人工檢查。",
       "acceptance_criteria": [
         "模擬 claude -p 正常結束、逾時被 kill、以及腳本中途 crash 三種情境，bug-lock.sh release 都確實被呼叫到（可用 bug-lock.sh status 驗證鎖已釋放）",
@@ -212,7 +273,9 @@
       "module": "security",
       "title": "webhook 路徑與 secretToken 設定",
       "status": "todo",
-      "depends_on": ["T2"],
+      "depends_on": [
+        "T2"
+      ],
       "description": "webhook route 路徑使用隨機不可猜測的 path segment（非單純 /webhook），並產生/設定 TG_WEBHOOK_SECRET 寫入 .env，於 setWebhook 時與 server 端 secretToken 保持一致。確認 grammy 的 constant-time compareSecretToken 驗證路徑有被實際觸發（可用錯誤 secret 測試被拒）。",
       "acceptance_criteria": [
         "webhook 路徑包含隨機字串，不是可預期的固定字串",
@@ -228,7 +291,9 @@
       "module": "security",
       "title": "Token 讀取衛生檢查",
       "status": "todo",
-      "depends_on": ["T1"],
+      "depends_on": [
+        "T1"
+      ],
       "description": "確認 TG_DISPATCH_BOT_TOKEN、TG_WEBHOOK_SECRET 只透過 process.env 在啟動時讀取自 /Users/user/aladdin/.env（比照 cron/bug-report-run.sh 的 grep '^KEY=' 手法，不寫進 launchd plist 明文、不寫進任何 log 輸出、不出現在 git 追蹤的檔案中）。順帶檢查 telegram-dispatcher/ 目錄本身沒有意外把 .env 或 token 值寫進任何新建檔案。",
       "acceptance_criteria": [
         "grep -r 整個 telegram-dispatcher/ 目錄找不到任何 token 明文字串",
@@ -258,7 +323,9 @@
       "module": "webhook-server",
       "title": "同步查詢延遲防護（避免撞 grammy 10 秒 timeout）",
       "status": "todo",
-      "depends_on": ["T6"],
+      "depends_on": [
+        "T6"
+      ],
       "description": "評估 T6（Notion people.contains 查詢）這段同步邏輯在 bot.on('message') handler 內執行的耗時（不再有 T7 的 tracker 逐張交叉驗證這段，T7 已改為觸發後才跑的背景步驟，不影響訊息回覆這條路徑的延遲）；若候選單量大導致有機會逼近 grammy webhookCallback 預設 10 秒 timeout，需調整 webhookCallback 的 timeoutMilliseconds/onTimeout 選項放寬，或將這段查詢改為非同步/背景化後再訊息回覆（需符合『不可用 sleep/輪詢』硬規則，若背景化需用事件/callback 驅動而非輪詢）。",
       "acceptance_criteria": [
         "對單一使用者候選單量在正常範圍（個位數至十餘筆）下實測 T6 耗時，並記錄數字",
@@ -273,7 +340,9 @@
       "module": "persistence",
       "title": "launchd plist 與 wrapper script（webhook server + ngrok tunnel）",
       "status": "todo",
-      "depends_on": ["T2"],
+      "depends_on": [
+        "T2"
+      ],
       "description": "依 launchd-and-persistence 調查 recommendation，撰寫兩支獨立 plist（com.aladdin.tg-dispatch-server 管 bun webhook、com.aladdin.tg-dispatch-tunnel 管 ngrok），各自 RunAtLoad=true + KeepAlive=true，各自獨立 StandardOutPath/StandardErrorPath log 檔。兩支 plist 的 ProgramArguments 都指向薄 wrapper shell script，wrapper 內比照 cron/bug-report-run.sh 用 grep '^TG_DISPATCH_BOT_TOKEN=' .env 取值 export，最後一行用 exec 啟動實際 process（bun run server.ts / ngrok http --url=https://unrefreshing-trudy-subsequently.ngrok-free.dev <port>）。這個 task 只負責把 plist 與 wrapper script 寫好放進 telegram-dispatcher/（或既有 scripts/ 慣例位置），不要執行 launchctl load、不要啟動 ngrok，不要讓服務真的上線。",
       "acceptance_criteria": [
         "兩支 plist 檔案語法正確（可用 plutil -lint 驗證）",
@@ -290,7 +359,10 @@
       "module": "persistence",
       "title": "輕量健康檢查與降級告警",
       "status": "todo",
-      "depends_on": ["T18", "T13"],
+      "depends_on": [
+        "T18",
+        "T13"
+      ],
       "description": "加一個 /health endpoint（webhook server 自身）與一個週期性自我檢查（可用 setInterval，不可用 sleep 輪詢規避競態，這裡是合法的排程器用途）確認 server 存活與必要依賴可達；異常時透過 tg-notify.sh 通知維運者，避免『process 沒死但 tunnel 已斷線』這種最隱蔽的故障模式長期無人發現。",
       "acceptance_criteria": [
         "/health endpoint 回應 200 且內容包含最基本的存活資訊",
@@ -306,7 +378,12 @@
       "module": "docs",
       "title": "README：部署、環境變數、操作風險",
       "status": "todo",
-      "depends_on": ["T2", "T10", "T11", "T18"],
+      "depends_on": [
+        "T2",
+        "T10",
+        "T11",
+        "T18"
+      ],
       "description": "在 telegram-dispatcher/README.md 寫清楚：如何啟動/停止、需要哪些 .env 變數、launchd plist 位置與 launchctl load/unload 指令、已知操作風險（MacBook 睡眠會讓 webhook 漏接、ngrok 免費方案單一 session 限制、log 無 rotation 需自行規劃、ngrok inspector 不可對外開放）、萬一鎖卡住時如何用 bug-lock.sh cleanup 手動排除、以及 TG_WEBHOOK_SECRET 若懷疑外洩時的手動輪替程序（重新產生 secret → 更新 .env → 重啟 server → 重新呼叫 setWebhook）。",
       "acceptance_criteria": [
         "README 涵蓋啟動/停止/查狀態三種操作的具體指令",
@@ -321,7 +398,28 @@
       "module": "webhook-server",
       "title": "End-to-end dry run（單一低風險測試單）",
       "status": "todo",
-      "depends_on": ["T3", "T4", "T5", "T6", "T7", "T8", "T9", "T10", "T11", "T12", "T13", "T14", "T15", "T16", "T17", "T24", "T25", "T26", "T27", "T28"],
+      "depends_on": [
+        "T3",
+        "T4",
+        "T5",
+        "T6",
+        "T7",
+        "T8",
+        "T9",
+        "T10",
+        "T11",
+        "T12",
+        "T13",
+        "T14",
+        "T15",
+        "T16",
+        "T17",
+        "T24",
+        "T25",
+        "T26",
+        "T27",
+        "T28"
+      ],
       "description": "所有功能與安全 task 完成後，手動啟動 server（不需透過 launchd，foreground 或簡單背景執行即可）搭配已可用的 ngrok domain，用開發者自己的白名單 chat_id、挑一張已知可安全重跑或低風險/非緊急的測試 ticket，走一次完整真實流程：收訊息→列清單（純 Notion 狀態）→按按鈕→claim→同步 tracker.md→背景觸發 claude -p（獨立隔離 worktree）→等待流程結束（單張約 20-40 分鐘，tracer 階段長時間無輸出屬正常）→驗證通知、鎖釋放、worktree 清理。同時驗證 headless-pipeline 調查提到的不確定項：bug-report-analyst/spec-fetcher/drive-uploader-mr 這三個 permissionMode: default 的下游 agent 在此路徑下是否真的無感通過（不被權限對話框卡住）。",
       "acceptance_criteria": [
         "從 Telegram 按下按鈕到收到最終完成通知，全程沒有任何一步需要人工介入批准",
@@ -339,7 +437,16 @@
       "module": "persistence",
       "title": "正式上線：launchd 常駐 + ngrok tunnel + 註冊 webhook",
       "status": "todo",
-      "depends_on": ["T16", "T18", "T19", "T21", "T24", "T25", "T26", "T28"],
+      "depends_on": [
+        "T16",
+        "T18",
+        "T19",
+        "T21",
+        "T24",
+        "T25",
+        "T26",
+        "T28"
+      ],
       "description": "需要使用者最終確認才能執行。實際 launchctl load 兩支 plist（com.aladdin.tg-dispatch-server、com.aladdin.tg-dispatch-tunnel），確認 ngrok tunnel 真正對外生效，並對 Telegram Bot API 呼叫 setWebhook 指向 https://unrefreshing-trudy-subsequently.ngrok-free.dev/{隨機路徑} 帶上 secret_token，正式讓所有 tech-users.csv 白名單內的技術人員可以透過 Telegram 觸發 pipeline。這是本清單中唯一會讓系統對外生效、且會開始消耗真實 create-mr 執行資源的步驟，執行前必須先確認 T16（bootstrap 碰撞防護）已完成，因為上線後會有多位技術人員可能同時觸發不同 ticket。",
       "acceptance_criteria": [
         "使用者已明確口頭或書面確認要執行此步驟",
@@ -366,7 +473,9 @@
       "module": "security",
       "title": "webhook request body 大小限制",
       "status": "todo",
-      "depends_on": ["T2"],
+      "depends_on": [
+        "T2"
+      ],
       "description": "在 Hono app 上加 body size 限制 middleware（例如 hono/body-limit 的 bodyLimit()），設一個合理上限（Telegram update 正常不會超過幾十 KB，建議設 1MB），拒絕超過上限的請求，避免異常大 body 造成記憶體壓力。",
       "acceptance_criteria": [
         "送一個超過上限的 body 會被拒絕（明確錯誤回應，不是掛起或 500 崩潰）",
@@ -380,7 +489,9 @@
       "module": "security",
       "title": "webhook 路由 rate limit",
       "status": "todo",
-      "depends_on": ["T2"],
+      "depends_on": [
+        "T2"
+      ],
       "description": "對 webhook route 加基本 rate limit（例如每來源 IP 或全域每分鐘請求數上限，用簡單 in-memory token bucket 即可，不需要外部服務/資料庫）。防止高頻請求耗盡 ngrok 免費方案連線配額，或觸發過量下游 Notion/tracker 查詢。",
       "acceptance_criteria": [
         "短時間內對 webhook 送超過設定門檻的請求數，超額請求被明確拒絕（非崩潰、非掛起）",
@@ -394,7 +505,9 @@
       "module": "security",
       "title": "全域背景 pipeline 併發上限",
       "status": "todo",
-      "depends_on": ["T11"],
+      "depends_on": [
+        "T11"
+      ],
       "description": "獨立於 bug-lock.sh 的單票（per-ticket）鎖，新增一個全域計數器（in-memory 或簡單檔案計數皆可），限制同一時間最多 N 個 claude -p 背景流程在跑（N 值待與使用者確認，建議先抓一個保守值如 3）。超過上限時，webhook handler 應明確回覆『目前併發已達上限，請稍後再試』，不可安靜丟棄或無限排隊等待。",
       "acceptance_criteria": [
         "模擬同時觸發超過 N 張不同 ticket，第 N+1 個請求收到明確的『已達併發上限』回覆而非被安靜忽略",
@@ -409,7 +522,9 @@
       "module": "security",
       "title": "update_id / callback_query 重放去重",
       "status": "todo",
-      "depends_on": ["T2"],
+      "depends_on": [
+        "T2"
+      ],
       "description": "記錄近期已處理過的 Telegram update_id（或 callback_query.id），對重複值直接忽略不處理，防止舊的、曾經合法的請求被重放後再次觸發已完成或狀態已改變的 ticket。範圍可以很小：bounded in-memory Set 加 TTL（例如保留最近 1000 筆或最近 1 小時）即可，不需要資料庫。",
       "acceptance_criteria": [
         "同一個 update_id 被送兩次，第二次不會重複執行任何業務邏輯（不重複查詢、不重複觸發 claim/pipeline）",
@@ -423,7 +538,10 @@
       "module": "pipeline-runner",
       "title": "背景流程結束後刪除 worktree、保留分支",
       "status": "todo",
-      "depends_on": ["T13", "T16"],
+      "depends_on": [
+        "T13",
+        "T16"
+      ],
       "description": "使用者定案：每次觸發都在獨立 worktree 執行，跑完（無論成功/失敗/needs_qa）要刪除該次的 worktree 目錄釋放磁碟空間，但保留對應的 git 分支（mr/{ticket}）不刪，讓後續 code review/MR 歷史仍在。實作上用 `git worktree remove {path}`（分支不受影響，仍是主 repo底下的一般 local branch）；在 T13 的 trap 收尾邏輯裡，於 bug-lock.sh release 之後、通知之前或之後皆可，但必須跟 release 一樣具備『無論成功/失敗/中斷都會執行到』的保證。若 worktree 內有未 commit 的變更（理論上 /create-mr 流程結束前應該都已 commit，但異常中斷情境需考慮），需要用 `git worktree remove --force` 前先確認不是遺漏了尚未推送的重要工作，避免誤刪還沒保存的東西。",
       "acceptance_criteria": [
         "正常成功結束的流程，跑完後對應 worktree 目錄已被移除，但 `git branch` 仍能看到 mr/{ticket} 分支",
