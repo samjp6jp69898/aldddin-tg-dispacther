@@ -68,7 +68,7 @@
       "id": "T2",
       "module": "webhook-server",
       "title": "grammy + Hono webhook server 骨架（hono adapter）",
-      "status": "todo",
+      "status": "done",
       "depends_on": [
         "T1"
       ],

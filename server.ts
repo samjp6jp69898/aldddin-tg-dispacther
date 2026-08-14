@@ -1,12 +1,19 @@
 // Telegram dispatcher — webhook server 入口。
-// T1（本檔）只建立骨架：Hono app + placeholder 200 response。
-// grammy bot 掛載、webhookCallback 路由、白名單等留給後續 task（見 tasks.json）。
+// 白名單、inline keyboard、認領流程等留給後續 task（見 tasks.json）。
 
 import { Hono } from 'hono'
+import { webhookCallback } from 'grammy'
+import { bot } from './lib/webhook-server/bot.ts'
 
 const app = new Hono()
 
 app.get('/', c => c.text('telegram-dispatcher: placeholder ok', 200))
+
+// webhook 路徑目前固定 /webhook，T14 會換成隨機不可猜測的 path segment。
+app.post(
+  '/webhook',
+  webhookCallback(bot, 'hono', { secretToken: process.env.TG_WEBHOOK_SECRET }),
+)
 
 const port = Number(process.env.PORT ?? 8787)
 
