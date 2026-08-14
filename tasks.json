@@ -51,6 +51,10 @@
     {
       "date": "2026-08-14",
       "note": "T19 review（3 agent）：AC 全數 PASS，實測（真啟動 server curl /health、真跑一次獨立腳本模擬 ngrok 斷線並確認使用者收到真實 TG 通知、bun test 27/27）都過。過程中發現並修正一個真實問題：health-monitor.ts 的 notify() 失敗原本被空 catch 完全吞掉，沒有任何 fallback 記錄——tunnel 斷線又剛好 tg-notify.sh 本身也失敗這種雙重故障會無聲無息；已補上 log()（比照 T13 post-run-notify.ts 既有慣例，成功/失敗都寫進 logs/health-monitor.log）。另記錄一個範圍缺口（非本次修復範圍）：目前只覆蓋 risk_notes 講的『tunnel 斷線』，沒覆蓋『bun server 本身 event loop 卡死』——這種自我不可觀測的故障只能靠外部 process 才偵測得到，已在程式碼註解說明，需要的話應另開 task。\n\n**重要修正（意外發現）**：review 過程中實測推翻了 T17 changelog 當時的關鍵假設——原本認為 Bun 單執行緒下 execFileSync 同步阻塞會讓整個 process 完全無法處理其他使用者的請求（'不是排隊變慢，是真的卡死'）。實測（execFileSync('sleep',['2']) 搭配精確時間戳、同一個 Bun.serve process 內 同時打兩個請求）證實：Bun 1.2.9 下 execFileSync 阻塞其中一個 handler 時，同一個 process 內其他並發請求的 handler 仍會正常執行、正常回應，跟 Node.js 官方文件描述的行為不同，具體是 Bun runtime 內部怎麼做到的沒有深入研究。T17 把 queryCandidateTickets 改成 async 這個改動本身仍然保留（不依賴特定 Bun 版本實作細節、語意上更誠實、不影響正確性），但 candidate-tickets.ts 裡誇大的理由已修正為如實描述這次實測結果。T19 的 health-monitor.ts 也因此不需要為了『怕卡住其他請求』把 notify() 的 execFileSync 改成 async——這個顧慮本身不成立。"
+    },
+    {
+      "date": "2026-08-14",
+      "note": "T20 review（3 agent）：AC 全數 PASS，指令逐一實測/核對原始碼確認正確（launchctl bootstrap/bootout/print/list 語法、bug-lock.sh 子指令、env 變數表、secret 產生指令與字元集）。review 找到三個值得補的地方，已修正：(1) 輪替程序裡 <ngrok網址> 佔位符沒說明從哪查——已改成直接寫出固定 reserved domain（run-tunnel.sh 的 TUNNEL_URL 常數，不會因重啟變動），不用另外查；(2) 沒有教怎麼確認 Telegram 端目前實際登記的 webhook 狀態——新增一節用 getWebhookInfo（唯讀）查詢；(3) 最重要的一個：『工單鎖卡住時如何手動排除』那節原本沒說明 bug-lock.sh 不是認領資格的權威來源，有讓讀者誤以為它是某種獨立認領判準的風險——這正是 HOW-TO-CONTINUE.md 明文要求交接者不要混淆的心智模型（這個專案的認領判斷完全來自 Notion，跟 aladdin 主線 bug_analysis_tracker.md/tracker.sh 的認領池是兩件事），已在該節開頭補一段明確提醒。"
     }
   ],
   "architecture_summary": "Telegram → ngrok 固定 domain (unrefreshing-trudy-subsequently.ngrok-free.dev) → 本機常駐 Bun+Hono+grammy webhook server（獨立 TG_DISPATCH_BOT_TOKEN，走 grammy 官方 'hono' adapter + secretToken 驗證）→ chat_id 白名單（tech-users.csv）→ 反查 notion_user_id → 用 people.contains filter 正向查該人在 Notion Bug List 的候選單並以 Notion『狀態』欄位（仍有問題/待處理）為唯一可認領判準（僅走 scripts/notion.sh；不再拿 tracker.sh row 的 pending/rerun 狀態做二次篩選——這是使用者明確定案，見 changelog）→ inline keyboard 呈現（Bug 工單 + 需求池 UI 佔位，後者按下固定回「開發中」不接查詢）→ 使用者按下工單 → 同步 bug-lock.sh claim（mkdir 原子鎖，單一 syscall 無 TOCTOU，per-ticket 鎖仍保留，防兩人重複認領同一張單）→ 成功才回「已開始」，先幫這張單同步一行到 tracker.md（純技術性，滿足 /create-mr 內部 Step 0 既有的 tracker 存在性檢查，dispatcher 自己完全不讀這個狀態），再 fire-and-forget 背景 spawn `claude -p \"/create-mr {ticket}\" --permission-mode bypassPermissions`（cwd=某個為此次觸發全新建立、完全獨立的 worktree，所有涉及 repo 含 rajah 一律真隔離不走 symlink，stdio 明確導向檔案，外包 timeout，避免 pipe buffer deadlock 與無限期卡死）→ webhook handler 立即返回，不維護 job 狀態、不輪詢 → 背景 process 用 trap 保證無論成功/失敗/中斷都執行 bug-lock.sh release、刪除該次 worktree（保留 git 分支），並解析 claude -p 輸出分類結果，只在 create-mr 自己不會通知的情境（未知失敗、Step 0.1/0.5 早退 SKIPPED）用 tg-notify.sh 補發通知，避免重複騷擾。Notion 狀態/留言寫回全由 create-mr pipeline 既有 agent 負責，dispatcher 不碰。上線（launchd 常駐 + ngrok tunnel + 對 Telegram 註冊 webhook）是唯一需要使用者最終確認的步驟，且必須排在所有程式模組完成、安全檢查通過、且做過一次真實 dry-run 之後。",
@@ -409,7 +413,7 @@
       "id": "T20",
       "module": "docs",
       "title": "README：部署、環境變數、操作風險",
-      "status": "todo",
+      "status": "done",
       "depends_on": [
         "T2",
         "T10",

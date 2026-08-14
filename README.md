@@ -1,0 +1,205 @@
+# telegram-dispatcher
+
+透過 Telegram bot 讓白名單內的技術人員認領 Bug 工單，認領後在背景觸發既有
+的 `/create-mr` pipeline（詳見 `tasks.json` 的 `architecture_summary` 與
+`HOW-TO-CONTINUE.md`）。本檔只講「怎麼部署/操作這支服務」，不重複那兩份
+文件已有的架構/開發規則說明。
+
+## 系統組成
+
+兩支獨立常駐行程（各自一支 launchd job，互不依賴對方的 process 存活）：
+
+1. **webhook server**（`bun run server.ts`）：接 Telegram 送來的訊息/按鈕，
+   查 Notion、觸發背景 pipeline。
+2. **ngrok tunnel**：把上面的 server 對外暴露成 Telegram 打得到的 HTTPS
+   網址。
+
+## 啟動 / 停止 / 查狀態
+
+### 本機手動跑（開發、除錯用，不透過 launchd）
+
+```bash
+# 啟動 server（會一直佔用這個 terminal，Ctrl-C 停止）
+zsh /Users/user/aladdin/telegram-dispatcher/launchd/run-server.sh
+
+# 啟動 tunnel（另開一個 terminal；一旦執行就會真的對外開放，見下方風險）
+zsh /Users/user/aladdin/telegram-dispatcher/launchd/run-tunnel.sh
+```
+
+兩支 wrapper script 都會自動從根目錄 `.env` 讀必要的環境變數，不需要自己
+先 export。
+
+### 透過 launchd 常駐（正式模式）
+
+plist 定義檔放在 `telegram-dispatcher/launchd/`，**要先複製一份到
+`~/Library/LaunchAgents/`**（launchd 只認這個目錄下的檔案，不會直接讀 repo
+裡的路徑；`ProgramArguments` 裡的腳本路徑仍指回 repo，複製的只有 plist 本身）：
+
+```bash
+cp /Users/user/aladdin/telegram-dispatcher/launchd/com.aladdin.tg-dispatch-server.plist \
+   /Users/user/aladdin/telegram-dispatcher/launchd/com.aladdin.tg-dispatch-tunnel.plist \
+   ~/Library/LaunchAgents/
+```
+
+啟動（`bootstrap`，macOS 現行語法；舊語法 `launchctl load <path>` 也還能用）：
+
+```bash
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.aladdin.tg-dispatch-server.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.aladdin.tg-dispatch-tunnel.plist
+```
+
+停止（`bootout`；舊語法 `launchctl unload <path>`）：
+
+```bash
+launchctl bootout gui/$(id -u)/com.aladdin.tg-dispatch-server
+launchctl bootout gui/$(id -u)/com.aladdin.tg-dispatch-tunnel
+```
+
+查狀態：
+
+```bash
+launchctl list | grep tg-dispatch
+# 或看單一 job 的詳細狀態（PID、上次結束碼等）：
+launchctl print gui/$(id -u)/com.aladdin.tg-dispatch-server
+launchctl print gui/$(id -u)/com.aladdin.tg-dispatch-tunnel
+```
+
+log 檔位置：`telegram-dispatcher/logs/launchd-server.{out,err}.log`、
+`launchd-tunnel.{out,err}.log`（兩支 plist 各自指定，見 T18）。
+
+另外可以打 `/health`（不需要任何驗證）快速確認 server process 本身有沒有在
+回應：
+
+```bash
+curl http://localhost:8787/health
+# {"status":"ok","uptime_seconds":123}
+```
+
+> **T22 尚未執行前，以上 launchd 啟動指令不要自己跑**——正式上線（含真的
+> 呼叫 Telegram `setWebhook`）需要使用者本人在場確認，見 `tasks.json` T22。
+
+## 需要的環境變數（都放在根目錄 `/Users/user/aladdin/.env`）
+
+| 變數 | 說明 |
+|---|---|
+| `TG_DISPATCH_BOT_TOKEN` | Telegram bot token（BotFather 核發） |
+| `TG_WEBHOOK_PATH` | 隨機 hex 字串，webhook 路徑的一部分（見 T14），不是固定的 `/webhook` |
+| `TG_WEBHOOK_SECRET` | grammy `secretToken`，Telegram 呼叫 webhook 時會帶在 header 裡驗證 |
+| `PORT` | 選填，webhook server 監聽的本機 port，預設 `8787`；改動時記得 `launchd/run-tunnel.sh` 裡的 `PORT` 也要同步改，兩者必須一致 |
+
+這幾個變數只透過 `process.env` 在啟動時讀（wrapper script 用
+`grep '^KEY=' .env` 手法匯出，比照 `cron/bug-report-run.sh`），不會出現在
+log 或任何被 git 追蹤的檔案裡（見 T15）。
+
+## 已知操作風險
+
+- **MacBook 睡眠會讓 webhook 漏接**：launchd 的 `KeepAlive` 只保證「process
+  被殺掉會自動重啟」，不保證電腦本身沒睡眠。這台機器要插電、且系統設定要
+  關掉「插電時允許進入睡眠」（系統設定 → 電池/節能 → 關閉螢幕後防止自動
+  睡眠），否則整台機器睡著時 Telegram 送過來的更新會直接送達失敗，不會排隊
+  等醒來後補送。
+- **ngrok 免費方案同時間只允許 1 個 agent session**：如果有人在別台機器或
+  同一台機器手動另外開一個 `ngrok http ...`，會把這支常駐的 tunnel 直接踢
+  下線，且 `bun run server.ts` process 本身完全不會發現（它只是本機 port 沒
+  人連得到，process 照樣活著）——**不要手動另開 ngrok session**。T19 的
+  健康檢查（每分鐘查一次本機 ngrok admin API）會在這個情境發生時發 Telegram
+  告警給維運者，但這是事後偵測，不是預防；最好的做法就是不要手動開第二個。
+- **log 沒有 rotation，需要自行規劃**：`telegram-dispatcher/logs/` 底下的
+  `*.log`（含 `launchd-*.log`、`post-run-notify.log`、`health-monitor.log`、
+  以及每次觸發 `/create-mr` 產生的 `FAQ-*.stdout.log`/`.stderr.log`）會一直
+  累積，沒有內建的自動清理或輪替機制。長期跑建議定期手動清（或另外排一個
+  簡單的 cron 清舊檔），不清也不會讓服務壞掉，只是磁碟空間會一直長。
+- **ngrok request inspector（本機 4040 web UI）不可對外開放**：`run-tunnel.sh`
+  刻意沒有加任何會改變 `--web-addr` 綁定位址的旗標，維持 ngrok 預設只
+  bind `127.0.0.1`（見 T18）。之後如果有人想改這支腳本，**不要**加
+  `--web-addr 0.0.0.0:4040` 之類的設定對外開放——4040 admin API 沒有任何
+  認證機制，對外開放等於任何人都能看到即時流量內容。
+
+## 工單鎖卡住時如何手動排除
+
+> **這個鎖不是認領資格的權威來源。** 一張工單能不能被認領，一律只看 Notion
+> 的狀態欄位（`queryCandidateTickets`），跟這個鎖存不存在無關——鎖只是防
+> 「兩個 Telegram 使用者幾乎同時點同一張單」這個瞬間 race，claim 成功後
+> spawn 背景流程前就立刻釋放（見 T11）。也**不要**跟 aladdin 主線的
+> `bug_analysis_tracker.md`／`scripts/tracker.sh`（那套認領池）搞混，是完全
+> 不同的兩件事——這個區隔是專案明文要求（見 `HOW-TO-CONTINUE.md`）。
+
+`bug-lock.sh` 用 `mkdir` 做這個短暫的 race-condition mutex（見
+`scripts/bug-lock.sh`）。正常情況下 `/create-mr` 自己的 Step 8（所有出口
+路徑必經）與 T13 的 EXIT trap 安全網會確保鎖一定被釋放；如果懷疑某張單的
+鎖卡住了（例如 `claim:{ticket}` 按鈕一直回「已被其他 session 認領」，但
+實際上沒有任何背景流程真的在跑）：
+
+```bash
+# 查某張單目前鎖的狀態
+bash /Users/user/aladdin/scripts/bug-lock.sh status FAQ-1234
+
+# 確認過真的沒有任何背景流程在跑之後，手動釋放單一張單的鎖
+bash /Users/user/aladdin/scripts/bug-lock.sh release FAQ-1234
+
+# 或列出目前所有鎖，人工核對後決定要不要清
+bash /Users/user/aladdin/scripts/bug-lock.sh list
+
+# 極端情況（確定沒有任何流程在跑）：清掉全部鎖
+bash /Users/user/aladdin/scripts/bug-lock.sh cleanup
+```
+
+`release`/`cleanup` 對沒上鎖的 ticket 是 no-op（不會因為鎖本來就沒上而報
+錯），但釋放一個「其實還在跑」的鎖可能導致兩個流程同時處理同一張單——動手
+前務必先用 `pipeline-status.sh`（`bash /Users/user/aladdin/scripts/pipeline-status.sh`）
+或直接看 `worktrees/{ticket}/` 目錄是不是還在變動，確認真的沒有流程在跑。
+
+## 查目前 Telegram 端實際登記的 webhook 狀態
+
+收到 T19 健康檢查告警、或懷疑 webhook 沒收到訊息時，可以唯讀查 Telegram 端
+目前登記的網址與 secret 是否跟 `.env` 一致（`getWebhookInfo` 不會動到任何
+設定，安全隨時可查）：
+
+```bash
+BOT_TOKEN=$(grep '^TG_DISPATCH_BOT_TOKEN=' /Users/user/aladdin/.env | cut -d= -f2- | tr -d '\r\n')
+curl -s "https://api.telegram.org/bot${BOT_TOKEN}/getWebhookInfo"
+```
+
+回應裡的 `url` 欄位就是目前 Telegram 端實際打的網址——ngrok 這邊的網址是
+**固定 reserved domain**（`launchd/run-tunnel.sh` 裡的 `TUNNEL_URL` 常數，
+不會因為 tunnel 重啟而變），所以正常情況下 `url` 應該長期不變，跟
+`launchd/run-tunnel.sh` 裡寫的網址 + `.env` 的 `TG_WEBHOOK_PATH` 兜起來要
+完全一致；不一致或 `last_error_message` 不是空的，代表要重新呼叫
+`setWebhook`（見下一節）。
+
+## `TG_WEBHOOK_SECRET` 懷疑外洩時的手動輪替程序
+
+1. **重新產生 secret**（跟 T14 當初產生的方式一致，32 bytes、base64url 編碼）：
+   ```bash
+   bun -e "console.log(require('crypto').randomBytes(32).toString('base64url'))"
+   ```
+2. **更新 `.env`**：把 `/Users/user/aladdin/.env` 裡 `TG_WEBHOOK_SECRET=` 那一行
+   換成新值（新舊值只差在這一行，不要動到 `TG_WEBHOOK_PATH`——路徑要不要
+   一起換是另一個決定，通常只有懷疑 secret 外洩時只需要換 secret；如果連
+   路徑本身都懷疑外洩了，`TG_WEBHOOK_PATH` 也要用同樣方式重新產生一個純
+   hex 字串，見 T14）。
+3. **重啟 server**：讓新值生效（wrapper script 每次啟動都重新從 `.env`
+   讀取，不會自己 reload）。
+   ```bash
+   launchctl bootout gui/$(id -u)/com.aladdin.tg-dispatch-server
+   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.aladdin.tg-dispatch-server.plist
+   ```
+4. **重新呼叫 `setWebhook`**：Telegram 端也要知道新的 secret，否則舊 secret
+   失效後 Telegram 送來的請求全部會被新 server 判定為 secret_token 錯誤而
+   拒絕（401）。比照其他 wrapper script 的手法從 `.env` 現讀現用，不要把值
+   貼在指令歷史裡：
+   ```bash
+   ENV_FILE=/Users/user/aladdin/.env
+   BOT_TOKEN=$(grep '^TG_DISPATCH_BOT_TOKEN=' "$ENV_FILE" | cut -d= -f2- | tr -d '\r\n')
+   WEBHOOK_PATH=$(grep '^TG_WEBHOOK_PATH=' "$ENV_FILE" | cut -d= -f2- | tr -d '\r\n')
+   WEBHOOK_SECRET=$(grep '^TG_WEBHOOK_SECRET=' "$ENV_FILE" | cut -d= -f2- | tr -d '\r\n')
+   # ngrok 網址是固定 reserved domain（launchd/run-tunnel.sh 裡的
+   # TUNNEL_URL 常數，不會因 tunnel 重啟而變），不是每次要另外去查的值。
+   NGROK_URL="https://unrefreshing-trudy-subsequently.ngrok-free.dev"
+
+   curl -s "https://api.telegram.org/bot${BOT_TOKEN}/setWebhook" \
+     -d "url=${NGROK_URL}/${WEBHOOK_PATH}" \
+     -d "secret_token=${WEBHOOK_SECRET}"
+   ```
+   （正式上線本身 `setWebhook` 只在 T22 執行一次，這裡只是輪替 secret 時要
+   重跑同一個呼叫；換完可以用上一節的 `getWebhookInfo` 確認真的生效）。
