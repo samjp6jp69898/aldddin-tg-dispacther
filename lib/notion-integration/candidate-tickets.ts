@@ -42,3 +42,22 @@ export function queryCandidateTickets(notionUserId: string): string[] {
     .filter((n: unknown): n is number => typeof n === 'number')
     .map((n: number) => `FAQ-${n}`)
 }
+
+/**
+ * 查單一 ticket 目前在 Notion 的頁面 URL（給 T7 tracker.md 技術同步用）。
+ * ticket 格式不是 FAQ-{number} 或查無此單都回傳 null，不丟例外。
+ */
+export function getTicketNotionUrl(ticket: string): string | null {
+  const match = /^FAQ-(\d+)$/.exec(ticket)
+  if (!match) return null
+
+  const filter = { property: '單號', unique_id: { equals: Number(match[1]) } }
+  const raw = execFileSync('bash', [NOTION_SH, 'query-datasource', DATA_SOURCE_ID, JSON.stringify(filter)], {
+    encoding: 'utf8',
+    maxBuffer: 10 * 1024 * 1024,
+  })
+
+  const parsed = JSON.parse(raw)
+  if (!Array.isArray(parsed.results) || parsed.results.length === 0) return null
+  return parsed.results[0]?.url ?? null
+}

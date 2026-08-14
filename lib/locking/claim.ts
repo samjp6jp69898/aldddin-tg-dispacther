@@ -1,6 +1,7 @@
 import { execFileSync } from 'node:child_process'
 import type { Context } from 'grammy'
 import { queryCandidateTickets } from '../notion-integration/candidate-tickets.ts'
+import { ensureTrackerPending } from '../pipeline-runner/tracker-sync.ts'
 import type { TechUser } from '../user-resolution/tech-user.ts'
 
 const BUG_LOCK_SH = '/Users/user/aladdin/scripts/bug-lock.sh'
@@ -42,6 +43,7 @@ export async function handleClaim(ctx: Context, techUser: TechUser, ticket: stri
 
   await ctx.reply(`已開始處理 ${ticket}`)
 
-  // TODO(T7): 觸發前同步 tracker.md（ensure-pending，純技術性，滿足 /create-mr Step 0 前提）
+  ensureTrackerPending(ticket)
+
   // TODO(T11): fire-and-forget 觸發 /create-mr 背景流程
 }

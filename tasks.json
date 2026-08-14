@@ -151,7 +151,7 @@
       "id": "T7",
       "module": "pipeline-runner",
       "title": "觸發前同步 tracker.md（技術性，非判斷依據）",
-      "status": "todo",
+      "status": "done",
       "depends_on": [
         "T10"
       ],
