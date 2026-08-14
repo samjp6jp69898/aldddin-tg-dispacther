@@ -1,0 +1,13 @@
+{
+  "name": "telegram-dispatcher",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "bun run server.ts"
+  },
+  "dependencies": {
+    "grammy": "1.41.1",
+    "hono": "4.12.5"
+  }
+}

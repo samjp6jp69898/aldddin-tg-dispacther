@@ -53,7 +53,7 @@
       "id": "T1",
       "module": "webhook-server",
       "title": "專案骨架與依賴",
-      "status": "todo",
+      "status": "done",
       "depends_on": [],
       "description": "在 /Users/user/aladdin/telegram-dispatcher/ 建立 package.json（bun）、tsconfig.json，安裝 grammy 1.41.x、hono 4.x（版本比照參考實作 /Users/user/.claude/plugins/cache/claude-plugins-official/telegram/0.0.7/node_modules 內已驗證可共存的版本，不需釘死更舊版）。建立 server.ts 入口檔與 lib/ 底下的模組檔案分區（既有空的 lib/ 子目錄）。不要修改 /Users/user/.claude/plugins/... 下的參考實作本身，只讀不改。",
       "acceptance_criteria": [
