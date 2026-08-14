@@ -11,7 +11,7 @@ import type { TechUser } from '../user-resolution/tech-user.ts'
  * 沒有候選單時明確回覆「目前沒有可認領工單」，不留空白或無回應。
  */
 export async function sendTicketList(ctx: Context, techUser: TechUser): Promise<void> {
-  const tickets = queryCandidateTickets(techUser.notion_user_id)
+  const tickets = await queryCandidateTickets(techUser.notion_user_id)
 
   const keyboard = new InlineKeyboard()
   tickets.forEach(ticket => {

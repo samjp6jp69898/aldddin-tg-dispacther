@@ -1,4 +1,7 @@
-import { execFileSync } from 'node:child_process'
+import { execFile, execFileSync } from 'node:child_process'
+import { promisify } from 'node:util'
+
+const execFileAsync = promisify(execFile)
 
 const NOTION_SH = '/Users/user/aladdin/scripts/notion.sh'
 const DATA_SOURCE_ID = '21c87d78-618a-817f-ae71-000baa9ab11b'
@@ -24,10 +27,19 @@ function buildFilter(notionUserId: string): object {
  *
  * 查無候選單回傳空陣列；scripts/notion.sh 本身失敗（非零 exit、非預期回應
  * 格式）視為真正的錯誤，直接拋出，不吞掉。
+ *
+ * T17：故意用 async execFile（不是 execFileSync）——這是 bot.on('message')
+ * 熱路徑上唯一一段會打真實網路（Notion API）的同步阻塞呼叫。execFileSync
+ * 不只是「這次請求會不會撞 grammy 10 秒 timeout」的問題：Bun 是單執行緒，
+ * 同步阻塞會讓整個 process 在等待期間完全無法處理任何其他使用者的請求
+ * （不是排隊變慢，是真的卡死），直接牴觸 T16 剛做的多人真正同時使用設計。
+ * 改 async 才是治本，不是把 timeout 數字調大而已。實測（見 tasks.json T17
+ * changelog）單次查詢耗時 400-720ms，遠低於 10 秒，改 async 後即使個別請求
+ * 慢也只影響那個使用者自己的回覆延遲，不會拖累其他人。
  */
-export function queryCandidateTickets(notionUserId: string): string[] {
+export async function queryCandidateTickets(notionUserId: string): Promise<string[]> {
   const filterJson = JSON.stringify(buildFilter(notionUserId))
-  const raw = execFileSync('bash', [NOTION_SH, 'query-datasource', DATA_SOURCE_ID, filterJson], {
+  const { stdout: raw } = await execFileAsync('bash', [NOTION_SH, 'query-datasource', DATA_SOURCE_ID, filterJson], {
     encoding: 'utf8',
     maxBuffer: 10 * 1024 * 1024,
   })

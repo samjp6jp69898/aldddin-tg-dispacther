@@ -36,6 +36,11 @@ if (!/^[0-9a-f]{32,}$/.test(webhookPath)) {
   throw new Error('TG_WEBHOOK_PATH 格式不對（必須是純 hex 字串，長度 ≥32）：可能被誤改，拒絕啟動以免變成公開路由')
 }
 
+// T17：沒有覆寫 timeoutMilliseconds（維持 grammy 預設 10 秒、onTimeout='throw'）。
+// bot.on('message') 熱路徑上唯一會打真實網路的一段（T6 queryCandidateTickets）
+// 實測 5 次落在 400-720ms（見 tasks.json T17 changelog），離 10 秒有 10 倍以上
+// margin；該函式也已改成非阻塞 async（見 candidate-tickets.ts 註解），單一
+// 使用者的請求變慢不會拖累其他人，不需要為了單一極端情境放寬全域 timeout。
 app.post(`/${webhookPath}`, webhookCallback(bot, 'hono', { secretToken: webhookSecret }))
 
 // 任何沒命中上面路由的請求（含猜錯 webhook 路徑）一律回跟「secret_token 錯誤」

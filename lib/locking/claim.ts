@@ -48,7 +48,7 @@ export async function handleClaim(ctx: Context, techUser: TechUser, ticket: stri
 
   // 防禦性重驗：訊息可能是舊的，畫面上的單這期間可能已被別人處理完、
   // 或 Notion『當前指派』／『狀態』已經變了。
-  const stillCandidate = queryCandidateTickets(techUser.notion_user_id).includes(ticket)
+  const stillCandidate = (await queryCandidateTickets(techUser.notion_user_id)).includes(ticket)
   if (!stillCandidate) {
     await ctx.reply(`${ticket} 目前已不是你的可認領工單（可能已被處理或狀態已變更），請重新傳訊息取得最新清單。`)
     return

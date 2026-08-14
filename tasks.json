@@ -39,6 +39,10 @@
     {
       "date": "2026-08-14",
       "note": "T16 實作：description 本身留了兩個備選（改 setup-worktree.sh，或改 create-mr.md 的觸發參數），選了前者——setup-worktree.sh 偵測環境變數 DISPATCHER_TRIGGERED=1（由 telegram-dispatcher 的 spawn-create-mr.ts 在 spawn claude -p 時設定，沿 bash 子行程繼承鏈一路傳到 setup-worktree.sh，不需要改 create-mr.md 呼叫語法本身），收到後把 AFFECTED 強制展開成全部 4 個 MAIN_REPOS，不再對任何一個 symlink 回主 repo。刻意不碰 create-mr.md：那是被多條 pipeline 共用的檔案，改動風險與審查成本都更高，環境變數方案能達成同樣效果且單線 /create-mr、/create-mrs 完全無感（從不設這個變數）。review 時曾質疑這條環境變數繼承鏈（Node/Bun spawn → bash trap → claude -p → Bash tool 子行程 → setup-worktree.sh）是否真的可靠，已讀 Claude Code CLI 原始碼（cli.js）確認 Bash tool 預設完整繼承啟動 claude 行程當下的 process.env、無白名單機制，鏈路成立；且失敗模式是 graceful degrade（環境變數若某環節斷了，AFFECTED 就維持原本傳入的值，退回 T16 之前的行為，不會讓 pipeline 掛掉）。實測：真實跑過一次強制隔離（4 個 repo 皆拿到真 worktree，bootstrap 程式碼生成完成，DB 步驟因本機無 dev DB 正確判定 BOOTSTRAP_PARTIAL，屬預期環境狀況非新 bug）；真實併發跑兩張假票，用 inode 確認彼此 rajah worktree 完全獨立、互不干擾，驗證了 risk_notes 提到「create-mrs 從未驗證過真正並行跑 bootstrap」這個此前的空白。setup-worktree.sh 屬於 obsidian 獨立 git repo（scripts/ 是 symlink），commit 落在 obsidian repo 的 main 分支，不在 telegram-dispatcher 這邊。"
+    },
+    {
+      "date": "2026-08-14",
+      "note": "T17 實測：queryCandidateTickets（T6，bot.on('message') 熱路徑上唯一打 Notion API 的一段）對真實使用者連跑 5 次，耗時 400-720ms，遠低於 grammy 預設 10 秒 timeout。但發現比 AC 字面描述更根本的問題：該函式原本用 execFileSync（同步阻塞），Bun 單執行緒下這幾百毫秒會讓整個 process 完全無法處理任何其他使用者的請求（不是排隊變慢，是真的卡死），直接牴觸 T16 剛做的多人真正同時使用設計。改成治本：candidate-tickets.ts 的 queryCandidateTickets 改用 promisify(execFile) 變成非阻塞 async，兩個呼叫點（ticket-list.ts、claim.ts）改 await；getTicketNotionUrl 維持 sync（T7 背景同步與 post-run-notify.ts 獨立行程呼叫，不在這條熱路徑上，不動它，維持 surgical）。webhookCallback 的 timeoutMilliseconds 維持預設 10 秒不調整，server.ts 補註解說明依據（實測數字 + 已改非阻塞後單一慢請求不拖累其他人）。"
     }
   ],
   "architecture_summary": "Telegram → ngrok 固定 domain (unrefreshing-trudy-subsequently.ngrok-free.dev) → 本機常駐 Bun+Hono+grammy webhook server（獨立 TG_DISPATCH_BOT_TOKEN，走 grammy 官方 'hono' adapter + secretToken 驗證）→ chat_id 白名單（tech-users.csv）→ 反查 notion_user_id → 用 people.contains filter 正向查該人在 Notion Bug List 的候選單並以 Notion『狀態』欄位（仍有問題/待處理）為唯一可認領判準（僅走 scripts/notion.sh；不再拿 tracker.sh row 的 pending/rerun 狀態做二次篩選——這是使用者明確定案，見 changelog）→ inline keyboard 呈現（Bug 工單 + 需求池 UI 佔位，後者按下固定回「開發中」不接查詢）→ 使用者按下工單 → 同步 bug-lock.sh claim（mkdir 原子鎖，單一 syscall 無 TOCTOU，per-ticket 鎖仍保留，防兩人重複認領同一張單）→ 成功才回「已開始」，先幫這張單同步一行到 tracker.md（純技術性，滿足 /create-mr 內部 Step 0 既有的 tracker 存在性檢查，dispatcher 自己完全不讀這個狀態），再 fire-and-forget 背景 spawn `claude -p \"/create-mr {ticket}\" --permission-mode bypassPermissions`（cwd=某個為此次觸發全新建立、完全獨立的 worktree，所有涉及 repo 含 rajah 一律真隔離不走 symlink，stdio 明確導向檔案，外包 timeout，避免 pipe buffer deadlock 與無限期卡死）→ webhook handler 立即返回，不維護 job 狀態、不輪詢 → 背景 process 用 trap 保證無論成功/失敗/中斷都執行 bug-lock.sh release、刪除該次 worktree（保留 git 分支），並解析 claude -p 輸出分類結果，只在 create-mr 自己不會通知的情境（未知失敗、Step 0.1/0.5 早退 SKIPPED）用 tg-notify.sh 補發通知，避免重複騷擾。Notion 狀態/留言寫回全由 create-mr pipeline 既有 agent 負責，dispatcher 不碰。上線（launchd 常駐 + ngrok tunnel + 對 Telegram 註冊 webhook）是唯一需要使用者最終確認的步驟，且必須排在所有程式模組完成、安全檢查通過、且做過一次真實 dry-run 之後。",
@@ -342,7 +346,7 @@
       "id": "T17",
       "module": "webhook-server",
       "title": "同步查詢延遲防護（避免撞 grammy 10 秒 timeout）",
-      "status": "todo",
+      "status": "done",
       "depends_on": [
         "T6"
       ],
@@ -569,6 +573,25 @@
         "多個不同 ticket 的 worktree 各自獨立清理，互不影響"
       ],
       "risk_notes": "依賴 T16 先讓每次觸發都拿到真正獨立的 worktree，此 task 才有明確、單一的目錄可清理；若 T16 未完成、仍有 symlink-back 到主 repo 的情況，貿然對『看起來像 worktree』的路徑做 remove 可能誤傷主 repo，因此明確排在 T16 之後。",
+      "suggested_agent": "general-purpose"
+    },
+    {
+      "id": "T29",
+      "module": "webhook-server",
+      "title": "訊息流程改版：先選 BUG/需求池頂層選單再列清單",
+      "status": "todo",
+      "depends_on": [
+        "T8",
+        "T9"
+      ],
+      "description": "使用者 2026-08-14 在驗收 T17 時當場定案：改變 bot.on('message') 的回覆流程。原本收到訊息直接列 Bug 工單清單（T8）＋清單最下方掛需求池佔位按鈕（T9）；改成收到訊息先回覆一個只有兩顆按鈕的頂層選單（『BUG』／『需求池』），按 BUG 才觸發現有 T6 查詢＋列出候選單（沿用 T8 既有邏輯與文字），按需求池維持 T9 既有行為（固定回『開發中』，不觸發任何查詢）。既有 claim:{ticket} 認領流程（T10）不變。",
+      "acceptance_criteria": [
+        "白名單使用者發訊息後，收到的是頂層選單（兩顆按鈕：BUG、需求池），不是直接列 Bug 清單",
+        "點 BUG 按鈕後才觸發 Notion 查詢並列出候選單，含『目前沒有可認領工單』情境（沿用 T8 文案）",
+        "點需求池按鈕行為與 T9 完全一致：固定回覆『開發中』，不觸發任何 Notion/tracker/bug-lock 查詢",
+        "點候選單裡的工單按鈕（claim:{ticket}）行為與現有 T10 完全一致，不受這次改版影響"
+      ],
+      "risk_notes": "非原始 6 面向 feasibility 調查產出，是使用者在 T17 實測驗收現場當場提出、直接定案的新需求（見 changelog）。跟 T23（需求池完整 pipeline，deferred）不衝突：這裡只動『何時觸發列清單』的時機，需求池按鈕本身的行為仍是 T9 的佔位邏輯，不提前實作 T23。",
       "suggested_agent": "general-purpose"
     }
   ]
