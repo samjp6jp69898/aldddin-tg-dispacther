@@ -2,6 +2,7 @@
 // inline keyboard、認領流程等留給後續 task（見 tasks.json）。
 
 import { Hono } from 'hono'
+import { bodyLimit } from 'hono/body-limit'
 import { webhookCallback } from 'grammy'
 import { bot } from './lib/webhook-server/bot.ts'
 import { registerHandlers } from './lib/security/whitelist.ts'
@@ -17,6 +18,19 @@ await bot.init()
 console.error(`telegram-dispatcher: bot initialized as @${bot.botInfo.username}`)
 
 const app = new Hono()
+
+// T24 review 順帶發現並修正：空 body／格式錯誤的 JSON（帶對的 secret_token）
+// 會讓 grammy 的 c.req.json() 丟出未捕捉的 SyntaxError，沒有這個 handler 時
+// Hono 只會回通用的 500（不會讓 process 崩潰或卡住，但回應不夠乾淨、且會把
+// 內部例外訊息暴露出去）。全域接住：JSON 格式錯誤回乾淨的 400，其他真正
+// 未預期的例外才維持 500（且不把例外內容回給呼叫端，只留在 stderr）。
+app.onError((err, c) => {
+  if (err instanceof SyntaxError) {
+    return c.text('Bad Request', 400)
+  }
+  console.error(`unhandled error: ${err}`)
+  return c.text('Internal Server Error', 500)
+})
 
 // T19 review 順帶發現並修正：這裡原本回明文 'telegram-dispatcher: placeholder
 // ok'——跟 webhook 路徑、/health 一樣不驗證任何東西，卻直接把專案名稱洩漏
@@ -51,7 +65,27 @@ if (!/^[0-9a-f]{32,}$/.test(webhookPath)) {
 // 實測 5 次落在 400-720ms（見 tasks.json T17 changelog），離 10 秒有 10 倍以上
 // margin；該函式也已改成非阻塞 async（見 candidate-tickets.ts 註解），單一
 // 使用者的請求變慢不會拖累其他人，不需要為了單一極端情境放寬全域 timeout。
-app.post(`/${webhookPath}`, webhookCallback(bot, 'hono', { secretToken: webhookSecret }))
+// T24：正常 Telegram update（含 message/callback_query/photo caption 等常見
+// 欄位）就算塞滿文字上限也只有幾 KB，1MB 給了充足margin；限制目的是擋異常
+// 巨大 body 造成的記憶體壓力，不是卡正常流量。
+//
+// review 實測澄清（讀 hono bodyLimit 原始碼＋live test 確認，不是憑印象）：
+// 帶 Content-Length 的一般請求（真實 Telegram webhook 都是這種）會在進
+// webhookCallback 之前就短路擋掉，如原本描述；但沒有 Content-Length 或用
+// chunked 傳輸時，bodyLimit 走的是邊讀邊計位元組數的串流模式，webhookCallback
+// 會先開始執行、直到串流讀超過 maxSize 才丟例外變成 413——結果一樣正確
+// （超過 1MB 的資料不會真的進到記憶體，413 也照樣正確回），只是「一定
+// 在解析邏輯之前短路」這句話對 chunked 這條分支不完全成立，如實記錄。
+const MAX_WEBHOOK_BODY_SIZE = 1024 * 1024 // 1MB
+
+app.post(
+  `/${webhookPath}`,
+  bodyLimit({
+    maxSize: MAX_WEBHOOK_BODY_SIZE,
+    onError: c => c.text('Payload Too Large', 413),
+  }),
+  webhookCallback(bot, 'hono', { secretToken: webhookSecret }),
+)
 
 // 任何沒命中上面路由的請求（含猜錯 webhook 路徑）一律回跟「secret_token 錯誤」
 // 一模一樣的回應：401 + 空 body——這正是 grammy hono adapter 對 secret_token

@@ -55,6 +55,10 @@
     {
       "date": "2026-08-14",
       "note": "T20 review（3 agent）：AC 全數 PASS，指令逐一實測/核對原始碼確認正確（launchctl bootstrap/bootout/print/list 語法、bug-lock.sh 子指令、env 變數表、secret 產生指令與字元集）。review 找到三個值得補的地方，已修正：(1) 輪替程序裡 <ngrok網址> 佔位符沒說明從哪查——已改成直接寫出固定 reserved domain（run-tunnel.sh 的 TUNNEL_URL 常數，不會因重啟變動），不用另外查；(2) 沒有教怎麼確認 Telegram 端目前實際登記的 webhook 狀態——新增一節用 getWebhookInfo（唯讀）查詢；(3) 最重要的一個：『工單鎖卡住時如何手動排除』那節原本沒說明 bug-lock.sh 不是認領資格的權威來源，有讓讀者誤以為它是某種獨立認領判準的風險——這正是 HOW-TO-CONTINUE.md 明文要求交接者不要混淆的心智模型（這個專案的認領判斷完全來自 Notion，跟 aladdin 主線 bug_analysis_tracker.md/tracker.sh 的認領池是兩件事），已在該節開頭補一段明確提醒。"
+    },
+    {
+      "date": "2026-08-14",
+      "note": "T24 review（3 agent）：AC 全數 PASS，實測（2MB→413、正常 1.2KB update→200、bun test 27/27）皆過。額外派一個 agent 專門現場測邊界情況與繞過手法：剛好 1MB 邊界（含）通過、1MB+1 byte 被拒、chunked 無 Content-Length 的 2MB/50MB 串流上傳確實被擋住（bodyLimit 邊讀邊計位元組數，不是只信Content-Length header）、偽造小 Content-Length 也無法繞過（Bun HTTP 層本身就把 Content-Length 當作 request framing 的權威依據，多餘 bytes 根本不會被當成這個 request 的 body）——兩種主要繞過手法都驗證擋得住。\n\n修正一處：程式碼註解原本宣稱『一定在解析邏輯之前短路』，review 讀 hono bodyLimit 原始碼證實這只對有 Content-Length 的一般請求（真實 Telegram webhook 都是這種）成立；chunked/無 Content-Length時 webhookCallback 會先開始執行、串流讀超過才丟例外——結果一樣正確（記憶體不會真的超量、413 也照樣正確回），只是原本的說法不夠精確，已修正。\n\n額外發現並順便修正一個非 T24 造成、review 過程中兩個 agent 各自獨立發現的既有缺口：空 body 或格式錯誤 JSON（帶對的 secret_token）會讓 grammy 的 JSON.parse 丟未捕捉例外，變成 Hono 的通用 500（不影響任何 AC，process 不會崩潰或卡住，只是回應不夠乾淨）。已加 app.onError 全域接住：JSON 格式錯誤回乾淨 400，其他未預期例外仍維持 500 但不外洩例外內容（只留 stderr）。實測確認：空 body/畸形 JSON → 400，正常 update 仍 200，超大 body 仍 413（onError 沒蓋掉 bodyLimit 自己的錯誤處理）。"
     }
   ],
   "architecture_summary": "Telegram → ngrok 固定 domain (unrefreshing-trudy-subsequently.ngrok-free.dev) → 本機常駐 Bun+Hono+grammy webhook server（獨立 TG_DISPATCH_BOT_TOKEN，走 grammy 官方 'hono' adapter + secretToken 驗證）→ chat_id 白名單（tech-users.csv）→ 反查 notion_user_id → 用 people.contains filter 正向查該人在 Notion Bug List 的候選單並以 Notion『狀態』欄位（仍有問題/待處理）為唯一可認領判準（僅走 scripts/notion.sh；不再拿 tracker.sh row 的 pending/rerun 狀態做二次篩選——這是使用者明確定案，見 changelog）→ inline keyboard 呈現（Bug 工單 + 需求池 UI 佔位，後者按下固定回「開發中」不接查詢）→ 使用者按下工單 → 同步 bug-lock.sh claim（mkdir 原子鎖，單一 syscall 無 TOCTOU，per-ticket 鎖仍保留，防兩人重複認領同一張單）→ 成功才回「已開始」，先幫這張單同步一行到 tracker.md（純技術性，滿足 /create-mr 內部 Step 0 既有的 tracker 存在性檢查，dispatcher 自己完全不讀這個狀態），再 fire-and-forget 背景 spawn `claude -p \"/create-mr {ticket}\" --permission-mode bypassPermissions`（cwd=某個為此次觸發全新建立、完全獨立的 worktree，所有涉及 repo 含 rajah 一律真隔離不走 symlink，stdio 明確導向檔案，外包 timeout，避免 pipe buffer deadlock 與無限期卡死）→ webhook handler 立即返回，不維護 job 狀態、不輪詢 → 背景 process 用 trap 保證無論成功/失敗/中斷都執行 bug-lock.sh release、刪除該次 worktree（保留 git 分支），並解析 claude -p 輸出分類結果，只在 create-mr 自己不會通知的情境（未知失敗、Step 0.1/0.5 早退 SKIPPED）用 tg-notify.sh 補發通知，避免重複騷擾。Notion 狀態/留言寫回全由 create-mr pipeline 既有 agent 負責，dispatcher 不碰。上線（launchd 常駐 + ngrok tunnel + 對 Telegram 註冊 webhook）是唯一需要使用者最終確認的步驟，且必須排在所有程式模組完成、安全檢查通過、且做過一次真實 dry-run 之後。",
@@ -508,7 +512,7 @@
       "id": "T24",
       "module": "security",
       "title": "webhook request body 大小限制",
-      "status": "todo",
+      "status": "done",
       "depends_on": [
         "T2"
       ],
