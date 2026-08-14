@@ -28,14 +28,22 @@ function buildFilter(notionUserId: string): object {
  * 查無候選單回傳空陣列；scripts/notion.sh 本身失敗（非零 exit、非預期回應
  * 格式）視為真正的錯誤，直接拋出，不吞掉。
  *
- * T17：故意用 async execFile（不是 execFileSync）——這是 bot.on('message')
- * 熱路徑上唯一一段會打真實網路（Notion API）的同步阻塞呼叫。execFileSync
- * 不只是「這次請求會不會撞 grammy 10 秒 timeout」的問題：Bun 是單執行緒，
- * 同步阻塞會讓整個 process 在等待期間完全無法處理任何其他使用者的請求
- * （不是排隊變慢，是真的卡死），直接牴觸 T16 剛做的多人真正同時使用設計。
- * 改 async 才是治本，不是把 timeout 數字調大而已。實測（見 tasks.json T17
- * changelog）單次查詢耗時 400-720ms，遠低於 10 秒，改 async 後即使個別請求
- * 慢也只影響那個使用者自己的回覆延遲，不會拖累其他人。
+ * T17：改用 async execFile（原本是 execFileSync）——這是 bot.on('message')
+ * 熱路徑上唯一一段會打真實網路（Notion API）的呼叫。
+ *
+ * 【T19 review 期間修正】原本這裡的理由寫「Bun 單執行緒，execFileSync 同步
+ * 阻塞會讓整個 process 完全無法處理其他使用者的請求」——這個說法經 T19
+ * review 實測推翻：Bun 1.2.9 下 execFileSync 阻塞其中一個 handler 時，
+ * 同一個 Bun.serve process 內其他並發請求的 handler 仍會正常執行、正常回應
+ * （用 execFileSync('sleep',['2']) 搭配時間戳實測驗證過，見 tasks.json T19
+ * changelog），跟 Node.js 官方文件對 execFileSync 的行為描述不同，具體是
+ * Bun runtime 內部怎麼做到的沒有深入研究。
+ *
+ * 但改成 async 本身仍然是對的、值得保留：(1) 不依賴特定 Bun 版本的實作細節
+ * （文件上 execFileSync 就是同步阻塞，未來行為可能改變）；(2) 語意上更正確
+ * ——這本來就是一段 I/O，用 async 表達比較誠實；(3) 個別使用者查詢變慢時
+ * 仍然只影響自己的回覆延遲。實測（見 tasks.json T17 changelog）單次查詢
+ * 耗時 400-720ms，遠低於 grammy 10 秒 timeout。
  */
 export async function queryCandidateTickets(notionUserId: string): Promise<string[]> {
   const filterJson = JSON.stringify(buildFilter(notionUserId))

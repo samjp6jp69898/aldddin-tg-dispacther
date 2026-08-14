@@ -5,6 +5,7 @@ import { Hono } from 'hono'
 import { webhookCallback } from 'grammy'
 import { bot } from './lib/webhook-server/bot.ts'
 import { registerHandlers } from './lib/security/whitelist.ts'
+import { createHealthMonitor } from './lib/webhook-server/health-monitor.ts'
 
 registerHandlers(bot)
 
@@ -18,6 +19,11 @@ console.error(`telegram-dispatcher: bot initialized as @${bot.botInfo.username}`
 const app = new Hono()
 
 app.get('/', c => c.text('telegram-dispatcher: placeholder ok', 200))
+
+// T19：跟 webhook 路徑不同，這個 endpoint 刻意不驗證 secret_token（供外部
+// 監控探測），內容只能是最基本的存活資訊——絕不能出現 ticket 編號、
+// assignee 姓名/email 等業務細節，否則等於給外部免費偵察窗口。
+app.get('/health', c => c.json({ status: 'ok', uptime_seconds: Math.floor(process.uptime()) }))
 
 // T14：webhook 路徑本身也是一道防線（secret_token 防「來源真偽」，路徑防
 // 「被 fuzz 出來」），路徑跟 secret 都只從 process.env 讀（值來自
@@ -53,6 +59,11 @@ app.all('*', c => {
   c.status(401)
   return c.body('')
 })
+
+// T19：每分鐘查一次本機 ngrok admin API，tunnel 狀態翻轉時發 tg-notify.sh
+// 告警給維運者（見 health-monitor.ts 註解）。用 setInterval 週期排程，不是
+// sleep/輪詢規避競態。
+createHealthMonitor().start()
 
 const port = Number(process.env.PORT ?? 8787)
 
