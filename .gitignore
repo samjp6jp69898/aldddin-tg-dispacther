@@ -1,3 +1,14 @@
 node_modules/
 .env
+.env.*
 *.log
+
+# T15：token 讀取衛生檢查發現，只擋 dotenv 格式（.env*）跟 *.log 對「非
+# dotenv 格式的誤存敏感檔名」沒防護——目前沒有任何程式碼路徑會產生這些檔案，
+# 純粹是未來手滑的防呆，不是已知風險。刻意不用 *token*/*secret* 這種廣泛
+# 萬用字元：會連帶誤傷合法原始碼檔名（例如未來真的有 xxxToken.ts）。
+secrets.*
+credentials.*
+config.env
+*.pem
+*.key

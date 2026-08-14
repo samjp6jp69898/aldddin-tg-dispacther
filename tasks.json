@@ -306,7 +306,7 @@
       "id": "T15",
       "module": "security",
       "title": "Token 讀取衛生檢查",
-      "status": "todo",
+      "status": "done",
       "depends_on": [
         "T1"
       ],
