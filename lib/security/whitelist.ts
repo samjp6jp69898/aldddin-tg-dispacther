@@ -2,6 +2,7 @@ import type { Bot } from 'grammy'
 import { resolveTechUserByChatId } from '../user-resolution/tech-user.ts'
 import { sendTicketList } from '../webhook-server/ticket-list.ts'
 import { handleReqPoolNoop } from '../webhook-server/reqpool.ts'
+import { handleClaim } from '../locking/claim.ts'
 
 // grammy 的 secretToken（見 lib/webhook-server/bot.ts / server.ts）只驗證請求
 // 真的來自 Telegram，不驗證是不是授權使用者；chat_id 白名單要在這一層自己做
@@ -11,7 +12,7 @@ import { handleReqPoolNoop } from '../webhook-server/reqpool.ts'
  * 掛載 bot.on('message') 與 bot.on('callback_query:data')，白名單外的 chat_id
  * 一律靜默 return，不執行任何後續 Notion/tracker 查詢或 keyboard 組裝。
  * 白名單內的 chat_id 通過後往下流動——callback_query 依 callback_data 分流
- * reqpool:noop（T9）/ claim:{ticket}（待 T10 接上）。
+ * reqpool:noop（T9）/ claim:{ticket}（T10）。
  */
 export function registerHandlers(bot: Bot): void {
   bot.on('message', async ctx => {
@@ -33,12 +34,17 @@ export function registerHandlers(bot: Bot): void {
       return
     }
 
-    if (ctx.callbackQuery.data === 'reqpool:noop') {
+    const data = ctx.callbackQuery.data
+    if (data === 'reqpool:noop') {
       await handleReqPoolNoop(ctx)
       return
     }
+    if (data.startsWith('claim:')) {
+      await handleClaim(ctx, techUser, data.slice('claim:'.length))
+      return
+    }
 
-    // claim:{ticket} 分流待 T10 接上。
+    // 未知的 callback_data：仍要 answer 消掉 loading 圈。
     await ctx.answerCallbackQuery()
   })
 }

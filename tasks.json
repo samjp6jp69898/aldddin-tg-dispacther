@@ -203,7 +203,7 @@
       "id": "T10",
       "module": "locking",
       "title": "工單認領 callback handler（claim + 分支回覆）",
-      "status": "todo",
+      "status": "done",
       "depends_on": [
         "T9",
         "T6"
