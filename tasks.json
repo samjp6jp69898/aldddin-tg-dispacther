@@ -101,7 +101,7 @@
       "id": "T4",
       "module": "webhook-server",
       "title": "啟動時預先 bot.init()",
-      "status": "todo",
+      "status": "done",
       "depends_on": [
         "T2"
       ],
