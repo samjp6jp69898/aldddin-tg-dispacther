@@ -367,7 +367,7 @@
       "id": "T18",
       "module": "persistence",
       "title": "launchd plist 與 wrapper script（webhook server + ngrok tunnel）",
-      "status": "todo",
+      "status": "done",
       "depends_on": [
         "T2"
       ],
