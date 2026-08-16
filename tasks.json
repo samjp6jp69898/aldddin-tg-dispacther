@@ -2,7 +2,7 @@
   "project": "telegram-dispatcher",
   "description": "常駐 Bun+Hono+grammy webhook server，經 ngrok 固定 domain 接收 Telegram，白名單驗證後依 chat_id 反查 tech-users.csv、查 Notion（狀態為唯一判準）列出可認領 bug 工單，使用者按下後原子鎖 claim，於獨立隔離 worktree 內 fire-and-forget 觸發 /create-mr headless pipeline，背景流程結束後自行釋放鎖、清理 worktree（保留分支）並通知，支援多人真正同時使用。",
   "created_at": "2026-08-14",
-  "updated_at": "2026-08-14",
+  "updated_at": "2026-08-16",
   "changelog": [
     {
       "date": "2026-08-14",
@@ -59,6 +59,10 @@
     {
       "date": "2026-08-14",
       "note": "T24 review（3 agent）：AC 全數 PASS，實測（2MB→413、正常 1.2KB update→200、bun test 27/27）皆過。額外派一個 agent 專門現場測邊界情況與繞過手法：剛好 1MB 邊界（含）通過、1MB+1 byte 被拒、chunked 無 Content-Length 的 2MB/50MB 串流上傳確實被擋住（bodyLimit 邊讀邊計位元組數，不是只信Content-Length header）、偽造小 Content-Length 也無法繞過（Bun HTTP 層本身就把 Content-Length 當作 request framing 的權威依據，多餘 bytes 根本不會被當成這個 request 的 body）——兩種主要繞過手法都驗證擋得住。\n\n修正一處：程式碼註解原本宣稱『一定在解析邏輯之前短路』，review 讀 hono bodyLimit 原始碼證實這只對有 Content-Length 的一般請求（真實 Telegram webhook 都是這種）成立；chunked/無 Content-Length時 webhookCallback 會先開始執行、串流讀超過才丟例外——結果一樣正確（記憶體不會真的超量、413 也照樣正確回），只是原本的說法不夠精確，已修正。\n\n額外發現並順便修正一個非 T24 造成、review 過程中兩個 agent 各自獨立發現的既有缺口：空 body 或格式錯誤 JSON（帶對的 secret_token）會讓 grammy 的 JSON.parse 丟未捕捉例外，變成 Hono 的通用 500（不影響任何 AC，process 不會崩潰或卡住，只是回應不夠乾淨）。已加 app.onError 全域接住：JSON 格式錯誤回乾淨 400，其他未預期例外仍維持 500 但不外洩例外內容（只留 stderr）。實測確認：空 body/畸形 JSON → 400，正常 update 仍 200，超大 body 仍 413（onError 沒蓋掉 bodyLimit 自己的錯誤處理）。"
+    },
+    {
+      "date": "2026-08-16",
+      "note": "T25 實作（in-memory token bucket，全域不分來源 IP，理由：威脅是『同一個外洩 secret_token 被高頻重放』而非多來源攻擊，且 chat_id 要等 grammy 解析完 body 才拿得到，per-chat_id 分桶會打亂 T24 bodyLimit 之前短路的設計）。3 個 review agent（正確性/邊界、威脅模型、風格一致性）挖到一個真實設計缺陷並已修正：原本 rate limit middleware 掛在 webhookCallback（真正驗證 secret_token 的地方）之前，代表任何知道 webhook 路徑但沒有 secret_token 的請求也能消耗全域額度，連帶讓合法 Telegram 請求被 429；且 429 的回應格式跟 catch-all／secret 錯誤的 401 不同，會變成一個新的『這條路徑存在』side channel，直接破壞 T14 刻意做的均一 401 回應防線。修正：新增 lib/security/webhook-secret-guard.ts，自己做一次跟 grammy compareSecretToken 對等（node:crypto timingSafeEqual 常數時間比較、401 空 body 回應格式完全一致）的驗證，掛在 rate limit 之前，只有通過的請求才消耗額度；webhookCallback 內部仍會重複驗證一次 secret_token，重複但無害。另外 correctness review 指出『全域 bucket 假設個位數技術人員不會互相排擠』只驗證過單人低頻情境，沒驗證『白名單內多人同時活動』——這是真實會發生的正常使用情境（多人同時開選單/翻頁/認領），已將預設值從 capacity=30/refill=30/60 調高到 capacity=60/refill=60/60（60 次/分鐘），並在 rate-limit.test.ts 補一條『5 人各 8 次請求、20 秒內交錯』的模擬測試；per-chat_id 分桶暫不做（YAGNI，之後若實測仍被誤擋再考慮）。實測：真實啟動 server，驗證 (1) 沒帶/帶錯 secret_token 的請求即使高頻打，全部回 401、不消耗額度；(2) 猜錯路徑的 catch-all 401 與上述完全一致；(3) 帶正確 secret_token 送 65 個請求，前 60 個 200、後 5 個 429；(4) /health、/ 兩個不掛 rate limit 的路由不受影響。bun test 40/40 pass。"
     }
   ],
   "architecture_summary": "Telegram → ngrok 固定 domain (unrefreshing-trudy-subsequently.ngrok-free.dev) → 本機常駐 Bun+Hono+grammy webhook server（獨立 TG_DISPATCH_BOT_TOKEN，走 grammy 官方 'hono' adapter + secretToken 驗證）→ chat_id 白名單（tech-users.csv）→ 反查 notion_user_id → 用 people.contains filter 正向查該人在 Notion Bug List 的候選單並以 Notion『狀態』欄位（仍有問題/待處理）為唯一可認領判準（僅走 scripts/notion.sh；不再拿 tracker.sh row 的 pending/rerun 狀態做二次篩選——這是使用者明確定案，見 changelog）→ inline keyboard 呈現（Bug 工單 + 需求池 UI 佔位，後者按下固定回「開發中」不接查詢）→ 使用者按下工單 → 同步 bug-lock.sh claim（mkdir 原子鎖，單一 syscall 無 TOCTOU，per-ticket 鎖仍保留，防兩人重複認領同一張單）→ 成功才回「已開始」，先幫這張單同步一行到 tracker.md（純技術性，滿足 /create-mr 內部 Step 0 既有的 tracker 存在性檢查，dispatcher 自己完全不讀這個狀態），再 fire-and-forget 背景 spawn `claude -p \"/create-mr {ticket}\" --permission-mode bypassPermissions`（cwd=某個為此次觸發全新建立、完全獨立的 worktree，所有涉及 repo 含 rajah 一律真隔離不走 symlink，stdio 明確導向檔案，外包 timeout，避免 pipe buffer deadlock 與無限期卡死）→ webhook handler 立即返回，不維護 job 狀態、不輪詢 → 背景 process 用 trap 保證無論成功/失敗/中斷都執行 bug-lock.sh release、刪除該次 worktree（保留 git 分支），並解析 claude -p 輸出分類結果，只在 create-mr 自己不會通知的情境（未知失敗、Step 0.1/0.5 早退 SKIPPED）用 tg-notify.sh 補發通知，避免重複騷擾。Notion 狀態/留言寫回全由 create-mr pipeline 既有 agent 負責，dispatcher 不碰。上線（launchd 常駐 + ngrok tunnel + 對 Telegram 註冊 webhook）是唯一需要使用者最終確認的步驟，且必須排在所有程式模組完成、安全檢查通過、且做過一次真實 dry-run 之後。",
@@ -528,7 +532,7 @@
       "id": "T25",
       "module": "security",
       "title": "webhook 路由 rate limit",
-      "status": "todo",
+      "status": "done",
       "depends_on": [
         "T2"
       ],

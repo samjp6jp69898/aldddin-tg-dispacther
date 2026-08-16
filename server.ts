@@ -6,6 +6,8 @@ import { bodyLimit } from 'hono/body-limit'
 import { webhookCallback } from 'grammy'
 import { bot } from './lib/webhook-server/bot.ts'
 import { registerHandlers } from './lib/security/whitelist.ts'
+import { createRateLimitMiddleware } from './lib/security/rate-limit.ts'
+import { createWebhookSecretGuard } from './lib/security/webhook-secret-guard.ts'
 import { createHealthMonitor } from './lib/webhook-server/health-monitor.ts'
 
 registerHandlers(bot)
@@ -78,8 +80,18 @@ if (!/^[0-9a-f]{32,}$/.test(webhookPath)) {
 // 在解析邏輯之前短路」這句話對 chunked 這條分支不完全成立，如實記錄。
 const MAX_WEBHOOK_BODY_SIZE = 1024 * 1024 // 1MB
 
+// T25 review 發現並修正：secret_token 驗證要排在量體控制之前——rate limit
+// 原本掛在 webhookCallback（真正驗證 secret_token 的地方）之前，代表任何
+// 知道路徑但沒有 token 的請求也能消耗全域額度，連帶讓合法請求被 429，且
+// 429 跟下面 catch-all 的 401 不一致，會變成「這條路徑存在」的側漏訊號，
+// 破壞 T14 的均一回應防線。createWebhookSecretGuard 自己先做一次跟 grammy
+// 對等（含常數時間比較、含完全一致的 401 空 body 回應）的驗證，見
+// lib/security/webhook-secret-guard.ts 檔頭註解；只有通過的請求才進到
+// rate limit，webhookCallback 內部還會再驗一次 secret_token，重複但無害。
 app.post(
   `/${webhookPath}`,
+  createWebhookSecretGuard(webhookSecret),
+  createRateLimitMiddleware(),
   bodyLimit({
     maxSize: MAX_WEBHOOK_BODY_SIZE,
     onError: c => c.text('Payload Too Large', 413),
