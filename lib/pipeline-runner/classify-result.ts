@@ -84,7 +84,14 @@ export function classifyPipelineResult(exitCode: number, stdoutContent: string):
   // 中繼變數，沒新資料時字面就是 "SKIPPED"，跟真正的早退 SKIPPED 是兩件事）
   // 誤判成 skipped；錨定抓值從根本避開這整類「子字串剛好出現在別的地方」
   // 的風險，不只是調順序。
-  const statusMatch = /^- Pipeline status:\s*(\S+)/m.exec(result)
+  //
+  // 必須容忍 markdown 裝飾（FAQ-4616 2026-08-16 真實誤判案例）：模板寫的是
+  // 純文字，但 manager（LLM）實際吐出的是「- **Pipeline status**:
+  // `already_fixed`」——標籤被加粗、值被包反引號，嚴格比對直接漏接、成功
+  // 被誤判成 unknown_failure 補發了假警報。regex 對 `**` 與 backtick 做
+  // 選配容忍（星號在冒號前後都可能出現，如「status:**」的寫法），值本身
+  // 收斂到 \w（i18n_manual_handoff 含數字，不能用純字母類），行首錨定不變。
+  const statusMatch = /^-\s*\*{0,2}Pipeline status\*{0,2}\s*:\s*\*{0,2}\s*`?(\w+)/m.exec(result)
   if (statusMatch) {
     const status = statusMatch[1]
     if (status === 'success' || status === 'already_fixed' || status === 'i18n_manual_handoff') return 'success'

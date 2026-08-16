@@ -142,6 +142,25 @@ const BUG_LOCK_SH = '/Users/user/aladdin/scripts/bug-lock.sh'
 // changelog）。已用真實 claude -p 呼叫 /create-mr:create-mr（帶假單號，30 秒
 // timeout 內主動中斷）驗證這個命名空間前綴的指令真的會被辨識、真的開始跑
 // pipeline（多輪 tool use），不是憑猜測改。
+// claude 必須用絕對路徑，禁止裸呼叫 `claude` 交給 PATH 解析：實測（FAQ-4616
+// 2026-08-16 全部五次真實失敗 log + transcript version 欄位）dispatcher spawn
+// 出來的 bash 會解析到 ~/node_modules 的舊版 1.0.128（經 ~/.bun/bin/claude
+// symlink），該版把 opus alias 對應到已下架的 claude-opus-4-1-20250805、背景
+// 小模型用已下架的 claude-3-5-haiku，啟動 1 秒內 API 404 結束，完全沒進
+// pipeline。外部以相同 env 模擬卻解析到 .local/bin 的新版——PATH 解析在
+// 這條 spawn 鏈上不可靠，直接把「用哪個 claude」從環境問題變成常數。
+const CLAUDE_BIN = '/Users/user/.local/bin/claude'
+
+// 模型必須明確指定 --model opus（alias，由 CLI 解析成當下最新的 Opus 正式
+// 版），不能省略讓它吃 ~/.claude/settings.json 的使用者預設：settings.json
+// 殘留已下架的舊 model ID 時同樣直接 404。alias 而非寫死完整 ID，正是為了
+// 不重蹈「寫死的 ID 之後下架」同一個坑。
+// unset CLAUDE_EFFORT：server 若是從某個 Claude Code session 裡手動啟動的，
+// 會沿繼承鏈把該 session 的 CLAUDE_EFFORT（如 high）一路傳給背景 claude -p；
+// 明確清掉，讓背景流程永遠用 CLI 預設 effort，不隨啟動 server 的環境漂移。
+// 診斷行寫進 stderr log（失敗案例中該檔一直是空的，不影響 stdout 的乾淨
+// JSON 前提）：留下當次真實 PATH 與 claude 解析結果，之後再出現版本漂移
+// 可直接從 log 定位，不用重走這次的推理。
 export const WRAPPER_SCRIPT = `
 trap '
   EC=$?
@@ -149,7 +168,9 @@ trap '
   bun ${CLEANUP_WORKTREE_TS} "$1" >/dev/null 2>&1
   bun ${POST_RUN_NOTIFY_TS} "$1" "$EC" "$2" >/dev/null 2>&1
 ' EXIT
-timeout 3600 claude -p "/create-mr:create-mr $1" --permission-mode bypassPermissions --output-format json
+unset CLAUDE_EFFORT
+{ echo "diag PATH=$PATH"; echo "diag which claude: $(which -a claude 2>&1 | tr '\\n' ' ')"; echo "diag version: $(${CLAUDE_BIN} --version 2>&1)"; } >&2
+timeout 3600 ${CLAUDE_BIN} -p "/create-mr:create-mr $1" --model opus --permission-mode bypassPermissions --output-format json
 `
 
 /**
