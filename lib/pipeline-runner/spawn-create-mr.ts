@@ -89,6 +89,7 @@ export function spawnDetachedProcess(
 }
 
 const POST_RUN_NOTIFY_TS = '/Users/user/aladdin/telegram-dispatcher/lib/pipeline-runner/post-run-notify.ts'
+const CLEANUP_WORKTREE_TS = '/Users/user/aladdin/telegram-dispatcher/lib/pipeline-runner/cleanup-worktree.ts'
 const BUG_LOCK_SH = '/Users/user/aladdin/scripts/bug-lock.sh'
 
 /**
@@ -112,7 +113,26 @@ const BUG_LOCK_SH = '/Users/user/aladdin/scripts/bug-lock.sh'
  * 之後才觸發，若不遮蔽，release 的 "RELEASED: ..." 之類文字會被續寫進同一個
  * stdout log 檔，接在 claude 吐出的 JSON 陣列後面，破壞 T11「stdout 保證是
  * 單一乾淨 JSON」的前提，也是 post-run-notify.ts 自己接下來要 JSON.parse 的
- * 那份檔案——必須先確保它沒被弄髒。
+ * 那份檔案——必須先確保它沒被弄髒。cleanup-worktree.ts（T28）同一個理由，也
+ * 接 `>/dev/null 2>&1`。
+ *
+ * T28：release 之後、post-run-notify 之前多插一行 cleanup-worktree.ts，一樣
+ * 綁在同一個 EXIT trap 裡，跟 release 具備一樣的『無論成功/失敗/中斷都會
+ * 執行到』保證（trap 觸發時 timeout/claude 那行已經結束，不管什麼原因）。
+ * 用 $1（ticket）即可，不需要 $2（stdoutPath）——worktree 路徑是
+ * `/Users/user/aladdin/worktrees/{ticket}/{repo}` 這種固定慣例，不依賴
+ * stdout log 內容。cleanup 失敗（例如強制清理仍失敗）只會記進它自己的 log，
+ * 不影響這裡的 EC/後續 post-run-notify。
+ *
+ * review 提出的排序取捨（bug-lock release 排在 cleanup-worktree 之前，不是
+ * 之後）：release 先執行代表同一張 ticket 理論上可以在 worktree 還沒清完前
+ * 就被重新認領——但反過來若讓 cleanup 排在 release 之前，一旦
+ * cleanup-worktree.ts 卡住（四個 repo 的 git worktree remove 逐一跑），鎖會
+ * 永遠不釋放，比『worktree 清理跟新流程的 setup-worktree.sh 撞在一起』的風險
+ * 更嚴重——後者本來就有自癒機制（setup-worktree.sh 開頭的 attempt 迴圈本來
+ * 就會先 `worktree remove --force` + `branch -D` 再 add，見該腳本『1. 建
+ * worktree』一節），且同一張單重新被認領到跑進 Step 4 通常要 15–40 分鐘，
+ * 窗口極小。兩害相權，維持現有順序（release 優先）。
  */
 // T26 實測期間發現並修正（跟 T26 本身無關，屬既有嚴重問題，經使用者確認
 // 現在就修）：.claude/commands/create-mr/create-mr.md 是巢狀資料夾結構，
@@ -122,10 +142,11 @@ const BUG_LOCK_SH = '/Users/user/aladdin/scripts/bug-lock.sh'
 // changelog）。已用真實 claude -p 呼叫 /create-mr:create-mr（帶假單號，30 秒
 // timeout 內主動中斷）驗證這個命名空間前綴的指令真的會被辨識、真的開始跑
 // pipeline（多輪 tool use），不是憑猜測改。
-const WRAPPER_SCRIPT = `
+export const WRAPPER_SCRIPT = `
 trap '
   EC=$?
   bash ${BUG_LOCK_SH} release "$1" >/dev/null 2>&1
+  bun ${CLEANUP_WORKTREE_TS} "$1" >/dev/null 2>&1
   bun ${POST_RUN_NOTIFY_TS} "$1" "$EC" "$2" >/dev/null 2>&1
 ' EXIT
 timeout 3600 claude -p "/create-mr:create-mr $1" --permission-mode bypassPermissions --output-format json

@@ -2,7 +2,46 @@ import { describe, expect, test } from 'bun:test'
 import { mkdtempSync, readFileSync, rmSync, watch, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { spawnDetachedProcess } from './spawn-create-mr.ts'
+import { spawnDetachedProcess, WRAPPER_SCRIPT } from './spawn-create-mr.ts'
+
+// review-integration 發現的真實缺口（E）：trap 裡 release/cleanup/notify 三行
+// 的順序完全沒有測試守護，未來有人改動時很容易在不自覺間打亂順序或漏掉一行
+// ——直接對真的 claude -p 跑一次太重（需要網路/認證），改成對 WRAPPER_SCRIPT
+// 這個字串常數做結構斷言：三個呼叫都在同一個 trap 區塊內、且順序是
+// release → cleanup-worktree → post-run-notify（T28 的順序取捨見
+// spawn-create-mr.ts 對應註解）。
+describe('WRAPPER_SCRIPT — EXIT trap 內收尾呼叫的順序（T13/T28 依賴的結構）', () => {
+  test('bug-lock release → cleanup-worktree → post-run-notify，三者都在同一個 trap 區塊內', () => {
+    const trapMatch = /trap '([\s\S]*?)' EXIT/.exec(WRAPPER_SCRIPT)
+    expect(trapMatch).not.toBeNull()
+    const trapBody = trapMatch![1]!
+
+    const releaseIdx = trapBody.indexOf('bug-lock.sh release')
+    const cleanupIdx = trapBody.indexOf('cleanup-worktree.ts')
+    const notifyIdx = trapBody.indexOf('post-run-notify.ts')
+
+    expect(releaseIdx).toBeGreaterThan(-1)
+    expect(cleanupIdx).toBeGreaterThan(-1)
+    expect(notifyIdx).toBeGreaterThan(-1)
+    expect(releaseIdx).toBeLessThan(cleanupIdx)
+    expect(cleanupIdx).toBeLessThan(notifyIdx)
+  })
+
+  test('EC 在 trap 第一行就存起來，且 cleanup-worktree.ts 只帶 ticket（$1），不需要 EC/stdoutPath', () => {
+    const trapMatch = /trap '([\s\S]*?)' EXIT/.exec(WRAPPER_SCRIPT)
+    const trapBody = trapMatch![1]!
+    const lines = trapBody
+      .split('\n')
+      .map(l => l.trim())
+      .filter(Boolean)
+
+    expect(lines[0]).toBe('EC=$?')
+    const cleanupLine = lines.find(l => l.includes('cleanup-worktree.ts'))!
+    expect(cleanupLine).toContain('"$1"')
+    expect(cleanupLine).not.toContain('$EC')
+    expect(cleanupLine).not.toContain('"$2"')
+  })
+})
 
 // T16 review 發現：spawnDetachedProcess 的 env 合併邏輯（opts.env ? {...process.env, ...opts.env} : undefined）
 // 之前完全靠手動 bun -e 驗證，沒有自動化回歸保護。這裡用真的 spawn 一個 bash
