@@ -4,6 +4,7 @@ import { sendTopLevelMenu } from '../webhook-server/top-menu.ts'
 import { sendTicketList } from '../webhook-server/ticket-list.ts'
 import { handleReqPoolNoop } from '../webhook-server/reqpool.ts'
 import { handleClaim } from '../locking/claim.ts'
+import { createReplayGuard } from './replay-guard.ts'
 
 // grammy 的 secretToken（見 lib/webhook-server/bot.ts / server.ts）只驗證請求
 // 真的來自 Telegram，不驗證是不是授權使用者；chat_id 白名單要在這一層自己做
@@ -15,14 +16,40 @@ import { handleClaim } from '../locking/claim.ts'
  * 白名單內的 chat_id 通過後往下流動——收到訊息先回頂層選單（T29，不查任何
  * Notion）；callback_query 依 callback_data 分流 menu:bug（T29，才觸發 T6/T8
  * 查詢列清單）/ reqpool:noop（T9）/ claim:{ticket}（T10）。
+ *
+ * T27：白名單通過之後才做 update_id 重放去重（review 發現：順序放反的話，
+ * 白名單外的陌生流量也會消耗共用的追蹤額度，稀釋掉真正該防的重放窗口；
+ * 白名單查詢本身很輕量，先做不虧）。去重集合是這個函式呼叫當下建立的
+ * closure 變數，不是 module-level singleton——production 只會呼叫一次
+ * registerHandlers(bot)（server.ts），效果跟 module-level 一樣；但測試每次
+ * 呼叫都拿到全新的 guard，天生互相隔離，不需要靠人工約定不同測試間的
+ * update_id 才能避免互相誤判成重放。
+ *
+ * review 發現並修正：isDuplicate 是「查完立刻記」，若業務邏輯之後才丟出
+ * 例外（打 Notion/Telegram API 失敗等），Telegram 依規範會重新投遞同一個
+ * update_id——這正是這層去重原本要處理的情境之一，但如果不處理，那次真正
+ * 的重試會被誤判成重放而永久吞掉，使用者完全收不到任何回應。兩個 handler
+ * 都用 try/catch 包住業務邏輯：失敗時呼叫 replayGuard.forget() 讓之後的
+ * 重試可以真的重跑一次，並把例外原樣往上丟（維持跟 T27 之前一致的錯誤
+ * 傳遞行為——server.ts 的 app.onError 接住回 500，不吞例外内容）。
  */
 export function registerHandlers(bot: Bot): void {
+  const replayGuard = createReplayGuard()
+
   bot.on('message', async ctx => {
     const chatId = String(ctx.chat.id)
     const techUser = resolveTechUserByChatId(chatId)
-    if (techUser === null) return // 白名單外：靜默 return
+    if (techUser === null) return // 白名單外：靜默 return，不做重放判斷
 
-    await sendTopLevelMenu(ctx)
+    const updateId = ctx.update.update_id
+    if (replayGuard.isDuplicate(updateId)) return // T27：重放的 update，直接忽略
+
+    try {
+      await sendTopLevelMenu(ctx)
+    } catch (err) {
+      replayGuard.forget(updateId)
+      throw err
+    }
   })
 
   bot.on('callback_query:data', async ctx => {
@@ -35,23 +62,31 @@ export function registerHandlers(bot: Bot): void {
       return
     }
 
-    const data = ctx.callbackQuery.data
-    if (data === 'menu:bug') {
-      await ctx.answerCallbackQuery()
-      await ctx.replyWithChatAction('typing') // 這裡才是真的打 Notion 查詢的地方（T6），先給讀取中提示
-      await sendTicketList(ctx, techUser)
-      return
-    }
-    if (data === 'reqpool:noop') {
-      await handleReqPoolNoop(ctx)
-      return
-    }
-    if (data.startsWith('claim:')) {
-      await handleClaim(ctx, techUser, data.slice('claim:'.length))
-      return
-    }
+    const updateId = ctx.update.update_id
+    if (replayGuard.isDuplicate(updateId)) return // T27：重放的 update，直接忽略（不 answerCallbackQuery——原始的合法請求已經處理過了）
 
-    // 未知的 callback_data：仍要 answer 消掉 loading 圈。
-    await ctx.answerCallbackQuery()
+    try {
+      const data = ctx.callbackQuery.data
+      if (data === 'menu:bug') {
+        await ctx.answerCallbackQuery()
+        await ctx.replyWithChatAction('typing') // 這裡才是真的打 Notion 查詢的地方（T6），先給讀取中提示
+        await sendTicketList(ctx, techUser)
+        return
+      }
+      if (data === 'reqpool:noop') {
+        await handleReqPoolNoop(ctx)
+        return
+      }
+      if (data.startsWith('claim:')) {
+        await handleClaim(ctx, techUser, data.slice('claim:'.length))
+        return
+      }
+
+      // 未知的 callback_data：仍要 answer 消掉 loading 圈。
+      await ctx.answerCallbackQuery()
+    } catch (err) {
+      replayGuard.forget(updateId)
+      throw err
+    }
   })
 }

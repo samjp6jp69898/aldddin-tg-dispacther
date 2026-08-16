@@ -19,8 +19,17 @@ function captureHandlers() {
   return handlers
 }
 
+// T27：whitelist.ts 的 replayGuard 是 registerHandlers() 呼叫當下建立的
+// closure 變數（不是 module-level singleton，review 發現原本設計成
+// singleton 會讓測試之間共用追蹤狀態、只能靠人工約定不同 update_id 區段
+// 避免互相誤判——已改成每次呼叫 registerHandlers 都拿到全新的 guard，這裡
+// 每個測試各自呼叫 captureHandlers() 天生互相隔離）。每個 ctx 預設給一個
+// 獨一無二的 update_id（遞增計數器）純粹是方便，不是為了跨測試隔離。
+let updateIdCounter = 0
 function makeCtx(overrides: Record<string, unknown>) {
+  updateIdCounter++
   return {
+    update: { update_id: updateIdCounter },
     answerCallbackQuery: mock(async () => {}),
     replyWithChatAction: mock(async () => {}),
     reply: mock(async () => {}),
@@ -97,5 +106,74 @@ describe('registerHandlers — T29 頂層選單 + callback_query 路由', () => 
     expect(ctx.answerCallbackQuery).toHaveBeenCalledTimes(1)
     expect(ctx.replyWithChatAction).not.toHaveBeenCalled()
     expect(ctx.reply).not.toHaveBeenCalled()
+  })
+
+  // T27：同一個 update_id 的 message 被送第二次（重放，或 Telegram 因為
+  // 我們回應逾時而做的合法重試），第二次不該重複執行任何業務邏輯。
+  test('T27：同一個 update_id 的 message 重放：第二次靜默 return，不重複回覆', async () => {
+    const handlers = captureHandlers()
+    const ctx = makeCtx({ chat: { id: REAL_TECH_CHAT_ID }, update: { update_id: 900001 } })
+    await handlers['message']!(ctx)
+    expect(ctx.reply).toHaveBeenCalledTimes(1)
+
+    // 同一個 update_id 再送一次（同一個 ctx 重呼叫一次 handler，模擬重放）——
+    // reply 的呼叫次數不會再增加。
+    await handlers['message']!(ctx)
+    expect(ctx.reply).toHaveBeenCalledTimes(1) // 還是 1，不是 2
+  })
+
+  // T27：callback_query 版本——重放的請求連 answerCallbackQuery 都不該做
+  // （原始合法請求已經處理過），不只是不重複觸發 claim。
+  test('T27：同一個 update_id 的 callback_query 重放：第二次連 answerCallbackQuery 都不做', async () => {
+    const handlers = captureHandlers()
+    const ctx = makeCtx({ chat: { id: REAL_TECH_CHAT_ID }, callbackQuery: { data: 'reqpool:noop' }, update: { update_id: 900002 } })
+    await handlers['callback_query:data']!(ctx)
+    expect(ctx.answerCallbackQuery).toHaveBeenCalledTimes(1)
+    expect(ctx.reply).toHaveBeenCalledTimes(1)
+
+    await handlers['callback_query:data']!(ctx)
+    expect(ctx.answerCallbackQuery).toHaveBeenCalledTimes(1) // 還是 1
+    expect(ctx.reply).toHaveBeenCalledTimes(1) // 還是 1
+  })
+
+  // 不同 update_id（即使其他欄位完全相同）不該互相干擾——這是 makeCtx 預設
+  // 自動遞增 update_id 的行為本身就在驗證的事，這裡額外顯式測一次以防
+  // 未來有人誤改成固定值。
+  test('T27：不同 update_id 的兩則獨立訊息都正常處理，不會被誤判成重放', async () => {
+    const handlers = captureHandlers()
+    const ctx1 = makeCtx({ chat: { id: REAL_TECH_CHAT_ID } })
+    const ctx2 = makeCtx({ chat: { id: REAL_TECH_CHAT_ID } })
+    expect((ctx1.update as any).update_id).not.toBe((ctx2.update as any).update_id)
+
+    await handlers['message']!(ctx1)
+    await handlers['message']!(ctx2)
+    expect(ctx1.reply).toHaveBeenCalledTimes(1)
+    expect(ctx2.reply).toHaveBeenCalledTimes(1)
+  })
+
+  // review 發現的真實 bug 對應測試：業務邏輯（這裡用 ctx.reply 丟出例外
+  // 模擬 sendTopLevelMenu 內部呼叫 Telegram API 失敗）第一次失敗，例外要
+  // 原樣往上丟（不吞掉、行為跟 T27 之前一致），且這個 update_id 要被
+  // forget 掉——Telegram 之後真正的重試（同一個 update_id 再送一次）必須
+  // 能重新跑一次業務邏輯，不能被誤判成重放而永久靜默吞掉。
+  test('T27：業務邏輯第一次失敗（例外原樣往上丟）：同一個 update_id 之後的重試不會被誤判成重放，能重新執行', async () => {
+    const handlers = captureHandlers()
+    let shouldFail = true
+    const ctx = makeCtx({
+      chat: { id: REAL_TECH_CHAT_ID },
+      update: { update_id: 900003 },
+      reply: mock(async () => {
+        if (shouldFail) throw new Error('模擬 Telegram API 失敗')
+      }),
+    })
+
+    await expect(handlers['message']!(ctx)).rejects.toThrow('模擬 Telegram API 失敗')
+    expect(ctx.reply).toHaveBeenCalledTimes(1)
+
+    shouldFail = false
+    // 同一個 update_id 的重試：如果沒有 forget，這裡會被 replayGuard 判定
+    // 重複而靜默 return，ctx.reply 不會再被呼叫——這正是本測試要防的迴歸。
+    await handlers['message']!(ctx)
+    expect(ctx.reply).toHaveBeenCalledTimes(2)
   })
 })
