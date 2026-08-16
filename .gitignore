@@ -12,3 +12,4 @@ credentials.*
 config.env
 *.pem
 *.key
+logs/
