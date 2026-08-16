@@ -13,8 +13,9 @@ import { createReplayGuard } from './replay-guard.ts'
 /**
  * 掛載 bot.on('message') 與 bot.on('callback_query:data')，白名單外的 chat_id
  * 一律靜默 return，不執行任何後續 Notion/tracker 查詢或 keyboard 組裝。
- * 白名單內的 chat_id 通過後往下流動——收到訊息先回頂層選單（T29，不查任何
- * Notion）；callback_query 依 callback_data 分流 menu:bug（T29，才觸發 T6/T8
+ * 白名單內的 chat_id 通過後往下流動——訊息走 T30 指令式路由（bug 直接列
+ * 清單 / req 需求池佔位 / /menu 頂層選單 / 其他回用法提示，見 handler 內
+ * 註解）；callback_query 依 callback_data 分流 menu:bug（T29，觸發 T6/T8
  * 查詢列清單）/ reqpool:noop（T9）/ claim:{ticket}（T10）。
  *
  * T27：白名單通過之後才做 update_id 重放去重（review 發現：順序放反的話，
