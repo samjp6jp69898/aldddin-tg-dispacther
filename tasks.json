@@ -75,6 +75,10 @@
     {
       "date": "2026-08-16",
       "note": "T28 實作：新增 lib/pipeline-runner/cleanup-worktree.ts，在 T13 既有的 bash EXIT trap 裡（bug-lock release 之後、post-run-notify 之前）多插一行 `bun cleanup-worktree.ts \"$1\"`——對 MAIN_REPOS（agrabah/abu/lago/rajah）逐一 `git worktree remove`，分支 mr/{ticket} 不受影響；四個都清乾淨後才 rm -rf 母目錄（先把 bootstrap.log 搬去 telegram-dispatcher/logs/ 保留一份）。\n\n3 個 review agent（git 邏輯正確性、與 spawn-create-mr.ts 的整合、acceptance_criteria 逐條核對）之後，git 邏輯 review 挖到兩個會實際造成資料損毀/誤判的真實 bug，已修正：\n(1) 原本用 `git rev-parse --git-dir` 與 `--git-common-dir` 字串比較判斷『是不是真正的 linked worktree』，但兩者在『repo 根目錄』與『深層子目錄』回傳的路徑格式不對稱（子目錄下 --git-dir 是絕對路徑、--git-common-dir 卻仍是相對路徑），單純字串比較會誤判——而且不是邊界情況：`/Users/user/aladdin` 本身就是 git repo（`git rev-parse --show-toplevel` 證實），`worktrees/{ticket}/{repo}` 正是它的深層子目錄，任何殘留在該路徑但其實只是一般子目錄的東西都會被誤判成 linked worktree。改用 `git rev-parse --path-format=absolute` 讓兩者都回傳絕對路徑，已實測驗證修好。（這個發現連帶說明一件事：CLAUDE.md 目前寫『aladdin/ 根目錄本身不是 git repo』，但實測 aladdin 根目錄現在確實是 git repo（本 session 所在的 feature/telegram-dispatcher 分支即證據）——這份文件的說法已經過時，留給之後維護 CLAUDE.md 的人核實與更新，本 task 沒有動 CLAUDE.md 本身。）\n(2) 若 wtPath 剛好是指向『另一個真 worktree』（不是主 repo）的 symlink，舊版判準會誤判成 true，實測 `git worktree remove --force` 會直接摧毀 symlink 目標裡未 commit 的內容且不可回復。已修正：一律先用 `lstatSync().isSymbolicLink()` 擋 symlink，不管 git 判準怎麼說——結構保證，不是啟發式。\n\nacceptance_criteria review 指出 risk_notes 要求『用 --force 前先確認不是遺漏了尚未推送的重要工作』，原本只有 `git status --porcelain` 記檔名清單，未追蹤檔案的實際內容仍不可回復；也實測過 `git stash create` 不含 untracked 檔案，不足以保護。已改成強制清理前用 `cp -R` 完整備份整個目錄到 telegram-dispatcher/logs/force-cleanup-backups/（對 symlink 只複製連結本身、不遞迴進目標，跟 node_modules/.env.local 這類 symlink 共存安全），log 同時記檔名清單與備份路徑。\n\n整合 review 指出：(a) cleanup-worktree.ts 所有 execFileSync 原本沒有 timeout，若卡住會拖住同一個 trap 裡排在後面的 post-run-notify（最需要補發通知的 infra_failure/cli_failure 情境反而收不到通知）——已比照 post-run-notify.ts 既有的 EXEC_TIMEOUT_MS=30000 模式補上；(b) release 鎖排在 cleanup 之前（同一張 ticket 理論上可能在 worktree 還沒清完前就被重新認領）是刻意取捨而非疏漏——反過來會讓『cleanup 卡住則鎖永不釋放』的風險更嚴重，且 setup-worktree.sh 本來就有『先 remove --force 再 add』的自癒機制，維持現況、已在 spawn-create-mr.ts 補註解說明取捨。\n\n另外自行補強（review 未直接要求，但屬同一組『不能誤刪』的防線）：cleanupWorktreesForTicket／removeRepoWorktree 兩個匯出的公開 API 原本沒有 ticket 格式驗證，只有 CLI 入口 main() 有——若以空字串呼叫，cleanupTicketDir 會把 `worktrees/` 這個母目錄本身當成『某個 ticket 的目錄』整個 rm -rf 掉（會波及所有其他 ticket 正在跑的 worktree）。已在兩個匯出函式最前面都加上 TICKET_RE 驗證，破壞性動作前置檢查。\n\ncleanup-worktree.test.ts 全程用真的 git repo + 真的 worktree add/remove/lock（不 mock），覆蓋：乾淨移除、dirty→force+完整備份可還原、symlink 回主 repo 略過不動、symlink 指向另一真 worktree 也不會被摧毀、root 本身是 git repo 時的 F1 迴歸（一般子目錄 vs 真 worktree 都正確判斷）、worktree 被 lock 時兩次 remove 都真的失敗回傳 failed、空字串 ticket 不會清掉其他 ticket、四 repo 整合含 bootstrap.log 保留、不同 ticket 互不影響、部分 repo 失敗時保留母目錄不假裝清空。spawn-create-mr.test.ts 補兩個測試釘住 WRAPPER_SCRIPT trap 內三行呼叫的順序（release→cleanup→notify）與 cleanup 只帶 $1。bun test 77/77 pass。"
+    },
+    {
+      "date": "2026-08-16",
+      "note": "T30 定案並實作：訊息從「任何文字回頂層選單」（T29）改為指令式路由（bug/req//menu/其他→提示），whitelist.ts 單點修改，callback 路由不變；req 因 T23 deferred 暫回佔位。同日 T22 正式上線（launchd 兩支服務 + setWebhook），wrapper 已於 T21 尾段改用絕對路徑 claude。"
     }
   ],
   "architecture_summary": "Telegram → ngrok 固定 domain (unrefreshing-trudy-subsequently.ngrok-free.dev) → 本機常駐 Bun+Hono+grammy webhook server（獨立 TG_DISPATCH_BOT_TOKEN，走 grammy 官方 'hono' adapter + secretToken 驗證）→ chat_id 白名單（tech-users.csv）→ 反查 notion_user_id → 用 people.contains filter 正向查該人在 Notion Bug List 的候選單並以 Notion『狀態』欄位（仍有問題/待處理）為唯一可認領判準（僅走 scripts/notion.sh；不再拿 tracker.sh row 的 pending/rerun 狀態做二次篩選——這是使用者明確定案，見 changelog）→ inline keyboard 呈現（Bug 工單 + 需求池 UI 佔位，後者按下固定回「開發中」不接查詢）→ 使用者按下工單 → 同步 bug-lock.sh claim（mkdir 原子鎖，單一 syscall 無 TOCTOU，per-ticket 鎖仍保留，防兩人重複認領同一張單）→ 成功才回「已開始」，先幫這張單同步一行到 tracker.md（純技術性，滿足 /create-mr 內部 Step 0 既有的 tracker 存在性檢查，dispatcher 自己完全不讀這個狀態），再檢查全域併發上限（T26，in-memory 計數器，N=5，超過時明確回覆已達上限而非安靜忽略）、通過才 fire-and-forget 背景 spawn `claude -p \"/create-mr:create-mr {ticket}\" --permission-mode bypassPermissions`（指令名稱帶 create-mr: 命名空間前綴——.claude/commands/create-mr/create-mr.md 是巢狀資料夾結構，Claude Code 會註冊成 create-mr:create-mr，純 /create-mr 會得到 Unknown command，T26 實測期間發現並修正；cwd=某個為此次觸發全新建立、完全獨立的 worktree，所有涉及 repo 含 rajah 一律真隔離不走 symlink，stdio 明確導向檔案，外包 timeout，避免 pipe buffer deadlock 與無限期卡死）→ webhook handler 立即返回，不維護 job 狀態、不輪詢 → 背景 process 用 trap 保證無論成功/失敗/中斷都執行 bug-lock.sh release、刪除該次 worktree（保留 git 分支），並解析 claude -p 輸出分類結果，只在 create-mr 自己不會通知的情境（未知失敗、Step 0.1/0.5 早退 SKIPPED）用 tg-notify.sh 補發通知，避免重複騷擾。Notion 狀態/留言寫回全由 create-mr pipeline 既有 agent 負責，dispatcher 不碰。上線（launchd 常駐 + ngrok tunnel + 對 Telegram 註冊 webhook）是唯一需要使用者最終確認的步驟，且必須排在所有程式模組完成、安全檢查通過、且做過一次真實 dry-run 之後。",
@@ -492,7 +496,7 @@
       "id": "T22",
       "module": "persistence",
       "title": "正式上線：launchd 常駐 + ngrok tunnel + 註冊 webhook",
-      "status": "todo",
+      "status": "in_progress",
       "depends_on": [
         "T16",
         "T18",
@@ -625,6 +629,25 @@
       ],
       "risk_notes": "非原始 6 面向 feasibility 調查產出，是使用者在 T17 實測驗收現場當場提出、直接定案的新需求（見 changelog）。跟 T23（需求池完整 pipeline，deferred）不衝突：這裡只動『何時觸發列清單』的時機，需求池按鈕本身的行為仍是 T9 的佔位邏輯，不提前實作 T23。",
       "suggested_agent": "general-purpose"
+    },
+    {
+      "id": "T30",
+      "module": "webhook-server",
+      "title": "訊息改指令式路由：bug 直接列清單 / req 需求池 / /menu 頂層選單",
+      "status": "in_progress",
+      "depends_on": [
+        "T29"
+      ],
+      "description": "使用者 2026-08-16 於 T22 上線驗收時定案，取代 T29「任何訊息都回頂層選單」：bot.on('message') 改為指令式路由——文字 bug（大小寫/空白容忍）直接觸發 T6 查詢列出候選工單（等同點頂層選單 BUG 按鈕）；文字 req 回需求池佔位回覆「開發中」（T23 仍 deferred，Notion 需求 data source 未確認，真清單待 T23 完成後與需求池按鈕一起接上）；文字 /menu 回 T29 頂層選單（既有 inline keyboard 與 callback 路由 menu:bug / reqpool:noop / claim:{ticket} 全部保留不變）；其他文字回用法提示（維持白名單內無安靜失敗路徑原則）。",
+      "acceptance_criteria": [
+        "發 bug 直接收到候選工單清單（與點 BUG 按鈕結果一致）",
+        "發 req 收到需求池佔位回覆",
+        "發 /menu 收到頂層選單，按鈕行為不變",
+        "發其他文字收到用法提示",
+        "單元測試涵蓋四條路由且全數通過"
+      ],
+      "risk_notes": "T27 重放去重與 T3 白名單順序不變（路由只發生在兩道閘之後）。req 目前是佔位：使用者要求的「列出需求工單列表」受 T23 阻擋（Notion 需求池 data source / 狀態欄位 / 對應 pipeline 均未確認），本 task 只交付路由本身，不隱含 T23 的展開。",
+      "suggested_agent": "main session 直接實作（單一檔案路由變更），review 依 HOW-TO-CONTINUE 慣例派三個唯讀 agent"
     }
   ]
 }

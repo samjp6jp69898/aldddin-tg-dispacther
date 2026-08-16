@@ -45,9 +45,11 @@ describe('registerHandlers — T29 頂層選單 + callback_query 路由', () => 
     expect(ctx.reply).not.toHaveBeenCalled()
   })
 
-  test('白名單內 chat_id 發訊息：回頂層選單（BUG／需求池兩顆按鈕），不查任何 Notion', async () => {
+  // T30：訊息改為指令式路由（/menu 才回頂層選單；bug 直接列清單；req 佔位；
+  // 其他文字回用法提示）——取代 T29「任何訊息都回頂層選單」。
+  test('T30：發 /menu：回頂層選單（BUG／需求池兩顆按鈕），不查任何 Notion', async () => {
     const handlers = captureHandlers()
-    const ctx = makeCtx({ chat: { id: REAL_TECH_CHAT_ID } })
+    const ctx = makeCtx({ chat: { id: REAL_TECH_CHAT_ID }, message: { text: '/menu' } })
     await handlers['message']!(ctx)
 
     expect(ctx.reply).toHaveBeenCalledTimes(1)
@@ -55,6 +57,41 @@ describe('registerHandlers — T29 頂層選單 + callback_query 路由', () => 
     expect(text).toBe('請選擇：')
     const buttonTexts = (opts as any).reply_markup.inline_keyboard.flat().map((b: any) => b.text)
     expect(buttonTexts).toEqual(['BUG', '需求池'])
+  })
+
+  // 跟 menu:bug 按鈕的測試同一個理由刻意不 mock Notion：要驗證的正是
+  // 「bug 這個文字路由真的接到會打 Notion 的那段」。
+  test('T30：發 bug（大小寫/空白容忍）：typing 提示 → 觸發真實 T6 查詢列清單', async () => {
+    const handlers = captureHandlers()
+    const ctx = makeCtx({ chat: { id: REAL_TECH_CHAT_ID }, message: { text: '  BUG ' } })
+    await handlers['message']!(ctx)
+
+    expect(ctx.replyWithChatAction).toHaveBeenCalledWith('typing')
+    expect(ctx.reply).toHaveBeenCalledTimes(1)
+    const [text] = ctx.reply.mock.calls[0]!
+    expect(['你的可認領工單：', '目前沒有可認領工單']).toContain(text)
+  })
+
+  test('T30：發 req：固定回開發中（T23 佔位），不觸發 typing／Notion 查詢', async () => {
+    const handlers = captureHandlers()
+    const ctx = makeCtx({ chat: { id: REAL_TECH_CHAT_ID }, message: { text: 'req' } })
+    await handlers['message']!(ctx)
+
+    expect(ctx.replyWithChatAction).not.toHaveBeenCalled()
+    expect(ctx.reply).toHaveBeenCalledWith('開發中')
+  })
+
+  test('T30：發未知文字／無文字訊息：回用法提示，不靜默、不觸發查詢', async () => {
+    const handlers = captureHandlers()
+    const ctx = makeCtx({ chat: { id: REAL_TECH_CHAT_ID }, message: { text: '哈囉' } })
+    await handlers['message']!(ctx)
+    expect(ctx.replyWithChatAction).not.toHaveBeenCalled()
+    expect(ctx.reply).toHaveBeenCalledTimes(1)
+    expect(String(ctx.reply.mock.calls[0]![0])).toContain('可用指令')
+
+    const ctxNoText = makeCtx({ chat: { id: REAL_TECH_CHAT_ID }, message: {} })
+    await handlers['message']!(ctxNoText)
+    expect(String(ctxNoText.reply.mock.calls[0]![0])).toContain('可用指令')
   })
 
   test('callback_query data=reqpool:noop：answer + 固定回開發中，不觸發 typing（沒有 Notion 查詢，T9 行為不變）', async () => {
