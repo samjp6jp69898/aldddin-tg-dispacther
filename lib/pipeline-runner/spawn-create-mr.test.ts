@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { mkdtempSync, readFileSync, rmSync, watch } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, watch, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { spawnDetachedProcess } from './spawn-create-mr.ts'
@@ -76,6 +76,148 @@ describe('spawnDetachedProcess — env 合併（T16 依賴的機制）', () => {
 
     const content = await waitForFileContent(stdoutPath, c => c.includes('DISPATCHER_TRIGGERED='))
     expect(content).toContain('DISPATCHER_TRIGGERED=unset')
+
+    rmSync(dir, { recursive: true, force: true })
+  })
+})
+
+// T26 依賴的機制：全域併發計數器要在背景 process 真正結束時才釋放名額，
+// 事件驅動（'exit'/'error'），不是 sleep/輪詢猜一個固定時間。這裡用真的
+// spawn（不 mock child_process），用 Promise 包住 onExit 呼叫本身當作
+// 完成訊號——沒有等待時間的猜測成分，onExit 什麼時候真的被呼叫，Promise
+// 就什麼時候 resolve。
+function waitForOnExit(spawnFn: (onExit: () => void) => void, timeoutMs = 5000): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('timeout waiting for onExit')), timeoutMs)
+    spawnFn(() => {
+      clearTimeout(timer)
+      resolve()
+    })
+  })
+}
+
+describe('spawnDetachedProcess — opts.onExit（T26 依賴的機制）', () => {
+  test('process 正常結束（exit 0）：onExit 被呼叫恰好一次', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'spawn-onexit-test-'))
+    const stdoutPath = join(dir, 'out.log')
+    const stderrPath = join(dir, 'err.log')
+    let calls = 0
+
+    await waitForOnExit(onExit =>
+      spawnDetachedProcess('bash', ['-c', 'exit 0'], {
+        cwd: dir,
+        stdoutPath,
+        stderrPath,
+        onExit: () => {
+          calls++
+          onExit()
+        },
+      }),
+    )
+
+    expect(calls).toBe(1)
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  test('process 以非 0 結束（模擬失敗/被 kill）：onExit 一樣被呼叫恰好一次——不是只有成功才釋放名額', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'spawn-onexit-test-'))
+    const stdoutPath = join(dir, 'out.log')
+    const stderrPath = join(dir, 'err.log')
+    let calls = 0
+
+    await waitForOnExit(onExit =>
+      spawnDetachedProcess('bash', ['-c', 'exit 1'], {
+        cwd: dir,
+        stdoutPath,
+        stderrPath,
+        onExit: () => {
+          calls++
+          onExit()
+        },
+      }),
+    )
+
+    expect(calls).toBe(1)
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  test('spawn 本身失敗（指令不存在）：onExit 仍被呼叫恰好一次，不會永久卡住名額', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'spawn-onexit-test-'))
+    const stdoutPath = join(dir, 'out.log')
+    const stderrPath = join(dir, 'err.log')
+    let calls = 0
+
+    await waitForOnExit(onExit =>
+      spawnDetachedProcess('this-command-definitely-does-not-exist-xyz', [], {
+        cwd: dir,
+        stdoutPath,
+        stderrPath,
+        onExit: () => {
+          calls++
+          onExit()
+        },
+      }),
+    )
+
+    expect(calls).toBe(1)
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  // T26 review 發現的測試空白：之前只測過「正常結束」跟「exit code 非 0」
+  // 兩種，沒有真的送過 kill signal 驗證 'exit' 事件真的會觸發——這正是
+  // spawnCreateMr 文件裡『被 timeout 殺』這個情境實際依賴的機制，之前只有
+  // 論證（Node 語意），沒有實測。這裡真的 spawn 一個長時間 sleep，再真的
+  // SIGKILL 它，確認 onExit 依然恰好被呼叫一次。
+  test('process 被真的 SIGKILL：onExit 依然被呼叫恰好一次（不是只有自然結束/exit code 才觸發）', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'spawn-onexit-test-'))
+    const stdoutPath = join(dir, 'out.log')
+    const stderrPath = join(dir, 'err.log')
+    let calls = 0
+    let capturedPid: number | undefined
+
+    // waitForOnExit 的 Promise executor 是同步執行的，spawnFn(onExit) 這行
+    // 跑完時 spawnDetachedProcess 已經同步回傳（child.pid 已知），所以下面
+    // 緊接著就能安全讀到 capturedPid，不需要額外等待。
+    const onExitPromise = waitForOnExit(onExit => {
+      capturedPid = spawnDetachedProcess('sleep', ['30'], {
+        cwd: dir,
+        stdoutPath,
+        stderrPath,
+        onExit: () => {
+          calls++
+          onExit()
+        },
+      })
+    })
+
+    expect(capturedPid).toBeDefined()
+    process.kill(capturedPid!, 'SIGKILL')
+
+    await onExitPromise
+    expect(calls).toBe(1)
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  // T26 review 發現的真實 bug 對應測試：spawnDetachedProcess 的
+  // mkdirSync/openSync（見函式開頭）在 onExit 監聽器掛上之前執行，若丟出
+  // 例外，onExit 完全沒機會被呼叫——這正是 spawnCreateMr 現在用 try/catch
+  // 接住並歸還名額的前提。這裡用一個「路徑中間段是檔案不是目錄」的
+  // stdoutPath 逼 mkdirSync 真的丟 ENOTDIR，驗證這個前提本身是真的（不是
+  // 想像的邊界情況）。
+  test('mkdirSync 目標路徑不合法（中間段是檔案不是目錄）：同步丟出例外，不是靜默失敗或非同步錯誤', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'spawn-onexit-test-'))
+    const notADir = join(dir, 'this-is-a-file')
+    writeFileSync(notADir, 'x')
+    const stdoutPath = join(notADir, 'subdir', 'out.log') // notADir 是檔案，底下不能再建目錄
+    const stderrPath = join(dir, 'err.log')
+
+    expect(() =>
+      spawnDetachedProcess('bash', ['-c', 'exit 0'], {
+        cwd: dir,
+        stdoutPath,
+        stderrPath,
+      }),
+    ).toThrow()
 
     rmSync(dir, { recursive: true, force: true })
   })

@@ -1,10 +1,16 @@
 import { spawn } from 'node:child_process'
 import { openSync, closeSync, mkdirSync, appendFileSync } from 'node:fs'
 import { join, dirname } from 'node:path'
+import { GLOBAL_CONCURRENCY_LIMIT, createConcurrencyLimiter } from './concurrency-limiter.ts'
 
 const LOG_DIR = '/Users/user/aladdin/telegram-dispatcher/logs'
 const SPAWN_ERROR_LOG = join(LOG_DIR, 'spawn-errors.log')
 const TICKET_RE = /^FAQ-\d+$/
+
+// T26：全 process 共用同一份額度，這個檔案是唯一消費者（見
+// concurrency-limiter.ts 檔頭註解）——tryAcquire 用在下面 spawnCreateMr，
+// release 用在背景 process 的 exit/error handler。
+const concurrencyLimiter = createConcurrencyLimiter(GLOBAL_CONCURRENCY_LIMIT)
 
 /**
  * 起一個完全脫離目前行程生命週期的背景 process：stdout/stderr 明確導向獨立
@@ -18,11 +24,17 @@ const TICKET_RE = /^FAQ-\d+$/
  * 沒接 listener 會被 Node 當成 uncaught exception，直接炸掉整個長駐的
  * webhook server process（review 實測驗證過）。這裡接住並寫進獨立的錯誤
  * log，換掉「整台 bot 陪葬」的後果。
+ *
+ * opts.onExit（T26）：背景 process 真正結束時呼叫一次，不管是正常結束、被
+ * timeout 殺、還是中途 crash（'exit' event 不分結束原因都會觸發，見下方
+ * 'exit'/'error' 兩個 listener 為何都接、且都經過同一個 guard 保證只呼叫一
+ * 次）。用來讓 T26 的全域併發計數器在背景流程真的結束時才釋放名額，不是猜
+ * 一個固定時間之後就當作結束——事件驅動，不是 sleep/輪詢。
  */
 export function spawnDetachedProcess(
   command: string,
   args: string[],
-  opts: { cwd: string; stdoutPath: string; stderrPath: string; env?: NodeJS.ProcessEnv },
+  opts: { cwd: string; stdoutPath: string; stderrPath: string; env?: NodeJS.ProcessEnv; onExit?: () => void },
 ): number | undefined {
   // stdout/stderr 分開兩個檔案（不是同一個檔案輪流寫）：--output-format json
   // 的 stdout 保證是單一乾淨的 JSON 陣列（實測驗證過），跟 stderr 雜訊混在
@@ -53,10 +65,24 @@ export function spawnDetachedProcess(
   closeSync(outFd)
   closeSync(errFd)
 
+  // 'error'（spawn 本身失敗，例如指令不存在）跟 'exit'（process 真的跑過、
+  // 結束）理論上互斥，但 Node 對 spawn 失敗時是否還會補發 'exit' 這件事沒有
+  // 跨版本/跨平台的穩定保證——用 guard 確保 onExit 不管哪個事件觸發都只算
+  // 一次，避免『spawn 失敗卻被兩個 event 各釋放一次名額』這種計數器多釋放
+  // 的邊界情況。
+  let onExitCalled = false
+  function callOnExitOnce(): void {
+    if (onExitCalled) return
+    onExitCalled = true
+    opts.onExit?.()
+  }
+
   child.on('error', err => {
     mkdirSync(dirname(SPAWN_ERROR_LOG), { recursive: true })
     appendFileSync(SPAWN_ERROR_LOG, `${new Date().toISOString()} spawn 失敗: ${command} ${args.join(' ')} -> ${err}\n`)
+    callOnExitOnce()
   })
+  child.on('exit', () => callOnExitOnce())
 
   child.unref()
   return child.pid
@@ -88,13 +114,21 @@ const BUG_LOCK_SH = '/Users/user/aladdin/scripts/bug-lock.sh'
  * 單一乾淨 JSON」的前提，也是 post-run-notify.ts 自己接下來要 JSON.parse 的
  * 那份檔案——必須先確保它沒被弄髒。
  */
+// T26 實測期間發現並修正（跟 T26 本身無關，屬既有嚴重問題，經使用者確認
+// 現在就修）：.claude/commands/create-mr/create-mr.md 是巢狀資料夾結構，
+// Claude Code 會把它註冊成帶命名空間的指令 create-mr:create-mr，不是原本
+// 這裡寫死的純 /create-mr——用純 /create-mr 呼叫會得到「Unknown command」，
+// 整個背景流程立刻結束，完全沒進到 pipeline 邏輯（真實 log 佐證，見 T26
+// changelog）。已用真實 claude -p 呼叫 /create-mr:create-mr（帶假單號，30 秒
+// timeout 內主動中斷）驗證這個命名空間前綴的指令真的會被辨識、真的開始跑
+// pipeline（多輪 tool use），不是憑猜測改。
 const WRAPPER_SCRIPT = `
 trap '
   EC=$?
   bash ${BUG_LOCK_SH} release "$1" >/dev/null 2>&1
   bun ${POST_RUN_NOTIFY_TS} "$1" "$EC" "$2" >/dev/null 2>&1
 ' EXIT
-timeout 3600 claude -p "/create-mr $1" --permission-mode bypassPermissions --output-format json
+timeout 3600 claude -p "/create-mr:create-mr $1" --permission-mode bypassPermissions --output-format json
 `
 
 /**
@@ -121,25 +155,63 @@ timeout 3600 claude -p "/create-mr $1" --permission-mode bypassPermissions --out
  * 行程生命週期（見該函式註解），若收尾邏輯綁在 Node 的事件監聽上，webhook
  * server 重啟/崩潰就會漏接收尾——違背 detached+unref 當初的設計初衷。改用
  * bash trap，讓收尾邏輯跟著這個獨立行程本身走，不依賴 Node 父行程存活。
+ *
+ * T26（不牴觸上一段）：全域併發計數器改用 Node 側 child.on('exit', ...)
+ * （見 spawnDetachedProcess 的 opts.onExit）釋放名額，這裡不是走 bash
+ * trap。原因：這個計數器本來就是 in-memory、只存在於「這個 webhook server
+ * process 自己記得自己啟動過幾個還沒結束的背景流程」，跟上一段講的『收尾
+ * 邏輯要撐過 server 重啟』是不同性質的東西——server 重啟時計數器本來就該
+ * 歸零（見 concurrency-limiter.ts 檔頭），不需要、也不可能靠 bash trap 讓
+ * 一個活在 Node process 記憶體裡的數字撐過那個 process 自己的重啟。
+ *
+ * review 發現並修正：tryAcquire 成功之後、真正 spawn 之前這段（mkdirSync／
+ * openSync，見 spawnDetachedProcess 開頭）是同步的，理論上可能丟出例外
+ * （磁碟滿、EMFILE fd 用盡——spawnDetachedProcess 自己的註解就承認這是長駐
+ * process 的真實風險、權限錯誤等）。若在這裡丟例外卻沒接住：(1) 上面已經
+ * tryAcquire 佔用的名額永遠不會釋放（onExit 根本沒機會註冊），變成永久洩漏；
+ * (2) 例外會一路往上炸穿 claim.ts、whitelist.ts，最後只被 server.ts 的
+ * app.onError 接住回 500——Telegram 使用者完全收不到任何回覆，違反 claim.ts
+ * 自己的既有原則『每個分支都要有明確回覆，沒有安靜失敗的路徑』。用 try/catch
+ * 包住，失敗時歸還名額、寫進既有的 SPAWN_ERROR_LOG（跟 spawnDetachedProcess
+ * 的 'error' handler 同一個 log 檔，同一種『記錄但不讓呼叫端連坐』的慣例），
+ * 回傳一個獨立的 reason 讓 claim.ts 能回覆使用者明確的失敗訊息。
  */
-export function spawnCreateMr(ticket: string): number | undefined {
+export function spawnCreateMr(
+  ticket: string,
+): { ok: true; pid: number | undefined } | { ok: false; reason: 'concurrency_limit' | 'spawn_error' } {
   if (!TICKET_RE.test(ticket)) {
     throw new Error(`拒絕 spawn：ticket 格式不對（${ticket}），可能是注入嘗試`)
   }
 
-  const timestamp = new Date().toISOString().replace(/[:.]/g, '-')
-  const base = `${ticket}.${timestamp}`
-  const stdoutPath = join(LOG_DIR, `${base}.stdout.log`)
-  const stderrPath = join(LOG_DIR, `${base}.stderr.log`)
+  if (!concurrencyLimiter.tryAcquire()) {
+    return { ok: false, reason: 'concurrency_limit' }
+  }
 
-  return spawnDetachedProcess('bash', ['-c', WRAPPER_SCRIPT, 'run-create-mr', ticket, stdoutPath], {
-    cwd: '/Users/user/aladdin',
-    stdoutPath,
-    stderrPath,
-    // T16：告訴這條背景流程「我是被 dispatcher 觸發的」，setup-worktree.sh
-    // 收到這個訊號後強制全部 repo 真隔離（見該腳本內對應註解），根除多人
-    // 同時觸發時共用主 repo symlink 的 bootstrap 碰撞風險。單線 /create-mr、
-    // /create-mrs 不會設這個環境變數，行為不受影響。
-    env: { DISPATCHER_TRIGGERED: '1' },
-  })
+  try {
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-')
+    const base = `${ticket}.${timestamp}`
+    const stdoutPath = join(LOG_DIR, `${base}.stdout.log`)
+    const stderrPath = join(LOG_DIR, `${base}.stderr.log`)
+
+    const pid = spawnDetachedProcess('bash', ['-c', WRAPPER_SCRIPT, 'run-create-mr', ticket, stdoutPath], {
+      cwd: '/Users/user/aladdin',
+      stdoutPath,
+      stderrPath,
+      // T16：告訴這條背景流程「我是被 dispatcher 觸發的」，setup-worktree.sh
+      // 收到這個訊號後強制全部 repo 真隔離（見該腳本內對應註解），根除多人
+      // 同時觸發時共用主 repo symlink 的 bootstrap 碰撞風險。單線 /create-mr、
+      // /create-mrs 不會設這個環境變數，行為不受影響。
+      env: { DISPATCHER_TRIGGERED: '1' },
+      // T26：不管背景流程最後是成功、失敗、被 timeout 殺、還是中途 crash，
+      // 只要真的結束就釋放名額——見 spawnDetachedProcess 的 'exit'/'error'
+      // handler，兩者都保證只呼叫一次。
+      onExit: () => concurrencyLimiter.release(),
+    })
+    return { ok: true, pid }
+  } catch (err) {
+    concurrencyLimiter.release()
+    mkdirSync(dirname(SPAWN_ERROR_LOG), { recursive: true })
+    appendFileSync(SPAWN_ERROR_LOG, `${new Date().toISOString()} spawnCreateMr 失敗（${ticket}）: ${err}\n`)
+    return { ok: false, reason: 'spawn_error' }
+  }
 }

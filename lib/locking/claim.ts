@@ -59,12 +59,31 @@ export async function handleClaim(ctx: Context, techUser: TechUser, ticket: stri
     return
   }
 
-  await ctx.reply(`已開始處理 ${ticket}`)
-
   ensureTrackerPending(ticket)
 
   // 把鎖的擁有權交給即將 spawn 的 /create-mr 自己的 Step 0.1.3（見 releaseLock 註解）。
   releaseLock(ticket)
 
-  spawnCreateMr(ticket)
+  // T26：先真的 spawn（內部會先檢查全域併發上限），確定有沒有名額，再決定
+  // 要回覆「已開始處理」還是「已達上限」——順序很重要：如果先回「已開始
+  // 處理」才發現額度不夠，會變成回覆內容自相矛盾的靜默失敗（違反 T10 的
+  // 『每個分支都要有明確回覆』原則）。per-ticket 鎖已經在上面 release 掉，
+  // 沒佔滿全域額度不影響其他人認領同一張單（bug-lock 只擋『幾乎同時點同一
+  // 張單』那個瞬間，鎖本來就該儘早放手，見 releaseLock 註解）。
+  const result = spawnCreateMr(ticket)
+  if (!result.ok) {
+    // review 發現：spawnCreateMr 內部 spawn 失敗（磁碟/fd 用盡等）跟「單純
+    // 額度滿了」是不同情境，給不同訊息——都要有明確回覆，不能讓使用者在
+    // 例外未接住的舊版行為下完全收不到任何訊息（見 spawnCreateMr 的
+    // spawn_error 分支註解）。per-ticket 鎖已經 release，兩種情況都可以
+    // 重新嘗試認領。
+    const text =
+      result.reason === 'concurrency_limit'
+        ? `${ticket} 目前無法啟動：背景流程已達全域併發上限，請稍後再試。`
+        : `${ticket} 目前無法啟動：背景流程啟動失敗，請稍後再試或聯絡維運人員檢查 spawn-errors.log。`
+    await ctx.reply(text)
+    return
+  }
+
+  await ctx.reply(`已開始處理 ${ticket}`)
 }
