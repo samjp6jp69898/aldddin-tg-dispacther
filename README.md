@@ -78,6 +78,25 @@ curl http://localhost:8787/health
 > **T22 尚未執行前，以上 launchd 啟動指令不要自己跑**——正式上線（含真的
 > 呼叫 Telegram `setWebhook`）需要使用者本人在場確認，見 `tasks.json` T22。
 
+## Telegram 端使用方式（技術人員視角）
+
+前提：使用者的 `tg_chat_id` 必須已登記在
+`obsidian/commands/create-mr/references/tech-users.csv`（新技術第一次 DM bot
+之後，用 `/tg-chatid-sync` skill 把 chat_id 回填 CSV）；白名單外的 chat_id
+發什麼都會被**靜默忽略**（不回覆、不報錯，見 T3）。
+
+1. 對 bot（`@bug_analyst_bot`）發送任意訊息 → 回頂層選單（`BUG` / `需求池`）。
+2. 點 `BUG` → 依 Notion「當前指派」查你名下的候選工單，逐顆列成按鈕；
+   沒有可認領單時明確回覆「目前沒有可認領工單」。（`需求池` 目前是 UI
+   佔位，點了無實際動作，見 T9/T23。）
+3. 點 `claim:{ticket}` 按鈕 → 上鎖防重複認領 → 背景觸發 `/create-mr`
+   pipeline（單張約 20–40 分鐘）。同一時間全域最多 5 條背景流程（T26），
+   超過會明確回覆請稍後再試。
+4. 結果通知：pipeline 正常結束時依 create-mr 自己的出口規則發 TG／留
+   Notion 留言（`already_fixed`／`i18n`／`failed` 只留 Notion 不發 TG）；
+   只有流程**異常結束**（infra／CLI 層炸掉、無法辨識結果）才由 dispatcher
+   補發「⚠️ 需人工檢查」訊息附 log 路徑（T13）。
+
 ## 需要的環境變數（都放在根目錄 `/Users/user/aladdin/.env`）
 
 | 變數 | 說明 |
