@@ -37,7 +37,7 @@ function makeCtx(overrides: Record<string, unknown>) {
   }
 }
 
-describe('registerHandlers — T29 頂層選單 + callback_query 路由', () => {
+describe('registerHandlers — T30 指令式訊息路由 + T29 callback_query 路由', () => {
   test('白名單外 chat_id 發訊息：靜默 return，不回覆任何東西', async () => {
     const handlers = captureHandlers()
     const ctx = makeCtx({ chat: { id: NOT_TECH_CHAT_ID } })

@@ -627,7 +627,7 @@
         "點需求池按鈕行為與 T9 完全一致：固定回覆『開發中』，不觸發任何 Notion/tracker/bug-lock 查詢",
         "點候選單裡的工單按鈕（claim:{ticket}）行為與現有 T10 完全一致，不受這次改版影響"
       ],
-      "risk_notes": "非原始 6 面向 feasibility 調查產出，是使用者在 T17 實測驗收現場當場提出、直接定案的新需求（見 changelog）。跟 T23（需求池完整 pipeline，deferred）不衝突：這裡只動『何時觸發列清單』的時機，需求池按鈕本身的行為仍是 T9 的佔位邏輯，不提前實作 T23。",
+      "risk_notes": "非原始 6 面向 feasibility 調查產出，是使用者在 T17 實測驗收現場當場提出、直接定案的新需求（見 changelog）。跟 T23（需求池完整 pipeline，deferred）不衝突：這裡只動『何時觸發列清單』的時機，需求池按鈕本身的行為仍是 T9 的佔位邏輯，不提前實作 T23。（註：本 task 的「任何訊息回頂層選單」行為已於 2026-08-16 被 T30 取代——訊息改指令式路由，頂層選單改由 /menu 觸發；本 task 產出的頂層選單元件與 callback 路由仍沿用。）",
       "suggested_agent": "general-purpose"
     },
     {
