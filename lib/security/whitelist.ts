@@ -4,6 +4,7 @@ import { sendTopLevelMenu } from '../webhook-server/top-menu.ts'
 import { sendTicketList } from '../webhook-server/ticket-list.ts'
 import { sendDemandList } from '../webhook-server/demand-list.ts'
 import { handleClaim } from '../locking/claim.ts'
+import { handleDemandClaim } from '../locking/demand-claim.ts'
 import { createReplayGuard } from './replay-guard.ts'
 
 // grammy 的 secretToken（見 lib/webhook-server/bot.ts / server.ts）只驗證請求
@@ -17,8 +18,8 @@ import { createReplayGuard } from './replay-guard.ts'
  * 清單 / /req 需求池清單 / /menu 頂層選單 / 其他回用法提示，見 handler 內
  * 註解）；callback_query 依 callback_data 分流 menu:bug（T29，觸發 T6/T8
  * 查詢列清單）/ reqpool:noop（T9 建立、T32 接上真實需求池清單）/
- * claim:{ticket}（T10）/ demand-claim:{ticket}（T32 列出，實際認領行為待
- * T33，目前按下去只回覆功能開發中）。
+ * claim:{ticket}（T10）/ demand-claim:{ticket}（T33，上鎖＋更新 Notion
+ * AI分析，不觸發任何自動化 pipeline）。
  *
  * T27：白名單通過之後才做 update_id 重放去重（review 發現：順序放反的話，
  * 白名單外的陌生流量也會消耗共用的追蹤額度，稀釋掉真正該防的重放窗口；
@@ -108,11 +109,7 @@ export function registerHandlers(bot: Bot): void {
         return
       }
       if (data.startsWith('demand-claim:')) {
-        // T32 只做到列出需求單，claim 行為本身待 T33（見 demand-list.ts
-        // 檔頭註解）——按鈕先讓它可見、可按，但不做安靜失敗，明確告知使用者
-        // 這裡還沒做完，而不是像未知 callback_data 那樣毫無回應。
-        await ctx.answerCallbackQuery()
-        await ctx.reply('需求單認領功能開發中（T33），目前只能列出清單。')
+        await handleDemandClaim(ctx, techUser, data.slice('demand-claim:'.length))
         return
       }
 

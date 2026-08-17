@@ -1,4 +1,4 @@
-import { execFile } from 'node:child_process'
+import { execFile, execFileSync } from 'node:child_process'
 import { promisify } from 'node:util'
 
 const execFileAsync = promisify(execFile)
@@ -74,4 +74,24 @@ export async function queryDemandPoolTickets(notionUserId: string): Promise<stri
     .map((page: any) => page.properties?.['ID']?.unique_id?.number)
     .filter((n: unknown): n is number => typeof n === 'number')
     .map((n: number) => `ALDREQ-${n}`)
+}
+
+/**
+ * 查單一需求單目前在 Notion 的頁面 URL（給 T33 claim handler 更新 AI分析
+ * 欄位用，比照 candidate-tickets.ts 的 getTicketNotionUrl）。ticket 格式
+ * 不是 ALDREQ-{number} 或查無此單都回傳 null，不丟例外。
+ */
+export function getDemandTicketNotionUrl(ticket: string): string | null {
+  const match = /^ALDREQ-(\d+)$/.exec(ticket)
+  if (!match) return null
+
+  const filter = { property: 'ID', unique_id: { equals: Number(match[1]) } }
+  const raw = execFileSync('bash', [NOTION_SH, 'query-datasource', DATA_SOURCE_ID, JSON.stringify(filter)], {
+    encoding: 'utf8',
+    maxBuffer: 10 * 1024 * 1024,
+  })
+
+  const parsed = JSON.parse(raw)
+  if (!Array.isArray(parsed.results) || parsed.results.length === 0) return null
+  return parsed.results[0]?.url ?? null
 }

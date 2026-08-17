@@ -126,17 +126,10 @@ describe('registerHandlers — T30 指令式訊息路由（斜線指令） + T29
     expect(['你的可認領需求單：', '目前沒有可認領需求單']).toContain(text)
   })
 
-  // T32：demand-claim:{ticket} 目前只是可見/可按但功能未實作（T33），要有
-  // 明確回覆，不是安靜失敗。
-  test('callback_query data=demand-claim:{ticket}：answer + 明確回覆功能開發中，不誤觸發任何 claim 邏輯', async () => {
-    const handlers = captureHandlers()
-    const ctx = makeCtx({ chat: { id: REAL_TECH_CHAT_ID }, callbackQuery: { data: 'demand-claim:ALDREQ-741' } })
-    await handlers['callback_query:data']!(ctx)
-
-    expect(ctx.answerCallbackQuery).toHaveBeenCalledTimes(1)
-    expect(ctx.reply).toHaveBeenCalledTimes(1)
-    expect(String(ctx.reply.mock.calls[0]![0])).toContain('開發中')
-  })
+  // T33：demand-claim:{ticket} 現在有真實副作用（bug-lock.sh + 寫 Notion），
+  // 跟 claim:{ticket} 一樣不該在這個用真的 handler 的測試檔案裡測——已移到
+  // whitelist-claim-routing.test.ts，用 mock.module 掉 handleDemandClaim，
+  // 只驗證路由拆解正確，不執行真邏輯。
 
   // 這條會真的打一次 Notion API（sendTicketList 內部呼叫 T6 的
   // queryCandidateTickets，未 mock）——刻意不 mock：這條測試要驗證的正是
