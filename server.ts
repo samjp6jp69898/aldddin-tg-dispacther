@@ -19,6 +19,28 @@ registerHandlers(bot)
 await bot.init()
 console.error(`telegram-dispatcher: bot initialized as @${bot.botInfo.username}`)
 
+// T30：讓 Telegram 客戶端的「/」指令選單顯示 /bug /req /menu（含說明文字），
+// 使用者打「/」時才有 autocomplete 可選，不用死記指令字串。setMyCommands
+// 是覆寫式、冪等 API，每次啟動都呼叫一次即可維持跟 whitelist.ts 實際路由
+// 邏輯同步，不需要另外手動用 BotFather 維護一份容易漂移的清單。
+//
+// 明確指定 scope: all_private_chats（而非留白吃 default scope）：Telegram
+// 的 scope 優先序是 chat 專屬 > all_private_chats > default，這個 bot 本來
+// 就是純 DM 使用（白名單靠 chat_id 判斷，見 whitelist.ts），語意上本該對應
+// all_private_chats；且實測發現這個 bot token 底下先前已經有一組殘留在
+// all_private_chats scope 的舊指令（/start /help /status，來源不明，疑似
+// BotFather 建立時的預設範本），優先度比 default 高，只設 default 蓋不掉，
+// 使用者端「/」選單仍會看到舊清單——已改成直接設在 all_private_chats scope
+// 蓋掉殘留值。
+await bot.api.setMyCommands(
+  [
+    { command: 'bug', description: '列出你可認領的 Bug 工單' },
+    { command: 'req', description: '需求池（開發中，見 T23）' },
+    { command: 'menu', description: '顯示頂層選單' },
+  ],
+  { scope: { type: 'all_private_chats' } },
+)
+
 const app = new Hono()
 
 // T24 review 順帶發現並修正：空 body／格式錯誤的 JSON（帶對的 secret_token）

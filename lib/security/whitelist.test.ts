@@ -37,7 +37,7 @@ function makeCtx(overrides: Record<string, unknown>) {
   }
 }
 
-describe('registerHandlers — T30 指令式訊息路由 + T29 callback_query 路由', () => {
+describe('registerHandlers — T30 指令式訊息路由（斜線指令） + T29 callback_query 路由', () => {
   test('白名單外 chat_id 發訊息：靜默 return，不回覆任何東西', async () => {
     const handlers = captureHandlers()
     const ctx = makeCtx({ chat: { id: NOT_TECH_CHAT_ID } })
@@ -45,8 +45,9 @@ describe('registerHandlers — T30 指令式訊息路由 + T29 callback_query �
     expect(ctx.reply).not.toHaveBeenCalled()
   })
 
-  // T30：訊息改為指令式路由（/menu 才回頂層選單；bug 直接列清單；req 佔位；
-  // 其他文字回用法提示）——取代 T29「任何訊息都回頂層選單」。
+  // T30（2026-08-17 使用者收尾驗收時定案：改為斜線指令 /bug /req /menu，
+  // 取代原本的裸文字 bug/req，避免閒聊訊息剛好整句是 "bug"/"req" 誤觸）：
+  // /menu 回頂層選單；/bug 直接列清單；/req 佔位；其他文字回用法提示。
   test('T30：發 /menu：回頂層選單（BUG／需求池兩顆按鈕），不查任何 Notion', async () => {
     const handlers = captureHandlers()
     const ctx = makeCtx({ chat: { id: REAL_TECH_CHAT_ID }, message: { text: '/menu' } })
@@ -60,10 +61,10 @@ describe('registerHandlers — T30 指令式訊息路由 + T29 callback_query �
   })
 
   // 跟 menu:bug 按鈕的測試同一個理由刻意不 mock Notion：要驗證的正是
-  // 「bug 這個文字路由真的接到會打 Notion 的那段」。
-  test('T30：發 bug（大小寫/空白容忍）：typing 提示 → 觸發真實 T6 查詢列清單', async () => {
+  // 「/bug 這個指令路由真的接到會打 Notion 的那段」。
+  test('T30：發 /bug（大小寫/空白容忍）：typing 提示 → 觸發真實 T6 查詢列清單', async () => {
     const handlers = captureHandlers()
-    const ctx = makeCtx({ chat: { id: REAL_TECH_CHAT_ID }, message: { text: '  BUG ' } })
+    const ctx = makeCtx({ chat: { id: REAL_TECH_CHAT_ID }, message: { text: '  /BUG ' } })
     await handlers['message']!(ctx)
 
     expect(ctx.replyWithChatAction).toHaveBeenCalledWith('typing')
@@ -72,13 +73,25 @@ describe('registerHandlers — T30 指令式訊息路由 + T29 callback_query �
     expect(['你的可認領工單：', '目前沒有可認領工單']).toContain(text)
   })
 
-  test('T30：發 req：固定回開發中（T23 佔位），不觸發 typing／Notion 查詢', async () => {
+  test('T30：發 /req：固定回開發中（T23 佔位），不觸發 typing／Notion 查詢', async () => {
     const handlers = captureHandlers()
-    const ctx = makeCtx({ chat: { id: REAL_TECH_CHAT_ID }, message: { text: 'req' } })
+    const ctx = makeCtx({ chat: { id: REAL_TECH_CHAT_ID }, message: { text: '/req' } })
     await handlers['message']!(ctx)
 
     expect(ctx.replyWithChatAction).not.toHaveBeenCalled()
     expect(ctx.reply).toHaveBeenCalledWith('開發中')
+  })
+
+  test('T30：發不帶斜線的裸文字 bug/req：不再被當成指令，回用法提示（斜線是唯一合法格式）', async () => {
+    const handlers = captureHandlers()
+    const ctxBug = makeCtx({ chat: { id: REAL_TECH_CHAT_ID }, message: { text: 'bug' } })
+    await handlers['message']!(ctxBug)
+    expect(ctxBug.replyWithChatAction).not.toHaveBeenCalled()
+    expect(String(ctxBug.reply.mock.calls[0]![0])).toContain('可用指令')
+
+    const ctxReq = makeCtx({ chat: { id: REAL_TECH_CHAT_ID }, message: { text: 'req' } })
+    await handlers['message']!(ctxReq)
+    expect(String(ctxReq.reply.mock.calls[0]![0])).toContain('可用指令')
   })
 
   test('T30：發未知文字／無文字訊息：回用法提示，不靜默、不觸發查詢', async () => {

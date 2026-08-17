@@ -13,8 +13,8 @@ import { createReplayGuard } from './replay-guard.ts'
 /**
  * 掛載 bot.on('message') 與 bot.on('callback_query:data')，白名單外的 chat_id
  * 一律靜默 return，不執行任何後續 Notion/tracker 查詢或 keyboard 組裝。
- * 白名單內的 chat_id 通過後往下流動——訊息走 T30 指令式路由（bug 直接列
- * 清單 / req 需求池佔位 / /menu 頂層選單 / 其他回用法提示，見 handler 內
+ * 白名單內的 chat_id 通過後往下流動——訊息走 T30 指令式路由（/bug 直接列
+ * 清單 / /req 需求池佔位 / /menu 頂層選單 / 其他回用法提示，見 handler 內
  * 註解）；callback_query 依 callback_data 分流 menu:bug（T29，觸發 T6/T8
  * 查詢列清單）/ reqpool:noop（T9）/ claim:{ticket}（T10）。
  *
@@ -47,23 +47,25 @@ export function registerHandlers(bot: Bot): void {
 
     try {
       // T30（使用者 2026-08-16 於 T22 上線驗收時定案，取代 T29「任何訊息都
-      // 回頂層選單」）：改為指令式路由——
-      //   bug   → 直接列 Bug 候選工單（等同點頂層選單的 BUG 按鈕）
-      //   req   → 需求池；T23 仍 deferred（Notion 需求 data source 未確認），
+      // 回頂層選單」；2026-08-17 使用者收尾驗收時再定案改為斜線指令，取代
+      // 原本的裸文字 bug/req，跟 /menu 統一成同一種指令格式，避免裸文字誤觸
+      // ——例如閒聊訊息剛好整句就是 "bug" 或 "req"）：
+      //   /bug  → 直接列 Bug 候選工單（等同點頂層選單的 BUG 按鈕）
+      //   /req  → 需求池；T23 仍 deferred（Notion 需求 data source 未確認），
       //           目前與需求池按鈕同一個佔位回覆，T23 完成後兩處一起接真清單
       //   /menu → 頂層選單（既有 inline keyboard 流程保留，按鈕路由不變）
       //   其他  → 回覆用法提示。維持「白名單內沒有安靜失敗的路徑」原則，
       //           所以不是靜默忽略；比對大小寫不敏感、含前後空白容忍。
       const text = (ctx.message?.text ?? '').trim().toLowerCase()
-      if (text === 'bug') {
+      if (text === '/bug') {
         await ctx.replyWithChatAction('typing') // 跟 menu:bug 按鈕同款：真的打 Notion 前先給讀取中提示
         await sendTicketList(ctx, techUser)
-      } else if (text === 'req') {
+      } else if (text === '/req') {
         await ctx.reply('開發中')
       } else if (text === '/menu') {
         await sendTopLevelMenu(ctx)
       } else {
-        await ctx.reply('可用指令：bug（列出可認領 Bug 工單）、req（需求池）、/menu（選單）')
+        await ctx.reply('可用指令：/bug（列出可認領 Bug 工單）、/req（需求池）、/menu（選單）')
       }
     } catch (err) {
       replayGuard.forget(updateId)
