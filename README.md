@@ -75,8 +75,67 @@ curl http://localhost:8787/health
 # {"status":"ok","uptime_seconds":123}
 ```
 
-> **T22 尚未執行前，以上 launchd 啟動指令不要自己跑**——正式上線（含真的
-> 呼叫 Telegram `setWebhook`）需要使用者本人在場確認，見 `tasks.json` T22。
+> T22（正式上線）已於 2026-08-16／17 由使用者本人在場確認完成，`setWebhook`
+> 已呼叫過一次（見下方「查目前 Telegram 端實際登記的 webhook 狀態」）。以上
+> launchd 啟動指令目前可以正常操作；唯一仍需要使用者在場確認的情境是**換
+> 一台新機器重新上線**，見下一節「在另一台機器部署」。
+
+## 在另一台機器部署
+
+這支服務**不是獨立可攜的服務**：它觸發的 `/create-mr` pipeline 依賴整個
+aladdin/obsidian 生態系（`obsidian/commands/create-mr/references/tech-users.csv`、
+`scripts/bug-lock.sh`／`notion.sh`／`pipeline-status.sh`／`setup-worktree.sh`、
+`.claude/commands/create-mr` 這支指令本身、以及 `agrabah`／`abu`／`lago`／`rajah`
+等子專案的 git checkout），換機器等於要把整個 aladdin 開發環境搬過去，不是
+只複製 `telegram-dispatcher/` 這個資料夾就好。
+
+### 前置安裝 checklist
+
+1. **整份 aladdin monorepo**（含 `obsidian/` 子 repo、`agrabah`/`abu`/`lago`/
+   `rajah` 等 `/create-mr` pipeline 實際會用到的子專案、`.claude/` 底下的
+   commands/agents/skills）與 Claude Code CLI 本身（已登入、且能正常執行
+   `/create-mr:create-mr` 這個 slash command）。
+2. **bun**（跟原機器同版本或相容版本）：`cd telegram-dispatcher && bun install`
+   （目前依賴只有 `grammy`/`hono`，見 `package.json`，很輕量）。
+3. **ngrok**：安裝後執行 `ngrok config add-authtoken <token>`——**必須是同一個
+   ngrok 帳號**才能沿用既有的 reserved domain
+   `unrefreshing-trudy-subsequently.ngrok-free.dev`；帳號不同這個 domain 用
+   不了，換新 domain 或轉移 domain 的擁有權都超出本文件範圍，另外處理。
+4. **根目錄 `.env`**（`/Users/user/aladdin/.env`）：至少要有下面「需要的
+   環境變數」章節列的四個 `TG_*`/`PORT` 變數；`/create-mr` pipeline 本身還
+   需要 aladdin 主線既有的其他環境變數（Notion token 等），隨 aladdin 主線
+   走，不在本文件重複列。
+
+### 路徑是寫死的，換機器前務必核對
+
+目前這幾處**硬編碼絕對路徑**，假設帳號叫 `user`、aladdin 就在
+`/Users/user/aladdin`：
+
+| 檔案 | 寫死的內容 |
+|---|---|
+| `launchd/com.aladdin.tg-dispatch-server.plist` | `ProgramArguments`、`WorkingDirectory`、`StandardOutPath`、`StandardErrorPath`、`PATH`（含 `/Users/user/.bun/bin`） |
+| `launchd/com.aladdin.tg-dispatch-tunnel.plist` | 同上四項 |
+| `launchd/run-server.sh` | `ALADDIN="/Users/user/aladdin"`、`BUN="/Users/user/.bun/bin/bun"` |
+| `launchd/run-tunnel.sh` | `NGROK="/opt/homebrew/bin/ngrok"`（Apple Silicon 的 Homebrew 路徑；Intel Mac 通常是 `/usr/local/bin/ngrok`，裝之前先 `which ngrok` 確認） |
+
+- **新機器帳號同樣叫 `user`、aladdin 也 clone 在完全一樣的 `/Users/user/aladdin`**
+  → 以上檔案不用改，直接把整個 repo（連同 `.env`）搬過去即可。
+- **帳號或路徑不一樣** → 上面四個檔案都要對應改成新路徑，改完才能
+  `cp ... ~/Library/LaunchAgents/` 並 `launchctl bootstrap`（見上一節）。
+
+### 換機器時「要不要重新 `setWebhook`」
+
+**不需要**——只要新機器用的是同一個 ngrok 帳號、同一個 reserved domain，
+Telegram 端登記的 webhook 網址完全不變（`getWebhookInfo` 查到的 `url` 不會
+變），換機器只是換了「誰在背後接手機請求」。**但兩台機器不能同時開著**
+（ngrok 免費方案同時間只允許 1 個 tunnel session，見「已知操作風險」）：
+正確順序是先在舊機器 `launchctl bootout` 兩支服務（或直接關機/停用），確認
+舊 tunnel 真的斷了，再到新機器 `launchctl bootstrap` 啟動。中間會有一段
+webhook 完全收不到訊息的空窗，選一個沒人在用的時段切換。
+
+切換完務必**實際驗證一次**（比照 T21/T22 的收尾方式，不能只憑 process 有
+在跑就判定成功）：`curl /health`、`getWebhookInfo` 確認網址與 `last_error_message`
+正常、再用真實白名單 Telegram 帳號發 `/menu` 走一次完整流程確認收得到回覆。
 
 ## Telegram 端使用方式（技術人員視角）
 
