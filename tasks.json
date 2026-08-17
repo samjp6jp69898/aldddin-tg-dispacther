@@ -87,6 +87,10 @@
     {
       "date": "2026-08-17",
       "note": "T23（需求池調查）唯讀調查完成，標記 done，拆解為 T31-T36。調查發現：Notion 需求池 data source 是『總需求池資料庫』（ticket 編號 ALDREQ-{number}，與 Bug List 平行且有 relation 互連，data_source_id: 21d87d78-618a-8135-ad4f-000b273e1293）；people 欄位不像 Bug List『當前指派』乾淨，有『技術處理人員／指派人／負責人／測試人』四個欄位混雜，抽樣顯示『技術處理人員』在最接近可認領的狀態（文件完成待處理）反而常是空的（100 筆僅 5 筆有填）；且完全沒有找到等價於 create-mr 的需求池自動化 pipeline（但 ALDREQ 工單確實有人在手動處理，commit history 有大量真實紀錄）。\n\n使用者定案：claim 判準用『技術處理人員』∩ 狀態∈{文件完成待處理, 需求仍有問題}；claim 後動作選擇全自動化型（比照 create-mr）。\n\n第一版拆解（T31-T39）比照 create-mr 的多階段方法論（tracer 等價物→implementer→專屬 review 標準→整合），使用者當場推翻並重新定案：**不需要比照 create-mr 拆成多階段**——現在的 harness 與模型能力已經足夠，給足夠 context 就能一次產出好結果，只需要保留 create-mr 精神裡『第一步』的判斷（Notion 需求書＋留言內容是否足夠產出好結果，比照 pre-check fast-path 的精神），其餘交給一個有足夠上下文/輔助文件的單一 agent 直接做完，再跑一次通用 review、實際跑 E2E。已改寫為精簡版：T34（需求規格充足度判斷 gate）→ T35（單一需求實作 agent，不拆解法設計/implementer/review 標準三階段）→ T36（整合進 dispatcher + 真實 E2E，比照 T21/T22 紀律）。T31-T33（候選單查詢/UI/claim handler）維持原拆解不變，這部分本來就跟 Bug 工單的既有模式高度平行，範圍明確不需要簡化。\n\n這筆記錄留給下一個 session：如果之後又想幫需求 pipeline加回多階段設計，先看這裡——是使用者明確拍板要簡化，不是本 session 自己偷懶跳過。"
+    },
+    {
+      "date": "2026-08-17",
+      "note": "T31 實作：新增 lib/notion-integration/demand-pool-tickets.ts + demand-pool-tickets.test.ts，比照 candidate-tickets.ts 但查詢『總需求池資料庫』，filter 用『技術處理人員』people contains ∩ 『狀態』∈{文件完成待處理, 需求仍有問題}。實作前先用 notion.sh query-datasource 唯讀實測驗證過這個 database 的『狀態』屬性是 Notion **status** 型（不是 Bug List 的 select 型），filter 語法對應改用 `{status:{equals}}`，混用會讓 Notion API 直接回錯誤，不是猜測。\n\n3 個唯讀 review agent（正確性/欄位型別、風格一致性、邊界情況與 pagination）皆回報 PASS，正確性 review 用真實 API 交叉驗證 `狀態`/`技術處理人員`/`ID` 三個屬性型別；邊界情況 review 用 11 個真實技術帳號逐一實測 filter（6 個查到空清單、5 個查到真實候選單），額外挖到一個真實但目前未觸發的缺口：notion.sh query-datasource 固定 page_size=100，完全沒有處理 has_more/next_cursor，屬於『靜默丟資料』風險（比報錯更危險）——今天單一技術人員最多只有 2 張候選單，離 100 很遠，但沒有任何防線。已在 demand-pool-tickets.ts 加一道 fail-loud 防護：查到 has_more=true 就直接拋錯，不回傳不完整清單；刻意不動 notion.sh 本身（整個 aladdin 共用的腳本，改動範圍與影響超出 T31，candidate-tickets.ts 也共用同一支腳本、有同樣的潛在缺口，留給之後有人專門處理 notion.sh 分頁支援時一併修）。風格 review 也指出 T31 description 原本寫『回傳格式含標題、Notion URL』跟實際實作（只回單號字串，比照 candidate-tickets.ts 既有慣例）不符，已修正 description 用字。\n\n測試刻意不斷言具體 ticket 編號/張數（只驗證 ALDREQ-{number} 格式），避免真實資料隨時間變動（單子被處理完畢）導致測試 flaky——比照 whitelist.test.ts 對 Bug List 查詢『接受目前沒有可認領工單／有清單』兩種可能結果的既有慣例。bun test 85/85 pass（含 2 個真實打 Notion API 的唯讀測試）。"
     }
   ],
   "architecture_summary": "Telegram → ngrok 固定 domain (unrefreshing-trudy-subsequently.ngrok-free.dev) → 本機常駐 Bun+Hono+grammy webhook server（獨立 TG_DISPATCH_BOT_TOKEN，走 grammy 官方 'hono' adapter + secretToken 驗證）→ chat_id 白名單（tech-users.csv）→ 反查 notion_user_id → 用 people.contains filter 正向查該人在 Notion Bug List 的候選單並以 Notion『狀態』欄位（仍有問題/待處理）為唯一可認領判準（僅走 scripts/notion.sh；不再拿 tracker.sh row 的 pending/rerun 狀態做二次篩選——這是使用者明確定案，見 changelog）→ inline keyboard 呈現（Bug 工單 + 需求池 UI 佔位，後者按下固定回「開發中」不接查詢）→ 使用者按下工單 → 同步 bug-lock.sh claim（mkdir 原子鎖，單一 syscall 無 TOCTOU，per-ticket 鎖仍保留，防兩人重複認領同一張單）→ 成功才回「已開始」，先幫這張單同步一行到 tracker.md（純技術性，滿足 /create-mr 內部 Step 0 既有的 tracker 存在性檢查，dispatcher 自己完全不讀這個狀態），再檢查全域併發上限（T26，in-memory 計數器，N=5，超過時明確回覆已達上限而非安靜忽略）、通過才 fire-and-forget 背景 spawn `claude -p \"/create-mr:create-mr {ticket}\" --permission-mode bypassPermissions`（指令名稱帶 create-mr: 命名空間前綴——.claude/commands/create-mr/create-mr.md 是巢狀資料夾結構，Claude Code 會註冊成 create-mr:create-mr，純 /create-mr 會得到 Unknown command，T26 實測期間發現並修正；cwd=某個為此次觸發全新建立、完全獨立的 worktree，所有涉及 repo 含 rajah 一律真隔離不走 symlink，stdio 明確導向檔案，外包 timeout，避免 pipe buffer deadlock 與無限期卡死）→ webhook handler 立即返回，不維護 job 狀態、不輪詢 → 背景 process 用 trap 保證無論成功/失敗/中斷都執行 bug-lock.sh release、刪除該次 worktree（保留 git 分支），並解析 claude -p 輸出分類結果，只在 create-mr 自己不會通知的情境（未知失敗、Step 0.1/0.5 早退 SKIPPED）用 tg-notify.sh 補發通知，避免重複騷擾。Notion 狀態/留言寫回全由 create-mr pipeline 既有 agent 負責，dispatcher 不碰。上線（launchd 常駐 + ngrok tunnel + 對 Telegram 註冊 webhook）是唯一需要使用者最終確認的步驟，且必須排在所有程式模組完成、安全檢查通過、且做過一次真實 dry-run 之後。",
@@ -668,9 +672,11 @@
       "id": "T31",
       "module": "notion-integration",
       "title": "需求池候選單查詢實作",
-      "status": "todo",
-      "depends_on": ["T23"],
-      "description": "比照 lib/notion-integration/candidate-tickets.ts 的寫法，新增 lib/notion-integration/demand-pool-tickets.ts，查詢對象改成需求池 data source（data_source_id: 21d87d78-618a-8135-ad4f-000b273e1293，即『總需求池資料庫』），filter 條件依使用者定案：people 欄位『技術處理人員』contains 該技術的 notion_user_id，且『狀態』∈ {文件完成待處理, 需求仍有問題}。回傳格式（ticket 編號 ALDREQ-{number}、標題、Notion URL）比照 candidate-tickets.ts 現有回傳結構，方便 T32 直接套用既有的 inline keyboard 組裝邏輯。",
+      "status": "done",
+      "depends_on": [
+        "T23"
+      ],
+      "description": "比照 lib/notion-integration/candidate-tickets.ts 的寫法，新增 lib/notion-integration/demand-pool-tickets.ts，查詢對象改成需求池 data source（data_source_id: 21d87d78-618a-8135-ad4f-000b273e1293，即『總需求池資料庫』），filter 條件依使用者定案：people 欄位『技術處理人員』contains 該技術的 notion_user_id，且『狀態』∈ {文件完成待處理, 需求仍有問題}。回傳格式是 ticket 編號字串陣列（ALDREQ-{number}），跟 candidate-tickets.ts 的 queryCandidateTickets 回傳格式完全一致（不含標題/URL——candidate-tickets.ts 本來就只回單號，ticket-list.ts 直接拿單號當按鈕文字，這裡照既有慣例，review 期間已修正本欄位原本寫的『含標題、Notion URL』這個不準確的描述），方便 T32 直接套用既有的 inline keyboard 組裝邏輯。",
       "acceptance_criteria": [
         "查詢邏輯的 filter 與 candidate-tickets.ts 的寫法（buildFilter/queryCandidateTickets 模式、async execFile 呼叫 notion.sh）風格一致",
         "對一個已知在『技術處理人員』有填自己名字、狀態符合條件的測試技術帳號，能正確查到候選單",
@@ -685,7 +691,9 @@
       "module": "webhook-server",
       "title": "需求池清單接上 /req 與 reqpool:noop（真實列表 UI）",
       "status": "todo",
-      "depends_on": ["T31"],
+      "depends_on": [
+        "T31"
+      ],
       "description": "比照 T8（Bug 清單 inline keyboard 組裝）與 T30 對 /bug 的處理方式，把 whitelist.ts 的 /req 分支、以及 callback_query data=reqpool:noop 分支，從目前固定回覆『開發中』改成呼叫 T31 的 demand-pool-tickets.ts 查詢並組裝 inline keyboard 列出候選單（沒有候選單時明確回覆『目前沒有可認領需求單』，比照 Bug 清單的空清單文案風格）。",
       "acceptance_criteria": [
         "發 /req 且有候選需求單時，收到 inline keyboard 清單（格式與 Bug 清單一致：ALDREQ-{number} + 標題）",
@@ -702,7 +710,9 @@
       "module": "locking",
       "title": "需求池 claim handler（上鎖＋確認＋更新 Notion 狀態，不觸發自動化）",
       "status": "todo",
-      "depends_on": ["T32"],
+      "depends_on": [
+        "T32"
+      ],
       "description": "新增 demand-claim:{ticket} callback_data 的 handler，行為比照 T10（Bug claim）但不觸發任何背景 pipeline：用 bug-lock.sh（或評估是否需要獨立的 demand-lock 命名空間，避免跟 Bug 工單鎖搞混——傾向沿用同一支 bug-lock.sh 但用不同 ticket 格式 ALDREQ-xxx 天然區隔，不需要另開一支腳本）做 claim 防重複，成功後回覆『已認領，後續處理方式仍在建置中』（誠實反映 T34-T39 全自動化 pipeline 尚未完成），並視需要更新 Notion 狀態欄位（例如推進到『技術處理中』——需與使用者確認是否要在這一步就寫入 Notion，或先只做 Telegram 端確認）。",
       "acceptance_criteria": [
         "點需求單按鈕觸發 claim，同時間兩人點同一張單只有一人成功、另一人收到『已被認領』",
@@ -718,7 +728,9 @@
       "module": "demand-pipeline",
       "title": "需求規格充足度判斷（gate，比照 create-mr pre-check 精神）",
       "status": "todo",
-      "depends_on": ["T23"],
+      "depends_on": [
+        "T23"
+      ],
       "description": "使用者 2026-08-17 定案：不需要比照 create-mr 拆成 tracer/fixer/reviewer 多階段方法論——現在的 harness 與模型能力已經足夠，只要給足夠 context 就能一次產出好結果。全流程唯一要保留、比照 create-mr 精神的是『第一步』：判斷這張需求單的 Notion 內容（標題、描述、相關欄位、留言串）夠不夠讓人（或 agent）看懂具體要做什麼、範圍多大——不夠就不要硬做，回覆需要人工先補充規格，而不是憑空腦補硬上。實作一個 gate 函式/agent 呼叫：輸入需求單內容＋留言，輸出『規格充足，可進入 T35』或『規格不足，缺什麼』。",
       "acceptance_criteria": [
         "對規格清楚（標題+描述+留言就能看懂要做什麼）的需求單，gate 判定通過",
@@ -733,7 +745,9 @@
       "module": "demand-pipeline",
       "title": "需求實作 agent（單一 agent 直接產出，給足夠上下文與輔助文件）",
       "status": "blocked",
-      "depends_on": ["T34"],
+      "depends_on": [
+        "T34"
+      ],
       "description": "使用者 2026-08-17 定案：不拆成獨立的解法設計 agent＋implementer agent＋專屬 review 標準三個階段，改成單一 agent 一次做完——給它需求規格、留言、以及可透過既有 skills（rajah-query／method-call-graph／i18n-lookup／db-schema-lookup／vendor-adapter-lookup 等）現查的輔助文件與上下文，讓它比照一般開發 task 的方式直接：理解需求 → 找到相關程式碼 → 實作 → 寫 L0 測試 → 在隔離 worktree 內完成，最後跑一次既有 solution-reviewer 或同等的唯讀 review pass（review 標準不用重新發明，沿用『bun test pass／lint clean／沒有超出範圍的異動／功能是否對應需求描述』這種通用檢查即可，不需要像 T38 原案那樣另外設計一整套專屬標準）。",
       "acceptance_criteria": [
         "對至少 2-3 個真實歷史 ALDREQ 單（狀態=已完成，可對照真實 commit 回溯驗證）跑過一次，產出的程式碼異動方向與真實 commit 一致（不要求逐行相同，範圍要對齊）",
@@ -749,7 +763,10 @@
       "module": "demand-pipeline",
       "title": "需求 pipeline 整合進 dispatcher，含真實 E2E",
       "status": "blocked",
-      "depends_on": ["T33", "T35"],
+      "depends_on": [
+        "T33",
+        "T35"
+      ],
       "description": "比照 spawn-create-mr.ts 的模式，把 T34（gate）→ T35（實作 agent）包裝成一個可以用 claude -p 觸發的 slash command，T33 的 demand-claim handler 改成 claim 成功後 fire-and-forget 觸發：先跑 T34 gate，不通過就回覆需要人工補規格；通過就進 T35 產出實作，結束後通知結果（比照 T13 的收尾邏輯）。",
       "acceptance_criteria": [
         "claim 一張規格充足的需求單，能在背景觸發完整流程並在流程結束後收到通知（成功/失敗皆有明確回覆）",
