@@ -779,7 +779,7 @@
       "id": "T36",
       "module": "demand-pipeline",
       "title": "需求 pipeline 整合進 dispatcher，含真實 E2E",
-      "status": "blocked",
+      "status": "todo",
       "depends_on": [
         "T33",
         "T35"
