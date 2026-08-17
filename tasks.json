@@ -757,7 +757,7 @@
       "id": "T35",
       "module": "demand-pipeline",
       "title": "需求實作 agent（單一 agent 直接產出，給足夠上下文與輔助文件）",
-      "status": "blocked",
+      "status": "todo",
       "depends_on": [
         "T34"
       ],
