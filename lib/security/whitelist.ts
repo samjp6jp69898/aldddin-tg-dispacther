@@ -2,7 +2,7 @@ import type { Bot } from 'grammy'
 import { resolveTechUserByChatId } from '../user-resolution/tech-user.ts'
 import { sendTopLevelMenu } from '../webhook-server/top-menu.ts'
 import { sendTicketList } from '../webhook-server/ticket-list.ts'
-import { handleReqPoolNoop } from '../webhook-server/reqpool.ts'
+import { sendDemandList } from '../webhook-server/demand-list.ts'
 import { handleClaim } from '../locking/claim.ts'
 import { createReplayGuard } from './replay-guard.ts'
 
@@ -14,9 +14,11 @@ import { createReplayGuard } from './replay-guard.ts'
  * 掛載 bot.on('message') 與 bot.on('callback_query:data')，白名單外的 chat_id
  * 一律靜默 return，不執行任何後續 Notion/tracker 查詢或 keyboard 組裝。
  * 白名單內的 chat_id 通過後往下流動——訊息走 T30 指令式路由（/bug 直接列
- * 清單 / /req 需求池佔位 / /menu 頂層選單 / 其他回用法提示，見 handler 內
+ * 清單 / /req 需求池清單 / /menu 頂層選單 / 其他回用法提示，見 handler 內
  * 註解）；callback_query 依 callback_data 分流 menu:bug（T29，觸發 T6/T8
- * 查詢列清單）/ reqpool:noop（T9）/ claim:{ticket}（T10）。
+ * 查詢列清單）/ reqpool:noop（T9 建立、T32 接上真實需求池清單）/
+ * claim:{ticket}（T10）/ demand-claim:{ticket}（T32 列出，實際認領行為待
+ * T33，目前按下去只回覆功能開發中）。
  *
  * T27：白名單通過之後才做 update_id 重放去重（review 發現：順序放反的話，
  * 白名單外的陌生流量也會消耗共用的追蹤額度，稀釋掉真正該防的重放窗口；
@@ -51,8 +53,8 @@ export function registerHandlers(bot: Bot): void {
       // 原本的裸文字 bug/req，跟 /menu 統一成同一種指令格式，避免裸文字誤觸
       // ——例如閒聊訊息剛好整句就是 "bug" 或 "req"）：
       //   /bug  → 直接列 Bug 候選工單（等同點頂層選單的 BUG 按鈕）
-      //   /req  → 需求池；T23 仍 deferred（Notion 需求 data source 未確認），
-      //           目前與需求池按鈕同一個佔位回覆，T23 完成後兩處一起接真清單
+      //   /req  → 直接列需求池候選單（T31/T32，等同點頂層選單的『需求池』
+      //           按鈕），行為與 reqpool:noop 一致
       //   /menu → 頂層選單（既有 inline keyboard 流程保留，按鈕路由不變）
       //   其他  → 回覆用法提示。維持「白名單內沒有安靜失敗的路徑」原則，
       //           所以不是靜默忽略；比對大小寫不敏感、含前後空白容忍。
@@ -61,7 +63,8 @@ export function registerHandlers(bot: Bot): void {
         await ctx.replyWithChatAction('typing') // 跟 menu:bug 按鈕同款：真的打 Notion 前先給讀取中提示
         await sendTicketList(ctx, techUser)
       } else if (text === '/req') {
-        await ctx.reply('開發中')
+        await ctx.replyWithChatAction('typing') // 跟 /bug 對稱：真的打 Notion 前先給讀取中提示
+        await sendDemandList(ctx, techUser)
       } else if (text === '/menu') {
         await sendTopLevelMenu(ctx)
       } else {
@@ -95,11 +98,21 @@ export function registerHandlers(bot: Bot): void {
         return
       }
       if (data === 'reqpool:noop') {
-        await handleReqPoolNoop(ctx)
+        await ctx.answerCallbackQuery()
+        await ctx.replyWithChatAction('typing') // 這裡才是真的打 Notion 查詢的地方（T31），先給讀取中提示
+        await sendDemandList(ctx, techUser)
         return
       }
       if (data.startsWith('claim:')) {
         await handleClaim(ctx, techUser, data.slice('claim:'.length))
+        return
+      }
+      if (data.startsWith('demand-claim:')) {
+        // T32 只做到列出需求單，claim 行為本身待 T33（見 demand-list.ts
+        // 檔頭註解）——按鈕先讓它可見、可按，但不做安靜失敗，明確告知使用者
+        // 這裡還沒做完，而不是像未知 callback_data 那樣毫無回應。
+        await ctx.answerCallbackQuery()
+        await ctx.reply('需求單認領功能開發中（T33），目前只能列出清單。')
         return
       }
 

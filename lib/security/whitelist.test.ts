@@ -73,13 +73,18 @@ describe('registerHandlers — T30 指令式訊息路由（斜線指令） + T29
     expect(['你的可認領工單：', '目前沒有可認領工單']).toContain(text)
   })
 
-  test('T30：發 /req：固定回開發中（T23 佔位），不觸發 typing／Notion 查詢', async () => {
+  // T32：/req 從固定佔位改成真的查需求池（T31），刻意不 mock Notion——要
+  // 驗證的正是「/req 這個指令路由真的接到會打 Notion 的那段」，同一個理由
+  // 跟 /bug 測試一致。
+  test('T32：發 /req：typing 提示 → 觸發真實 T31 查詢需求池清單', async () => {
     const handlers = captureHandlers()
     const ctx = makeCtx({ chat: { id: REAL_TECH_CHAT_ID }, message: { text: '/req' } })
     await handlers['message']!(ctx)
 
-    expect(ctx.replyWithChatAction).not.toHaveBeenCalled()
-    expect(ctx.reply).toHaveBeenCalledWith('開發中')
+    expect(ctx.replyWithChatAction).toHaveBeenCalledWith('typing')
+    expect(ctx.reply).toHaveBeenCalledTimes(1)
+    const [text] = ctx.reply.mock.calls[0]!
+    expect(['你的可認領需求單：', '目前沒有可認領需求單']).toContain(text)
   })
 
   test('T30：發不帶斜線的裸文字 bug/req：不再被當成指令，回用法提示（斜線是唯一合法格式）', async () => {
@@ -107,14 +112,30 @@ describe('registerHandlers — T30 指令式訊息路由（斜線指令） + T29
     expect(String(ctxNoText.reply.mock.calls[0]![0])).toContain('可用指令')
   })
 
-  test('callback_query data=reqpool:noop：answer + 固定回開發中，不觸發 typing（沒有 Notion 查詢，T9 行為不變）', async () => {
+  // T32：reqpool:noop 從固定佔位改成真的查需求池，刻意不 mock Notion，理由
+  // 同 menu:bug 測試。
+  test('callback_query data=reqpool:noop：answer → typing 提示 → 觸發真實 T31 查詢需求池清單', async () => {
     const handlers = captureHandlers()
     const ctx = makeCtx({ chat: { id: REAL_TECH_CHAT_ID }, callbackQuery: { data: 'reqpool:noop' } })
     await handlers['callback_query:data']!(ctx)
 
     expect(ctx.answerCallbackQuery).toHaveBeenCalledTimes(1)
-    expect(ctx.replyWithChatAction).not.toHaveBeenCalled()
-    expect(ctx.reply).toHaveBeenCalledWith('開發中')
+    expect(ctx.replyWithChatAction).toHaveBeenCalledWith('typing')
+    expect(ctx.reply).toHaveBeenCalledTimes(1)
+    const [text] = ctx.reply.mock.calls[0]!
+    expect(['你的可認領需求單：', '目前沒有可認領需求單']).toContain(text)
+  })
+
+  // T32：demand-claim:{ticket} 目前只是可見/可按但功能未實作（T33），要有
+  // 明確回覆，不是安靜失敗。
+  test('callback_query data=demand-claim:{ticket}：answer + 明確回覆功能開發中，不誤觸發任何 claim 邏輯', async () => {
+    const handlers = captureHandlers()
+    const ctx = makeCtx({ chat: { id: REAL_TECH_CHAT_ID }, callbackQuery: { data: 'demand-claim:ALDREQ-741' } })
+    await handlers['callback_query:data']!(ctx)
+
+    expect(ctx.answerCallbackQuery).toHaveBeenCalledTimes(1)
+    expect(ctx.reply).toHaveBeenCalledTimes(1)
+    expect(String(ctx.reply.mock.calls[0]![0])).toContain('開發中')
   })
 
   // 這條會真的打一次 Notion API（sendTicketList 內部呼叫 T6 的

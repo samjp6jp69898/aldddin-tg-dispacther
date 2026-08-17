@@ -91,6 +91,10 @@
     {
       "date": "2026-08-17",
       "note": "T31 實作：新增 lib/notion-integration/demand-pool-tickets.ts + demand-pool-tickets.test.ts，比照 candidate-tickets.ts 但查詢『總需求池資料庫』，filter 用『技術處理人員』people contains ∩ 『狀態』∈{文件完成待處理, 需求仍有問題}。實作前先用 notion.sh query-datasource 唯讀實測驗證過這個 database 的『狀態』屬性是 Notion **status** 型（不是 Bug List 的 select 型），filter 語法對應改用 `{status:{equals}}`，混用會讓 Notion API 直接回錯誤，不是猜測。\n\n3 個唯讀 review agent（正確性/欄位型別、風格一致性、邊界情況與 pagination）皆回報 PASS，正確性 review 用真實 API 交叉驗證 `狀態`/`技術處理人員`/`ID` 三個屬性型別；邊界情況 review 用 11 個真實技術帳號逐一實測 filter（6 個查到空清單、5 個查到真實候選單），額外挖到一個真實但目前未觸發的缺口：notion.sh query-datasource 固定 page_size=100，完全沒有處理 has_more/next_cursor，屬於『靜默丟資料』風險（比報錯更危險）——今天單一技術人員最多只有 2 張候選單，離 100 很遠，但沒有任何防線。已在 demand-pool-tickets.ts 加一道 fail-loud 防護：查到 has_more=true 就直接拋錯，不回傳不完整清單；刻意不動 notion.sh 本身（整個 aladdin 共用的腳本，改動範圍與影響超出 T31，candidate-tickets.ts 也共用同一支腳本、有同樣的潛在缺口，留給之後有人專門處理 notion.sh 分頁支援時一併修）。風格 review 也指出 T31 description 原本寫『回傳格式含標題、Notion URL』跟實際實作（只回單號字串，比照 candidate-tickets.ts 既有慣例）不符，已修正 description 用字。\n\n測試刻意不斷言具體 ticket 編號/張數（只驗證 ALDREQ-{number} 格式），避免真實資料隨時間變動（單子被處理完畢）導致測試 flaky——比照 whitelist.test.ts 對 Bug List 查詢『接受目前沒有可認領工單／有清單』兩種可能結果的既有慣例。bun test 85/85 pass（含 2 個真實打 Notion API 的唯讀測試）。"
+    },
+    {
+      "date": "2026-08-17",
+      "note": "T32 實作：新增 lib/webhook-server/demand-list.ts（sendDemandList，比照 ticket-list.ts），刪除 lib/webhook-server/reqpool.ts（原本固定佔位邏輯已無存在意義，whitelist.ts 改直接呼叫 demand-list.ts，不留薄 wrapper）；whitelist.ts 的 /req 訊息分支與 reqpool:noop callback 分支都改成真的查需求池（T31）並列出候選單；新增 demand-claim:{ticket} callback_data 字首的 placeholder handler（回覆『需求單認領功能開發中（T33）』，不做任何實際認領動作）——這是 review 期間主動補上的範圍外小加項，理由：維持這個 repo 一貫的『白名單內沒有安靜失敗路徑』原則，讓使用者點下需求單按鈕至少有明確回應，而不是像未知 callback_data 那樣毫無回應。\n\n3 個唯讀 review agent（正確性/callback_data 字首衝突、安全與邊界、風格與文件一致性）皆回報 PASS。正確性 review 實際執行字串比對，證實 `'demand-claim:...'.startsWith('claim:')` 為 false，不會誤觸發 Bug 專用的 claim: 流程。安全review 確認例外傳遞、白名單/重放去重順序、無安靜失敗路徑皆正常，並記錄兩個非本次範圍的既有邊界（demand-claim ticket 目前無格式驗證但值未被使用故無風險、inline keyboard 未做候選單數量上限但與 ticket-list.ts 既有模式一致）。\n\n風格 review 抓到三個真實文件缺口，已修正：(1) lib/webhook-server/top-menu.ts 檔頭註解仍寫 reqpool:noop『固定回開發中』，已更新反映 T32 後的真實行為；(2) T9（需求池按鈕 UI 佔位）與 T29（先選頂層選單）的 risk_notes 都沒有『已被 T32 取代』的提醒，比照 T29 當初對 T30 的既有寫法補上，避免下一個 session 誤信這兩個 task 描述的固定佔位行為仍是現況；(3) T32 自己的 description/acceptance_criteria 原本沒提到 reqpool.ts 被刪除、demand-list.ts 這個新檔名、以及 demand-claim: placeholder，已補齊反映實際異動範圍。\n\n實測：使用者本人重啟正式環境 server 後，用真實白名單帳號發 /req，收到『目前沒有可認領需求單』（跟該帳號『技術處理人員』欄位目前未指派的資料現況一致，是預期結果）；非空清單分支已由 T31 的真實 Notion 查詢測試（不同帳號）與 code review 交叉驗證過格式與邏輯正確，且清單組裝邏輯與已在正式環境驗證過的 /bug 完全同一套 pattern，判斷驗證強度已足夠，不強求用另一個帳號湊出非空清單才能收尾。webhook getWebhookInfo 確認 pending_update_count=0、無 last_error，server log 無例外。bun test 86/86 pass。"
     }
   ],
   "architecture_summary": "Telegram → ngrok 固定 domain (unrefreshing-trudy-subsequently.ngrok-free.dev) → 本機常駐 Bun+Hono+grammy webhook server（獨立 TG_DISPATCH_BOT_TOKEN，走 grammy 官方 'hono' adapter + secretToken 驗證）→ chat_id 白名單（tech-users.csv）→ 反查 notion_user_id → 用 people.contains filter 正向查該人在 Notion Bug List 的候選單並以 Notion『狀態』欄位（仍有問題/待處理）為唯一可認領判準（僅走 scripts/notion.sh；不再拿 tracker.sh row 的 pending/rerun 狀態做二次篩選——這是使用者明確定案，見 changelog）→ inline keyboard 呈現（Bug 工單 + 需求池 UI 佔位，後者按下固定回「開發中」不接查詢）→ 使用者按下工單 → 同步 bug-lock.sh claim（mkdir 原子鎖，單一 syscall 無 TOCTOU，per-ticket 鎖仍保留，防兩人重複認領同一張單）→ 成功才回「已開始」，先幫這張單同步一行到 tracker.md（純技術性，滿足 /create-mr 內部 Step 0 既有的 tracker 存在性檢查，dispatcher 自己完全不讀這個狀態），再檢查全域併發上限（T26，in-memory 計數器，N=5，超過時明確回覆已達上限而非安靜忽略）、通過才 fire-and-forget 背景 spawn `claude -p \"/create-mr:create-mr {ticket}\" --permission-mode bypassPermissions`（指令名稱帶 create-mr: 命名空間前綴——.claude/commands/create-mr/create-mr.md 是巢狀資料夾結構，Claude Code 會註冊成 create-mr:create-mr，純 /create-mr 會得到 Unknown command，T26 實測期間發現並修正；cwd=某個為此次觸發全新建立、完全獨立的 worktree，所有涉及 repo 含 rajah 一律真隔離不走 symlink，stdio 明確導向檔案，外包 timeout，避免 pipe buffer deadlock 與無限期卡死）→ webhook handler 立即返回，不維護 job 狀態、不輪詢 → 背景 process 用 trap 保證無論成功/失敗/中斷都執行 bug-lock.sh release、刪除該次 worktree（保留 git 分支），並解析 claude -p 輸出分類結果，只在 create-mr 自己不會通知的情境（未知失敗、Step 0.1/0.5 早退 SKIPPED）用 tg-notify.sh 補發通知，避免重複騷擾。Notion 狀態/留言寫回全由 create-mr pipeline 既有 agent 負責，dispatcher 不碰。上線（launchd 常駐 + ngrok tunnel + 對 Telegram 註冊 webhook）是唯一需要使用者最終確認的步驟，且必須排在所有程式模組完成、安全檢查通過、且做過一次真實 dry-run 之後。",
@@ -269,7 +273,7 @@
         "點擊需求池按鈕必回覆固定文字『開發中』",
         "該按鈕邏輯不觸發任何 Notion/tracker/bug-lock 呼叫"
       ],
-      "risk_notes": "",
+      "risk_notes": "本 task 的『固定回覆開發中』行為已於 2026-08-17 被 T32 取代——reqpool:noop 這個 callback_data 名稱沿用不變，但已改成真的查需求池（T31）並列出候選單，不再是固定佔位；原本的 lib/webhook-server/reqpool.ts 也已在 T32 被刪除，改由 lib/webhook-server/demand-list.ts 取代。上面的 acceptance_criteria 描述的是 T9 當時的驗收標準，不代表現在的實際行為。",
       "suggested_agent": "general-purpose"
     },
     {
@@ -645,7 +649,7 @@
         "點需求池按鈕行為與 T9 完全一致：固定回覆『開發中』，不觸發任何 Notion/tracker/bug-lock 查詢",
         "點候選單裡的工單按鈕（claim:{ticket}）行為與現有 T10 完全一致，不受這次改版影響"
       ],
-      "risk_notes": "非原始 6 面向 feasibility 調查產出，是使用者在 T17 實測驗收現場當場提出、直接定案的新需求（見 changelog）。跟 T23（需求池完整 pipeline，deferred）不衝突：這裡只動『何時觸發列清單』的時機，需求池按鈕本身的行為仍是 T9 的佔位邏輯，不提前實作 T23。（註：本 task 的「任何訊息回頂層選單」行為已於 2026-08-16 被 T30 取代——訊息改指令式路由，頂層選單改由 /menu 觸發；本 task 產出的頂層選單元件與 callback 路由仍沿用。）",
+      "risk_notes": "非原始 6 面向 feasibility 調查產出，是使用者在 T17 實測驗收現場當場提出、直接定案的新需求（見 changelog）。跟 T23（需求池完整 pipeline，deferred）不衝突：這裡只動『何時觸發列清單』的時機，需求池按鈕本身的行為仍是 T9 的佔位邏輯，不提前實作 T23。（註：本 task 的「任何訊息回頂層選單」行為已於 2026-08-16 被 T30 取代——訊息改指令式路由，頂層選單改由 /menu 觸發；本 task 產出的頂層選單元件與 callback 路由仍沿用。另註：上面 acceptance_criteria 第三條『點需求池按鈕行為與 T9 完全一致：固定回覆開發中』是 T29 當時的驗收標準，2026-08-17 起已被 T32 取代——需求池按鈕已改成真的查需求池並列出候選單，不再是固定佔位，見 T9/T32 記錄。）",
       "suggested_agent": "general-purpose"
     },
     {
@@ -690,17 +694,18 @@
       "id": "T32",
       "module": "webhook-server",
       "title": "需求池清單接上 /req 與 reqpool:noop（真實列表 UI）",
-      "status": "todo",
+      "status": "done",
       "depends_on": [
         "T31"
       ],
-      "description": "比照 T8（Bug 清單 inline keyboard 組裝）與 T30 對 /bug 的處理方式，把 whitelist.ts 的 /req 分支、以及 callback_query data=reqpool:noop 分支，從目前固定回覆『開發中』改成呼叫 T31 的 demand-pool-tickets.ts 查詢並組裝 inline keyboard 列出候選單（沒有候選單時明確回覆『目前沒有可認領需求單』，比照 Bug 清單的空清單文案風格）。",
+      "description": "比照 T8（Bug 清單 inline keyboard 組裝）與 T30 對 /bug 的處理方式，把 whitelist.ts 的 /req 分支、以及 callback_query data=reqpool:noop 分支，從目前固定回覆『開發中』改成呼叫 T31 的 demand-pool-tickets.ts 查詢並組裝 inline keyboard 列出候選單（沒有候選單時明確回覆『目前沒有可認領需求單』，比照 Bug 清單的空清單文案風格）。實際異動範圍比原描述更完整：新增 lib/webhook-server/demand-list.ts（比照 ticket-list.ts 的 sendDemandList）；刪除 lib/webhook-server/reqpool.ts（原本的固定佔位邏輯已無存在意義，whitelist.ts 改直接呼叫 demand-list.ts，不留一層只轉呼叫的薄 wrapper）；額外新增 callback_data 字首 demand-claim:{ticket} 的 placeholder handler（review 期間補上，理由見 acceptance_criteria 最後一條）。",
       "acceptance_criteria": [
-        "發 /req 且有候選需求單時，收到 inline keyboard 清單（格式與 Bug 清單一致：ALDREQ-{number} + 標題）",
+        "發 /req 且有候選需求單時，收到 inline keyboard 清單（格式與 Bug 清單一致：每顆按鈕就是單號 ALDREQ-{number}，不含標題——candidate-tickets.ts/ticket-list.ts 本來就只回單號，這裡照既有慣例，T31 收尾時已修正本欄位原本不準確的『含標題』說法）",
         "發 /req 且沒有候選需求單時，收到明確的『目前沒有可認領需求單』回覆",
         "點 menu 選單的『需求池』按鈕（reqpool:noop）行為與上述一致，不再是固定佔位回覆",
         "T27 重放去重、T3 白名單順序不受影響",
-        "單元測試涵蓋有清單/無清單兩種情境"
+        "單元測試涵蓋有清單/無清單兩種情境",
+        "點候選需求單按鈕（demand-claim:{ticket}）不會安靜失敗、不會誤觸發 Bug 專用的 claim:{ticket} 流程——回覆明確的『功能開發中（T33）』文字，不做任何實際認領動作（claim 判斷/上鎖/Notion 寫入都是 T33 範圍）"
       ],
       "risk_notes": "這一步只是把清單做出來，先不接 claim（見 T33）——按下清單裡的需求單按鈕之前，要先設計新的 callback_data 命名（例如 demand-claim:{ticket}，不能沿用 claim:{ticket}，那個是 Bug 專用且直接觸發 create-mr worktree 流程，混用會導致需求單被當成 Bug 誤觸發 /create-mr）。",
       "suggested_agent": "general-purpose"
