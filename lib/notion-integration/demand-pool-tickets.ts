@@ -86,9 +86,15 @@ export function getDemandTicketNotionUrl(ticket: string): string | null {
   if (!match) return null
 
   const filter = { property: 'ID', unique_id: { equals: Number(match[1]) } }
+  // T34 review 發現：這裡跟這個目錄大多數 execFile 呼叫不一致，原本沒有
+  // timeout（candidate-tickets.ts 的同名函式 getTicketNotionUrl 也一樣沒有，
+  // 是既有缺口，但那個檔案不在本次改動範圍，這裡只修自己新增的這份）。
+  // T33（claim 會呼叫它）、T34（gate 會呼叫它）都是『卡住比報錯更糟』的
+  // 情境，補上跟這個目錄其他檔案一致的 30 秒上限。
   const raw = execFileSync('bash', [NOTION_SH, 'query-datasource', DATA_SOURCE_ID, JSON.stringify(filter)], {
     encoding: 'utf8',
     maxBuffer: 10 * 1024 * 1024,
+    timeout: 30_000,
   })
 
   const parsed = JSON.parse(raw)
