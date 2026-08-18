@@ -1,12 +1,10 @@
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { getDemandTicketNotionUrl } from '../notion-integration/demand-pool-tickets.ts'
+import { execClaudeWithStdin } from './claude-exec.ts'
 
 const execFileAsync = promisify(execFile)
 const NOTION_SH = '/Users/user/aladdin/scripts/notion.sh'
-// 沿用 spawn-create-mr.ts 已驗證過的理由：裸呼叫 `claude` 交給 PATH 解析
-// 在這種 spawn 鏈上不可靠（曾解析到下架舊版直接 404），一律用絕對路徑。
-const CLAUDE_BIN = '/Users/user/.local/bin/claude'
 
 // 實測發現（見 tasks.json T34 changelog）：需求單真正的規格說明不是 database
 // 欄位，是頁面 body 的 Notion blocks，且常見寫法是外層 numbered_list_item
@@ -152,16 +150,21 @@ ${comments.length > 0 ? comments.join('\n') : '（沒有留言）'}
  * spawn-create-mr.ts 對 opus 的既有選擇：不寫死完整 ID，避免下架後又踩一次
  * 坑）：這是單純的文字分類任務，不需要 opus 等級的推理成本，但比 haiku
  * 更能穩定抓住『佔位內容 vs 真實規格』這種需要語意判斷的細節。
+ *
+ * T36 review 發現並修正：prompt 原本直接放進 argv（`-p` 後面帶值），改用
+ * claude-exec.ts 的 execClaudeWithStdin 走 stdin——避免 OS ARG_MAX 風險，
+ * 也避免執行失敗時 err.message 把整個 prompt 內容（含外部 Notion 內容）
+ * 原樣暴露出來（見 claude-exec.ts 檔頭註解）。
  */
 async function askClaude(prompt: string): Promise<{ sufficient: boolean; missing?: string }> {
   const env = { ...process.env }
   delete env.CLAUDE_EFFORT
 
-  const { stdout } = await execFileAsync(
-    CLAUDE_BIN,
-    ['-p', prompt, '--model', 'sonnet', '--tools', '', '--strict-mcp-config', '--output-format', 'json'],
-    { encoding: 'utf8', maxBuffer: 10 * 1024 * 1024, timeout: CLAUDE_EXEC_TIMEOUT_MS, env },
-  )
+  const stdout = await execClaudeWithStdin(['-p', '--model', 'sonnet', '--tools', '', '--strict-mcp-config', '--output-format', 'json'], prompt, {
+    maxBuffer: 10 * 1024 * 1024,
+    timeout: CLAUDE_EXEC_TIMEOUT_MS,
+    env,
+  })
 
   const events = JSON.parse(stdout)
   if (!Array.isArray(events)) {
@@ -192,23 +195,40 @@ async function askClaude(prompt: string): Promise<{ sufficient: boolean; missing
 export type SpecSufficiencyResult = { sufficient: true } | { sufficient: false; missing: string }
 
 /**
- * T34：需求規格充足度判斷（gate，比照 create-mr pre-check 精神——唯一保留
- * 的『第一步』判斷，見 tasks.json T34 description）。輸入 ticket，抓 Notion
- * 頁面內文（遞迴 blocks）＋留言，交給 claude -p 判斷夠不夠讓人/agent 看懂
- * 具體要做什麼；不夠就回傳缺什麼，讓呼叫端（T36）決定要回覆使用者需要先
- * 補規格，而不是硬著頭皮進 T35。
- *
- * 找不到對應的 Notion 頁面（ticket 格式不對或查無此單）直接拋出例外，不
- * 靜默當成「不充分」——那是完全不同性質的錯誤（資料層問題，不是規格品質
- * 問題），呼叫端要能分辨。
+ * T36 review 期間抽出：T34 原本 checkSpecSufficiency(ticket) 內部自己抓一次
+ * 內文＋留言；T36 的 run-demand-pipeline.ts 除了判斷充足度，還要把同一份
+ * 內容拿去給 detectRepoScope／buildDemandImplementerPrompt 用，抽成獨立
+ * export 函式讓呼叫端可以只抓一次、重複使用，不用對同一張單打三次 Notion
+ * API。找不到對應的 Notion 頁面（ticket 格式不對或查無此單）直接拋出例外。
  */
-export async function checkSpecSufficiency(ticket: string): Promise<SpecSufficiencyResult> {
+export async function fetchDemandTicketContent(ticket: string): Promise<{ bodyText: string; comments: string[] }> {
   const url = getDemandTicketNotionUrl(ticket)
   if (url === null) {
-    throw new Error(`找不到 ${ticket} 對應的 Notion 頁面，無法判斷規格充足度`)
+    throw new Error(`找不到 ${ticket} 對應的 Notion 頁面`)
   }
 
   const [bodyText, comments] = await Promise.all([fetchBlocksText(url), fetchComments(url)])
+  return { bodyText, comments }
+}
+
+/**
+ * T34：需求規格充足度判斷（gate，比照 create-mr pre-check 精神——唯一保留
+ * 的『第一步』判斷，見 tasks.json T34 description）。輸入已經抓好的內文＋
+ * 留言（見 fetchDemandTicketContent），交給 claude -p 判斷夠不夠讓人/agent
+ * 看懂具體要做什麼；不夠就回傳缺什麼，讓呼叫端（T36）決定要回覆使用者需要
+ * 先補規格，而不是硬著頭皮進 T35。
+ */
+export async function checkSpecSufficiencyFromContent(ticket: string, bodyText: string, comments: string[]): Promise<SpecSufficiencyResult> {
   const prompt = buildPrompt(ticket, bodyText, comments)
   return await askClaude(prompt)
+}
+
+/**
+ * 比照原本簽名保留：只吃 ticket，自己抓內容。T34 既有測試與呼叫端都用這個
+ * 版本，行為跟 review 定案時完全一致，內部只是委派給上面兩個新拆出來的
+ * 函式，不影響外部行為。
+ */
+export async function checkSpecSufficiency(ticket: string): Promise<SpecSufficiencyResult> {
+  const { bodyText, comments } = await fetchDemandTicketContent(ticket)
+  return await checkSpecSufficiencyFromContent(ticket, bodyText, comments)
 }

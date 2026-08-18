@@ -1,6 +1,7 @@
 import { execFileSync } from 'node:child_process'
 import type { Context } from 'grammy'
 import { queryDemandPoolTickets, getDemandTicketNotionUrl } from '../notion-integration/demand-pool-tickets.ts'
+import { spawnDemandPipeline } from '../pipeline-runner/spawn-demand-pipeline.ts'
 import type { TechUser } from '../user-resolution/tech-user.ts'
 
 const BUG_LOCK_SH = '/Users/user/aladdin/scripts/bug-lock.sh'
@@ -54,14 +55,17 @@ function markAiAnalysisInProgress(ticket: string): void {
 }
 
 /**
- * demand-claim:{ticket} callback handler（見 tasks.json T33）。
+ * demand-claim:{ticket} callback handler（見 tasks.json T33/T36）。
  * 嚴格順序比照 claim.ts（T10）：(1) answerCallbackQuery (2) 防禦性重驗
  * 白名單＋重查 Notion (3) 同步 bug-lock.sh claim，先看結果再決定回什麼
- * 訊息 (4) 更新 Notion AI分析。每個分支都要有明確回覆，沒有安靜失敗的路徑。
+ * 訊息 (4) 更新 Notion AI分析 (5) T36：fire-and-forget 觸發背景 pipeline
+ * （T34 規格 gate → T36 範圍偵測 → T35 實作 agent）。每個分支都要有明確
+ * 回覆，沒有安靜失敗的路徑。
  *
- * 跟 claim.ts 最大的差異：這裡刻意不 spawn 任何背景流程（T34-T36 全自動化
- * pipeline 尚未完成），claim 成功後鎖立即釋放，回覆文案誠實反映『後續處理
- * 方式仍在建置中』，不能讓使用者誤以為已經有自動化在跑。
+ * 跟 claim.ts 的差異：這裡的鎖在 spawn 前就釋放（T33 定案），背景 pipeline
+ * 自己的進入點（run-demand-pipeline.ts）會重新拿一次鎖，鎖的擁有權轉移給
+ * 它，比照 claim.ts 對 Bug 工單鎖『spawn 前先 release，交給即將啟動的背景
+ * 流程自己管』的既有模式。
  */
 export async function handleDemandClaim(ctx: Context, techUser: TechUser, ticket: string): Promise<void> {
   await ctx.answerCallbackQuery()
@@ -95,5 +99,23 @@ export async function handleDemandClaim(ctx: Context, techUser: TechUser, ticket
     releaseLock(ticket)
   }
 
-  await ctx.reply(`已認領 ${ticket}，後續處理方式仍在建置中（T34-T36），Notion AI分析已標記為「分析中」。`)
+  const spawnResult = spawnDemandPipeline(ticket, techUser.email)
+  if (!spawnResult.ok) {
+    // 跟 claim.ts 對 Bug pipeline 的既有處理方式一致：併發滿載/spawn 失敗都
+    // 要有明確、不同的回覆，不能讓使用者以為流程已經在跑。review 發現並
+    // 修正一個真實文案矛盾：這裡的計數器（concurrency-limiter.ts）純粹是
+    // in-memory 計數，沒有任何排隊/自動重試機制，tryAcquire 失敗當下這張
+    // 單就不會有背景流程被觸發——舊版文案卻寫「不用重新認領」，等於告訴
+    // 使用者系統會自動處理，但實際上永遠不會，除非使用者自己重新觸發。
+    // 鎖已在上面 release 過，Notion『狀態』欄位（claim 判準）也未被這裡
+    // 動過，可以直接重新認領觸發一次新的 spawn 嘗試。
+    const text =
+      spawnResult.reason === 'concurrency_limit'
+        ? `${ticket} 已認領（Notion AI分析已標記「分析中」），但需求 pipeline 目前已達全域併發上限，這次不會自動重跑，請稍後重新認領一次。`
+        : `${ticket} 已認領（Notion AI分析已標記「分析中」），但背景流程啟動失敗，請聯絡維運人員檢查 spawn-errors.log；問題排除後可重新認領一次。`
+    await ctx.reply(text)
+    return
+  }
+
+  await ctx.reply(`已認領 ${ticket}，Notion AI分析已標記「分析中」，背景開始評估規格與範圍，完成後會再通知你。這是輔助草稿流程，產出需要人工複核，不是自動完成。`)
 }

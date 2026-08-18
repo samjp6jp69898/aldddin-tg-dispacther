@@ -6,7 +6,12 @@ const ROOT = '/Users/user/aladdin'
 const MAIN_REPOS = ['agrabah', 'abu', 'lago', 'rajah'] as const
 const LOG_DIR = '/Users/user/aladdin/telegram-dispatcher/logs'
 const LOG_PATH = join(LOG_DIR, 'cleanup-worktree.log')
-const TICKET_RE = /^FAQ-\d+$/
+// T36 review 期間發現：這裡跟 setup-worktree.sh 曾經有過的同一種問題
+// （見 tasks.json T36 changelog）——寫死只認 FAQ，需求池的 ALDREQ-xxx
+// 單完全被這道格式檢查擋死。這個檔案是 telegram-dispatcher 自己的（不是
+// obsidian 共用腳本），純新增分支不影響既有 FAQ 行為，不需要走維護協定的
+// 紅區流程。
+const TICKET_RE = /^(FAQ|ALDREQ)-\d+$/
 
 // review 發現：跟同目錄 post-run-notify.ts 的 EXEC_TIMEOUT_MS 同一個理由
 // （見該檔案 :16 註解）——這支腳本從 spawn-create-mr.ts 的 bash EXIT trap

@@ -151,20 +151,30 @@ webhook 完全收不到訊息的空窗，選一個沒人在用的時段切換。
      領單時明確回覆「目前沒有可認領工單」。
    - `/req` → 依 Notion『總需求池資料庫』列出你名下的候選需求單按鈕（T31/T32：
      判準是『技術處理人員』欄位含你本人 ∩ 狀態∈{文件完成待處理, 需求仍有問題}）；
-     沒有可認領單時明確回覆「目前沒有可認領需求單」。**認領本身尚未實作**
-     （見 T33）——按下需求單按鈕目前只會回覆「功能開發中」，不會觸發任何
-     背景流程或改動 Notion 狀態。
+     沒有可認領單時明確回覆「目前沒有可認領需求單」。點需求單按鈕會真的
+     上鎖＋更新 Notion『AI分析』為『分析中』＋觸發背景 pipeline（T33/T36，
+     見下方第 3 點）。
    - `/menu` → 頂層選單（`BUG` / `需求池` 兩顆按鈕，按鈕行為同上）。
    - 其他文字（含不帶 `/` 的 `bug`/`req`）→ 回覆用法提示（白名單內不靜默）。
-2. 點清單中的 Bug 工單按鈕即進入認領流程（下一步）；需求單按鈕目前只列出，
-   認領流程見上方 `/req` 說明。
-3. 點 `claim:{ticket}` 按鈕（Bug 專用） → 上鎖防重複認領 → 背景觸發 `/create-mr`
-   pipeline（單張約 20–40 分鐘）。同一時間全域最多 5 條背景流程（T26），
-   超過會明確回覆請稍後再試。
-4. 結果通知：pipeline 正常結束時依 create-mr 自己的出口規則發 TG／留
-   Notion 留言（`already_fixed`／`i18n`／`failed` 只留 Notion 不發 TG）；
-   只有流程**異常結束**（infra／CLI 層炸掉、無法辨識結果）才由 dispatcher
-   補發「⚠️ 需人工檢查」訊息附 log 路徑（T13）。
+2. 點清單中的 Bug 工單按鈕（`claim:{ticket}`）→ 上鎖防重複認領 → 背景觸發
+   `/create-mr` pipeline（單張約 20–40 分鐘）。同一時間全域最多 5 條背景
+   流程（T26），超過會明確回覆請稍後再試。結果通知：pipeline 正常結束時
+   依 create-mr 自己的出口規則發 TG／留 Notion 留言（`already_fixed`／
+   `i18n`／`failed` 只留 Notion 不發 TG）；只有流程**異常結束**（infra／
+   CLI 層炸掉、無法辨識結果）才由 dispatcher 補發「⚠️ 需人工檢查」訊息附
+   log 路徑（T13）。
+3. 點需求單按鈕（`demand-claim:{ticket}`）→ 上鎖＋更新 Notion AI分析為
+   『分析中』後，背景依序：(a) 判斷 Notion 規格內容夠不夠完整（T34 gate，
+   不夠會直接通知你「規格不足，缺什麼」，不會硬做）(b) 判斷這張單會動到
+   哪些 repo（T36 範圍偵測）——**跨 ≥2 個 repo 的需求目前不會自動實作**，
+   會通知你「需要人工複核」（2026-08-17 使用者定案：T35 回溯測試證實跨
+   repo 需求的範圍窮盡性不可靠，見 tasks.json T35 changelog）(c) 單一
+   repo 的需求才會真的建隔離環境、呼叫實作 agent 產出程式碼＋測試。同一
+   時間全域最多 **2** 條需求 pipeline（獨立於上面 Bug 的 N=5，不共用計數
+   器，見「已知操作風險」）。**這整條路徑目前是輔助草稿性質，不是自動
+   完成**——不管哪個分支結束都會發 Telegram 通知，成功產出的情況下通知
+   會附工作目錄路徑，**產出的程式碼不會自動 commit/push，必須人工複核**
+   （T36）。
 
 ## 需要的環境變數（都放在根目錄 `/Users/user/aladdin/.env`）
 
@@ -209,6 +219,28 @@ log 或任何被 git 追蹤的檔案裡（見 T15）。
   還有背景流程在跑，重啟後的新計數器不會知道它們存在（這些舊流程本身不受
   影響，仍會照常跑完，只是不再被新的計數器算進去），是刻意接受的 trade-off
   （見 `lib/pipeline-runner/concurrency-limiter.ts` 檔頭註解）。
+- **需求 pipeline 的全域併發上限 N=2，跟上面 Bug 的 N=5 是兩個獨立計數器**
+  （T36，使用者 2026-08-17 定案）：需求 pipeline 是全新、範圍完整性還沒被
+  充分驗證的 pipeline（T35 回溯測試已證實跨 repo 需求有真實遺漏風險），
+  刻意跟已穩定運作的 Bug pipeline 分開、給更保守的上限，兩者不會互相搶
+  額度也不會互相拖累。達到上限時該張需求單**不會自動排隊重跑**，回覆會
+  明確告知需要稍後重新認領一次（`lib/pipeline-runner/spawn-demand-pipeline.ts`）。
+- **需求 pipeline 的 worktree 不會自動清理**（`worktrees/{ALDREQ-ticket}/`）：
+  跟 Bug pipeline（T28 完成後自動清理）不同，需求單的產出**就是**
+  worktree 裡未 commit 的改動本身，人工複核完之前不能清掉，所以刻意不
+  自動清。長期累積會佔用磁碟空間（每個都是完整 repo checkout，可能還帶
+  `node_modules`），需要人工定期盤點、複核完之後手動清理：
+  ```bash
+  # 手動清理某張需求單的 worktree（ALDREQ-* 也支援，不是只有 FAQ-*）
+  bun /Users/user/aladdin/telegram-dispatcher/lib/pipeline-runner/cleanup-worktree.ts ALDREQ-1234
+  ```
+- **需求 pipeline 的實作 agent 給了完整工具權限（`--permission-mode
+  bypassPermissions`，沒有限制工具）**，這點跟 T34 的規格判斷／T36 的範圍
+  偵測（兩者都用 `--tools "" --strict-mcp-config` 結構性清空工具）不同——
+  給工具權限是這一步的必要條件（它真的要讀寫程式碼），風險跟既有
+  `/create-mr` 面對真實 bug report 外部內容時承擔的是同一類，但需求池
+  內容的可編輯人員範圍可能比 Bug List 更廣，尚未逐一核實兩者信任等級是
+  否真的對等，先如實記錄這個未驗證的假設。
 
 ## 工單鎖卡住時如何手動排除
 
