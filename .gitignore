@@ -13,3 +13,6 @@ config.env
 *.pem
 *.key
 logs/
+# T36（demand plan pipeline）執行期產物：plan.md 上傳 Drive 後才是正式交付，
+# 本機這份只是留痕方便除錯，跟 logs/ 同一類，不進版本控制。
+demand-plans/

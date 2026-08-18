@@ -1,41 +1,46 @@
-import { execFile, execFileSync } from 'node:child_process'
-import { promisify } from 'node:util'
+import { execFileSync } from 'node:child_process'
 import { appendFileSync, mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { fetchDemandTicketContent, checkSpecSufficiencyFromContent } from './spec-sufficiency-gate.ts'
 import { detectRepoScope } from './repo-scope-gate.ts'
-import { buildDemandImplementerPrompt } from './demand-implementer-prompt.ts'
-import { execClaudeWithStdin } from './claude-exec.ts'
+import { getDemandTicketNotionUrl } from '../notion-integration/demand-pool-tickets.ts'
+import { runDemandPlanPipeline } from './demand-plan-pipeline.ts'
+import { classifyAiAnalysis, shouldUploadPlan, buildNotionCommentText, buildTelegramText, type DemandOutcome } from './demand-finalize.ts'
 
-const execFileAsync = promisify(execFile)
 const BUG_LOCK_SH = '/Users/user/aladdin/scripts/bug-lock.sh'
-const SETUP_WORKTREE_SH = '/Users/user/aladdin/scripts/setup-worktree.sh'
 const TG_NOTIFY_SH = '/Users/user/aladdin/scripts/tg-notify.sh'
+const NOTION_SH = '/Users/user/aladdin/scripts/notion.sh'
+const GDRIVE_SH = '/Users/user/.claude/gdrive.sh'
 const LOG_DIR = '/Users/user/aladdin/telegram-dispatcher/logs'
 const DEMAND_LOG = join(LOG_DIR, 'demand-pipeline.log')
-const SETUP_TIMEOUT_MS = 20 * 60 * 1000 // bootstrap 含 DB migrate，比照 setup-worktree.sh 本身可能耗時的既有認知，給充足時間
-const IMPLEMENTER_TIMEOUT_MS = 30 * 60 * 1000 // 已排除跨 repo 案例（複雜度最高、T35 回溯測試裡耗時最久的那組），單一 repo 給 30 分鐘
+// 2026-08-17 建立，見 tasks.json T36 changelog：demand-pool 專用 Drive 父資料夾
+// （跟 Bug pipeline 的 bug-list 資料夾同一層、平行存在，不共用同一個資料夾）。
+const DEMAND_POOL_DRIVE_PARENT_ID = '1E21H-5UycBfCvfWs06ZChV-E84bs-vzP'
 
 /**
  * T36：需求 pipeline 整合進 dispatcher，唯一的 CLI 進入點（`bun
  * run-demand-pipeline.ts <ticket> <assigneeEmail>`），由
  * spawn-demand-pipeline.ts fire-and-forget spawn。主要的收尾保證是這支
- * Bun 腳本自己的 try/finally（涵蓋正常結束、任何步驟拋例外的情況）；review
- * 發現這個保證有一個真實缺口：如果這支腳本本身被外部機制強制終止
- * （SIGKILL 不可被 try/finally 攔截），finally 就沒機會執行、鎖永遠不會
- * 釋放——已在 spawn-demand-pipeline.ts 補上跟 Bug pipeline 同款的外層
- * `timeout` + bash EXIT trap 當最後一道安全網（見該檔案 WRAPPER_SCRIPT
- * 註解），這裡的 try/finally 仍是主要路徑、正常情況下就會執行完畢。
+ * Bun 腳本自己的 try/finally（涵蓋正常結束、任何步驟拋例外的情況）；
+ * spawn-demand-pipeline.ts 額外包了一層 bash `timeout` + EXIT trap 當
+ * SIGKILL 情境下的最後安全網（見該檔案 WRAPPER_SCRIPT 註解）。
  *
- * 流程：(1) 抓需求單內容 (2) T34 gate：規格不足 → 通知＋結束 (3) T36 範圍
- * 偵測（使用者 2026-08-17 定案）：跨 ≥2 個 repo → 通知『需人工複核』＋結束，
- * 不自動實作（T35 回溯測試證實跨 repo 需求範圍窮盡性不可靠，見 tasks.json
- * T35 changelog）(4) 單一 repo：setup-worktree.sh 建環境 → 組 T35 prompt →
- * 呼叫實作 agent（給真實工具權限，跟 T34/範圍偵測那種純分類呼叫不同，這裡
- * 需要它真的能讀寫檔案）(5) 完成後通知，**不清理 worktree**——不像 Bug
- * pipeline 有 push+MR 當作最終交付，這裡的交付物就是 worktree 裡的
- * uncommitted 改動本身，人工複核完才決定要不要用，太早清掉等於把唯一的
- * 產出丟了。
+ * 流程：(1) 抓需求單內容 (2) T34 gate：規格不足 → 收尾＋結束 (3) T36 範圍
+ * 偵測：跨 ≥2 個 repo → 收尾（標記『需人工複核』）＋結束 (4) 單一 repo：
+ * 交給 demand-plan-pipeline.ts 跑 draft×2 → review×3 → synthesize →
+ * classify，產出 plan.md（不改任何 repo 程式碼）(5) finalize：分類結果 →
+ * （若有 plan.md）上傳 Google Drive → Notion 留言＋更新 AI分析 → Telegram
+ * 通知。
+ *
+ * 2026-08-18 使用者定案二次修正（見 tasks.json T36 changelog 完整脈絡）：
+ * 第一版重新設計（implementer agent 直接改 code）→ 第二版（本機啟動全服務
+ * 驗證，見 demand-implementer-prompt.ts，已刪除）→ 第三版（也就是這裡）：
+ * 不建全服務 worktree，改用「2 個 draft agent 平行調查 → 3 個 review agent
+ * 各自角度審查 → synthesize 彙整」取代單一 agent 自己審自己，且用零工具
+ * 嚴格 JSON 分類取代自由文字結尾格式解析（第二版真實跑壞過一次：
+ * RESULT_STATUS 被包進一句話裡，regex 解析失敗，已改用 T34/T36 gate 既有
+ * 的可靠模式）。實際 draft/review/synthesize/classify 呼叫細節見
+ * demand-plan-pipeline.ts。
  */
 
 function log(msg: string): void {
@@ -69,69 +74,66 @@ function releaseLock(ticket: string): void {
   }
 }
 
-async function setupWorktree(ticket: string, repo: string): Promise<{ ok: true } | { ok: false; reason: string }> {
-  try {
-    // T16 既有防護：DISPATCHER_TRIGGERED=1 強制真隔離，避免跟同時可能在跑的
-    // Bug pipeline 撞到共用主 repo bootstrap（見 spawn-create-mr.ts 對這個
-    // 環境變數的既有註解，這裡沿用同一套機制，不重新發明）。
-    const { stdout } = await execFileAsync('bash', [SETUP_WORKTREE_SH, ticket, repo], {
-      encoding: 'utf8',
-      maxBuffer: 20 * 1024 * 1024,
-      timeout: SETUP_TIMEOUT_MS,
-      env: { ...process.env, DISPATCHER_TRIGGERED: '1' },
-    })
-    const lastLine = stdout.trim().split('\n').pop() ?? ''
-    if (lastLine.startsWith('SETUP_OK')) return { ok: true }
-    return { ok: false, reason: lastLine || '未知錯誤（setup-worktree.sh 沒有輸出可辨識的結尾行）' }
-  } catch (err) {
-    // review 發現：execFileAsync 逾時/非零 exit 時，真正的 SETUP_FAIL 原因在
-    // err.stdout（已實測驗證），不在 err.message——原本只塞 String(err) 只
-    //會給使用者看到「Command failed: bash .../setup-worktree.sh ...」這種
-    // 沒有實質資訊、還洩漏內部腳本路徑的文字。優先取 err.stdout 的最後一行。
-    const stdout = typeof (err as any)?.stdout === 'string' ? (err as any).stdout : ''
-    const lastLine = stdout.trim().split('\n').pop() ?? ''
-    if (lastLine) return { ok: false, reason: lastLine.slice(0, 500) }
-    return { ok: false, reason: `執行失敗或逾時（${SETUP_TIMEOUT_MS / 60000} 分鐘）` }
-  }
+/**
+ * 把 plan.md 上傳到 Drive：demand-pool 父資料夾底下建一個 {ticket} 子資料夾
+ * （比照 Bug pipeline drive-uploader 對 bug-list 資料夾的既有慣例），上傳
+ * plan.md，公開分享，回傳資料夾連結。任何一步失敗都往外拋，呼叫端決定要
+ * 不要把這個當成技術性失敗（不吞成 undefined 靜默略過連結——使用者需要
+ * 知道『plan.md 產出了但上傳失敗』跟『plan.md 產出成功』是不同狀態）。
+ */
+function uploadPlanToDrive(ticket: string, planPath: string): string {
+  const mkdirOut = execFileSync('bash', [GDRIVE_SH, 'mkdir', ticket, DEMAND_POOL_DRIVE_PARENT_ID], { encoding: 'utf8', timeout: 30_000 })
+  const folderIdMatch = /FOLDER_ID=(\S+)/.exec(mkdirOut)
+  if (!folderIdMatch) throw new Error(`gdrive.sh mkdir 沒有回傳 FOLDER_ID: ${mkdirOut.slice(0, 300)}`)
+  const folderId = folderIdMatch[1]!
+
+  execFileSync('bash', [GDRIVE_SH, 'upload', planPath, folderId], { encoding: 'utf8', timeout: 60_000 })
+  execFileSync('bash', [GDRIVE_SH, 'share', folderId], { encoding: 'utf8', timeout: 30_000 })
+
+  return `https://drive.google.com/drive/folders/${folderId}`
 }
 
-async function runImplementer(ticket: string, prompt: string, cwd: string, stdoutPath: string, stderrPath: string): Promise<{ ok: boolean; summary: string }> {
-  mkdirSync(LOG_DIR, { recursive: true })
-  const env = { ...process.env }
-  delete env.CLAUDE_EFFORT
+/**
+ * 統一收尾：分類 AI分析 值 → （若有 plan.md）上傳 Drive → Notion 留言＋
+ * 更新 AI分析 → Telegram 通知。每個子步驟各自 try/catch，一個失敗不阻斷
+ * 其他步驟（比照 drive-uploader.md『無論如何都要嘗試更新 AI分析欄位』的
+ * 既有原則），但都會記進 demand-pipeline.log 供事後排查。
+ */
+function finalize(ticket: string, email: string, outcome: DemandOutcome): void {
+  const aiAnalysis = classifyAiAnalysis(outcome)
+  log(`${ticket} finalize：${outcome.kind}${outcome.kind === 'plan' ? `/${outcome.status}` : ''} → AI分析=${aiAnalysis}`)
 
-  try {
-    // 跟 T34/repo-scope-gate 的純分類呼叫不同，這裡是真的要它讀寫檔案，
-    // 給真實工具權限（不能用 --tools ""）。--permission-mode
-    // bypassPermissions 的必要性理由同 spawn-create-mr.ts：headless 環境沒
-    // 人能回應權限對話框；prompt 裡嵌入外部 Notion 內容存在 prompt
-    // injection 風險，跟 create-mr 面對真實 bug report 文字內容時承擔的是
-    // 同一類、已被既有 pipeline 接受的風險，不是 T36 新引入的風險類別。
-    // prompt 走 stdin（見 claude-exec.ts），argv 不含 prompt 內容。
-    const stdout = await execClaudeWithStdin(['-p', '--model', 'sonnet', '--permission-mode', 'bypassPermissions', '--output-format', 'json'], prompt, {
-      cwd,
-      maxBuffer: 20 * 1024 * 1024,
-      timeout: IMPLEMENTER_TIMEOUT_MS,
-      env,
-    })
-    appendFileSync(stdoutPath, stdout)
-    const events = JSON.parse(stdout)
-    const resultEvent = Array.isArray(events) ? events.find((e: any) => e?.type === 'result') : null
-    const summary = typeof resultEvent?.result === 'string' ? resultEvent.result : '（無法解析出結果摘要，請直接看 log）'
-    return { ok: true, summary }
-  } catch (err) {
-    // review 發現：argv 已經不含 prompt 了（走 stdin），但 err.message 仍可能
-    // 帶 CLI 絕對路徑等內部細節，不直接把 String(err) 塞進最終給使用者的
-    // Telegram 訊息——用 err.killed/err.signal 明確分辨『逾時被殺』給乾淨
-    // 文案，其他情況才附上截斷過的錯誤字串（技術 log 檔案本身仍完整記錄
-    // 原始錯誤，供人工深入排查）。
-    appendFileSync(stderrPath, String(err))
-    const isTimeout = (err as any)?.killed === true || (err as any)?.signal === 'SIGTERM'
-    const summary = isTimeout
-      ? `實作 agent 逾時被中止（${IMPLEMENTER_TIMEOUT_MS / 60000} 分鐘），詳情請看 ${stderrPath}`
-      : `實作 agent 執行失敗，詳情請看 ${stderrPath}（錯誤摘要：${String((err as any)?.message ?? err).slice(0, 200)}）`
-    return { ok: false, summary }
+  let driveLink: string | undefined
+  if (shouldUploadPlan(outcome)) {
+    try {
+      driveLink = uploadPlanToDrive(ticket, outcome.planPath)
+      log(`${ticket} plan.md 已上傳 Drive：${driveLink}`)
+    } catch (err) {
+      log(`${ticket} plan.md 上傳 Drive 失敗: ${err}`)
+    }
   }
+
+  let notionUrl: string | null = null
+  try {
+    notionUrl = getDemandTicketNotionUrl(ticket)
+    if (notionUrl === null) {
+      log(`${ticket} finalize：找不到對應 Notion 頁面，跳過留言與 AI分析更新`)
+    } else {
+      const commentText = buildNotionCommentText(ticket, outcome)
+      if (driveLink) {
+        execFileSync('bash', [NOTION_SH, 'comment-text', notionUrl, commentText, driveLink, 'plan.md'], { encoding: 'utf8', timeout: 30_000 })
+      } else {
+        execFileSync('bash', [NOTION_SH, 'comment-text', notionUrl, commentText], { encoding: 'utf8', timeout: 30_000 })
+      }
+      execFileSync('bash', [NOTION_SH, 'update-prop', notionUrl, 'AI分析', 'select', aiAnalysis], { encoding: 'utf8', timeout: 30_000 })
+      log(`${ticket} Notion 留言＋AI分析=${aiAnalysis} 已更新`)
+    }
+  } catch (err) {
+    log(`${ticket} finalize：Notion 留言/更新失敗: ${err}`)
+  }
+
+  const text = buildTelegramText(ticket, outcome, { driveLink, notionUrl: notionUrl ?? undefined })
+  notify(ticket, email, text)
 }
 
 async function main(): Promise<void> {
@@ -159,7 +161,7 @@ async function main(): Promise<void> {
     const sufficiency = await checkSpecSufficiencyFromContent(ticket, bodyText, comments)
     if (!sufficiency.sufficient) {
       log(`${ticket} 規格不足：${sufficiency.missing}`)
-      notify(ticket, assigneeEmail, `${ticket} 規格不足，無法自動實作：\n${sufficiency.missing}\n\n請在 Notion 補充規格後重新認領。`)
+      finalize(ticket, assigneeEmail, { kind: 'insufficient-spec', missing: sufficiency.missing })
       return
     }
 
@@ -167,39 +169,21 @@ async function main(): Promise<void> {
     log(`${ticket} 範圍偵測結果：${repos.join(', ')}`)
 
     if (repos.length >= 2) {
-      // 使用者 2026-08-17 定案：跨 ≥2 個 repo 的需求不自動實作，T35 回溯
+      // 使用者 2026-08-17 定案：跨 ≥2 個 repo 的需求不自動分析，T35 回溯
       // 測試證實這種需求的範圍窮盡性不可靠（複雜樣本漏了 2 個獨立呼叫點），
       // 標記需人工複核而非直接視為完成。
-      notify(ticket, assigneeEmail, `${ticket} 判斷會跨 ${repos.length} 個 repo（${repos.join('、')}），目前的自動化 pipeline 對跨 repo 需求的範圍判斷還不夠可靠，需要你自己動手處理，不會自動實作。`)
+      finalize(ticket, assigneeEmail, { kind: 'cross-repo', repos })
       return
     }
 
     const repo = repos[0]!
-    const worktreePath = `/Users/user/aladdin/worktrees/${ticket}/${repo}`
-
-    const setupResult = await setupWorktree(ticket, repo)
-    if (!setupResult.ok) {
-      log(`${ticket} worktree 建置失敗：${setupResult.reason}`)
-      notify(ticket, assigneeEmail, `${ticket} 環境建置失敗，無法自動實作：${setupResult.reason}\n請聯絡維運人員或自行處理。`)
-      return
-    }
-
-    const prompt = buildDemandImplementerPrompt(ticket, bodyText, comments, { repos: [repo], worktreePaths: { [repo]: worktreePath } })
-    const timestamp = new Date().toISOString().replace(/[:.]/g, '-')
-    const stdoutPath = join(LOG_DIR, `${ticket}.${timestamp}.demand-implementer.stdout.log`)
-    const stderrPath = join(LOG_DIR, `${ticket}.${timestamp}.demand-implementer.stderr.log`)
-
-    const result = await runImplementer(ticket, prompt, worktreePath, stdoutPath, stderrPath)
-    log(`${ticket} 實作 agent 執行結束，ok=${result.ok}`)
-
-    notify(
-      ticket,
-      assigneeEmail,
-      `${ticket} 需求實作 agent 已跑完（${result.ok ? '有產出' : '執行異常'}）。\n\n這是輔助草稿，不是自動完成——請務必人工複核後才能用：\n工作目錄：${worktreePath}\nlog：${stdoutPath}\n\n摘要：\n${result.summary.slice(0, 1000)}`,
-    )
+    log(`${ticket} 開始 plan pipeline（repo=${repo}）`)
+    const outcome = await runDemandPlanPipeline(ticket, bodyText, comments, repo)
+    log(`${ticket} plan pipeline 結束，分類=${outcome.kind}${outcome.kind === 'plan' ? `/${outcome.status}` : ''}`)
+    finalize(ticket, assigneeEmail, outcome)
   } catch (err) {
     log(`${ticket} pipeline 未預期例外：${err}`)
-    notify(ticket, assigneeEmail, `⚠️ ${ticket} 需求 pipeline 執行時發生未預期錯誤，請人工檢查：${String(err).slice(0, 300)}`)
+    finalize(ticket, assigneeEmail, { kind: 'unexpected-error', detail: String(err).slice(0, 300) })
   } finally {
     releaseLock(ticket)
   }
