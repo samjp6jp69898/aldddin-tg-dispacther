@@ -6,7 +6,7 @@ import { bodyLimit } from 'hono/body-limit'
 import { webhookCallback } from 'grammy'
 import { bot } from './lib/webhook-server/bot.ts'
 import { registerHandlers } from './lib/security/whitelist.ts'
-import { createRateLimitMiddleware } from './lib/security/rate-limit.ts'
+import { createRateLimitMiddleware, createTokenBucket } from './lib/security/rate-limit.ts'
 import { createWebhookSecretGuard } from './lib/security/webhook-secret-guard.ts'
 import { createHealthMonitor } from './lib/webhook-server/health-monitor.ts'
 
@@ -194,8 +194,47 @@ const stripResponseHeaders = (src: Headers): Headers => {
   return out
 }
 
+// H31：五條 proxy route 各自的流量層量體控制（rate limit + body size）。
+//
+// 【硬性要求：bucket 絕不共用】——每條 route 在下面迴圈裡各自呼叫一次
+// createTokenBucket()，彼此獨立（三條 admin 路由之間也各自獨立，避免一個
+// 環境的高頻使用波及另一個環境的企劃），也都不與上面 webhook 那顆 bucket
+// 共用：webhook 的 createRateLimitMiddleware() 沒帶參數、內部自建自己的
+// bucket（見 rate-limit.ts createRateLimitMiddleware 預設值），本段落每次
+// 呼叫都另外自建一顆，物件各自獨立、互不影響——MCP 流量吃掉 TG 的額度會讓
+// 團隊的 bug 認領入口失效，反之亦然。
+//
+// admin 三條與 platform 給較寬鬆的容量：MCP 一次對話可能連續呼叫多支 tool，
+// 訂太小會誤擋企劃正常操作。toolsmith 因為後端 N=1 併發、單次操作數分鐘，
+// 容量另訂且明顯較小，避免一個長任務就把整個 process 對 toolsmith 的額度
+// 耗盡太久。這裡的數字只抓量級，不追求精確到某個神聖數值。
+const MCP_ROUTE_CAPACITY = 30
+const MCP_ROUTE_REFILL_PER_SECOND = 30 / 60 // 每分鐘 30 次
+const TOOLSMITH_CAPACITY = 5
+const TOOLSMITH_REFILL_PER_SECOND = 5 / 60 // 每分鐘 5 次
+
+// 未認證的巨大 body 會被 proxy 串流轉發到 localhost（認證是在 hosted server
+// 那端才發生），這一層要擋在 proxy，跟上面 webhook 的量級一致。
+const MAX_PROXY_BODY_SIZE = 1024 * 1024 // 1MB
+
+const PROXY_ROUTE_LIMITS: Record<string, { capacity: number; refillPerSecond: number }> = {
+  '/mcp-admin-dev': { capacity: MCP_ROUTE_CAPACITY, refillPerSecond: MCP_ROUTE_REFILL_PER_SECOND },
+  '/mcp-admin-pre': { capacity: MCP_ROUTE_CAPACITY, refillPerSecond: MCP_ROUTE_REFILL_PER_SECOND },
+  '/mcp-admin-evi': { capacity: MCP_ROUTE_CAPACITY, refillPerSecond: MCP_ROUTE_REFILL_PER_SECOND },
+  '/mcp-platform': { capacity: MCP_ROUTE_CAPACITY, refillPerSecond: MCP_ROUTE_REFILL_PER_SECOND },
+  '/toolsmith': { capacity: TOOLSMITH_CAPACITY, refillPerSecond: TOOLSMITH_REFILL_PER_SECOND },
+}
+
 for (const [prefix, port] of PROXY_ROUTES) {
-  app.all(`${prefix}/*`, async c => {
+  const rateLimit = createRateLimitMiddleware(createTokenBucket(PROXY_ROUTE_LIMITS[prefix]))
+  app.all(
+    `${prefix}/*`,
+    rateLimit,
+    bodyLimit({
+      maxSize: MAX_PROXY_BODY_SIZE,
+      onError: c => c.text('Payload Too Large', 413),
+    }),
+    async c => {
     // 用字串串接組 target，不用 new URL(path, base)——path 若以 // 開頭會被
     // URL 建構子當成 protocol-relative host，變成對外任意轉發（open proxy）。
     const url = new URL(c.req.url)
