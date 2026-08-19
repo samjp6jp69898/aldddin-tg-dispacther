@@ -199,6 +199,16 @@ for (const [prefix, port] of PROXY_ROUTES) {
     // 用字串串接組 target，不用 new URL(path, base)——path 若以 // 開頭會被
     // URL 建構子當成 protocol-relative host，變成對外任意轉發（open proxy）。
     const url = new URL(c.req.url)
+    // Review 修正：Hono 路由匹配會解碼非斜線的 %XX（如 /mcp-admin-de%76/…
+    // 會命中 /mcp-admin-dev/*），但這裡的 url.pathname 是未解碼的原文，
+    // slice(prefix.length) 會切錯位、組出無效 target 而落到 502——502 與
+    // catch-all 的 401 可被外部區分，等於免 token 探測出前綴存在。前綴段
+    // 的字面文字不符時（合法 client 的前綴本來就不含編碼字元），直接回
+    // 與 catch-all 一致的 401 + 空 body，不進轉發邏輯。
+    if (url.pathname !== prefix && !url.pathname.startsWith(prefix + '/')) {
+      c.status(401)
+      return c.body('')
+    }
     const targetUrl = `http://localhost:${port}${url.pathname.slice(prefix.length)}${url.search}`
     let upstream: Response
     try {
