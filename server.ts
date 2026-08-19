@@ -2,6 +2,7 @@
 // inline keyboard、認領流程等留給後續 task（見 tasks.json）。
 
 import { Hono } from 'hono'
+import type { MiddlewareHandler } from 'hono'
 import { bodyLimit } from 'hono/body-limit'
 import { webhookCallback } from 'grammy'
 import { bot } from './lib/webhook-server/bot.ts'
@@ -207,10 +208,13 @@ const stripResponseHeaders = (src: Headers): Headers => {
 // admin 三條與 platform 給較寬鬆的容量：MCP 一次對話可能連續呼叫多支 tool，
 // 訂太小會誤擋企劃正常操作。toolsmith 因為後端 N=1 併發、單次操作數分鐘，
 // 容量另訂且明顯較小，避免一個長任務就把整個 process 對 toolsmith 的額度
-// 耗盡太久。這裡的數字只抓量級，不追求精確到某個神聖數值。
+// 耗盡太久。這裡的數字只抓量級，不追求精確到某個神聖數值；toolsmith 的
+// capacity 訂在 10 而非更貼近下限的 5——已知一次 MCP 冷啟動握手
+// （initialize + notifications/initialized + tools/list 三個 POST）就吃掉
+// 3 顆，訂太緊握手都做不完就先被 429。
 const MCP_ROUTE_CAPACITY = 30
 const MCP_ROUTE_REFILL_PER_SECOND = 30 / 60 // 每分鐘 30 次
-const TOOLSMITH_CAPACITY = 5
+const TOOLSMITH_CAPACITY = 10
 const TOOLSMITH_REFILL_PER_SECOND = 5 / 60 // 每分鐘 5 次
 
 // 未認證的巨大 body 會被 proxy 串流轉發到 localhost（認證是在 hosted server
@@ -225,16 +229,47 @@ const PROXY_ROUTE_LIMITS: Record<string, { capacity: number; refillPerSecond: nu
   '/toolsmith': { capacity: TOOLSMITH_CAPACITY, refillPerSecond: TOOLSMITH_REFILL_PER_SECOND },
 }
 
-for (const [prefix, port] of PROXY_ROUTES) {
-  const rateLimit = createRateLimitMiddleware(createTokenBucket(PROXY_ROUTE_LIMITS[prefix]))
-  app.all(
-    `${prefix}/*`,
-    rateLimit,
-    bodyLimit({
-      maxSize: MAX_PROXY_BODY_SIZE,
-      onError: c => c.text('Payload Too Large', 413),
-    }),
-    async c => {
+// H31 review 收尾（正確性 + 安全兩份 fresh-context review 獨立判定為同一個
+// 真實回歸，非可接受取捨）：rateLimit 與 bodyLimit 原本掛在任何認證檢查之
+// 前（甚至在下面 handler 內、fetch 之前才做的 raw-prefix 字面檢查之前），
+// 兩個後果：
+// 1. 未認證的請求也能消耗額度做 DoS——違反 rate-limit.ts:15-18 自己寫明的
+//    掛載前提（webhook 版本的同一類問題 T25 修過一次，這裡在 proxy route
+//    上重現）：任何人不帶 token、以 1 req/s 打 /toolsmith 就能讓它永久
+//    429，合法企劃連坐被擋。
+// 2. bodyLimit 413（以及打滿額度的 429）是比 ec1a3dd 剛修掉的 502 更強的
+//    側信道：單一請求（>1MB body、完全不需認證）就能 100% 確定性探測出
+//    前綴是否存在，直接架空 ec1a3dd 剛修好的均一 401 防線。
+//
+// 修法（範圍限定，不是完整認證——真正認證仍在各 hosted server 那端）：
+// - rawPrefixGuard：把原本在 handler 內才做的字面前綴檢查，搬到 middleware
+//   鏈最前面，讓 percent-encoding 前綴探測在消耗任何額度之前就被均一 401
+//   擋下。
+// - authPresenceGuard：沒有 Authorization header 的請求視為零知識攻擊者，
+//   直接回均一 401，不進 rateLimit（不消耗額度）、不進 bodyLimit。這只墊
+//   高「零知識」攻擊門檻——攻擊者只要塞一個假 Authorization header 仍能
+//   通過這道閘、繼續消耗額度觸發合法 429，這是刻意接受的已知殘餘缺口：
+//   若要徹底根治，要把 tryConsume() 移到收到 upstream 回應「確定是 401」
+//   之後才呼叫，那是結構更大的改動（rate limit 的意義也會反過來——變成
+//   保護後端不被打，而不是先擋在門口），本次不做，留給未來視實際濫用情況
+//   再評估。
+// - bodyLimit 的 onError 從 413 改回均一 401：關掉「帶一個假 Authorization
+//   header 通過前兩道閘之後，仍能用超大 body 觸發 413 oracle」這個殘餘
+//   缺口。注意這只覆蓋 bodyLimit「有 Content-Length、進 handler 前就短路」
+//   那條分支；沒有 Content-Length／chunked 傳輸時超量走的是 fetch 對已中
+//   斷串流拋例外 → handler 的 catch → 回 502（既有行為，不是本次新增），
+//   502 不構成新側信道（/toolsmith 這類後端本來就常態未啟動、平時就回
+//   502，403/502 混雜早已是這幾條路由的常態雜訊）。
+const authPresenceGuard: MiddlewareHandler = async (c, next) => {
+  if (c.req.header('authorization') === undefined) {
+    c.status(401)
+    return c.body('')
+  }
+  await next()
+}
+
+const createRawPrefixGuard = (prefix: string): MiddlewareHandler => {
+  return async (c, next) => {
     // 用字串串接組 target，不用 new URL(path, base)——path 若以 // 開頭會被
     // URL 建構子當成 protocol-relative host，變成對外任意轉發（open proxy）。
     const url = new URL(c.req.url)
@@ -248,6 +283,26 @@ for (const [prefix, port] of PROXY_ROUTES) {
       c.status(401)
       return c.body('')
     }
+    await next()
+  }
+}
+
+for (const [prefix, port] of PROXY_ROUTES) {
+  const rateLimit = createRateLimitMiddleware(createTokenBucket(PROXY_ROUTE_LIMITS[prefix]))
+  app.all(
+    `${prefix}/*`,
+    createRawPrefixGuard(prefix),
+    authPresenceGuard,
+    rateLimit,
+    bodyLimit({
+      maxSize: MAX_PROXY_BODY_SIZE,
+      onError: c => {
+        c.status(401)
+        return c.body('')
+      },
+    }),
+    async c => {
+    const url = new URL(c.req.url)
     const targetUrl = `http://localhost:${port}${url.pathname.slice(prefix.length)}${url.search}`
     let upstream: Response
     try {
