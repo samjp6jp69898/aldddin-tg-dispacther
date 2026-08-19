@@ -121,6 +121,119 @@ app.post(
   webhookCallback(bot, 'hono', { secretToken: webhookSecret }),
 )
 
+// H14：hosted MCP path 分流 proxy——共用既有 ngrok domain，把五個前綴各自
+// 剝掉後轉發到本機對應 port 的 hosted server（例：/mcp-admin-dev/login →
+// http://localhost:8789/login）。認證由各 hosted server 自己的 Bearer token
+// 把關，這裡只做純轉發，跟 webhook 的 secret guard 無關（那道 guard 只掛在
+// webhook 那一條 route 上，不是全域 middleware）。
+//
+// 註冊順序是硬約束：Hono 依註冊順序匹配，這五條必須在 webhook route 之後、
+// 下面 catch-all `app.all('*')` 之前，否則全部被 catch-all 的 401 吃掉。
+//
+// 安全紀律（H14 AC11）：/login 的明文密碼會流經這一跳，本段落嚴禁任何
+// console.log / console.error 印出 request/response 的 body 或 headers，
+// body 只以串流原樣轉發、不讀取不緩衝。
+const PROXY_ROUTES: Array<[prefix: string, port: number]> = [
+  ['/mcp-admin-dev', 8789],
+  ['/mcp-admin-pre', 8791],
+  ['/mcp-admin-evi', 8792],
+  ['/mcp-platform', 8790],
+  ['/toolsmith', 8788],
+]
+
+// RFC 9110/7230 hop-by-hop headers：只屬於「這一跳」的連線層 header，
+// 轉發前必須移除（Connection header 自己點名的 header 也一併移除）。
+const HOP_BY_HOP_HEADERS = new Set([
+  'connection',
+  'keep-alive',
+  'proxy-authenticate',
+  'proxy-authorization',
+  'te',
+  'trailer',
+  'transfer-encoding',
+  'upgrade',
+])
+
+// 轉發用 request headers：
+// - hop-by-hop 移除（含 Connection 點名的）。
+// - host 移除：讓 fetch 依 target 自動補 localhost:<port>，不把 ngrok domain
+//   的 Host 帶給後端。
+// - content-length 移除：body 是串流轉發，由執行環境重算 framing；沿用原始
+//   Content-Length 配串流 body 是最典型的 proxy 破法。
+// - accept-encoding 移除：fetch 收到壓縮回應會自動解壓，但 Content-Encoding
+//   header 仍留在回應上，原樣回傳會變成「header 說壓縮、body 已解壓」的
+//   不一致；讓後端直接回未壓縮內容最單純（本機 loopback 無壓縮效益）。
+// - 其餘（含 Accept、Authorization）原樣保留。
+const stripForwardHeaders = (src: Headers): Headers => {
+  const connectionListed = new Set(
+    (src.get('connection') ?? '')
+      .split(',')
+      .map(name => name.trim().toLowerCase())
+      .filter(name => name !== ''),
+  )
+  const out = new Headers()
+  for (const [name, value] of src) {
+    if (HOP_BY_HOP_HEADERS.has(name) || connectionListed.has(name)) continue
+    if (name === 'host' || name === 'content-length' || name === 'accept-encoding') continue
+    out.set(name, value)
+  }
+  return out
+}
+
+// 回應 headers 同樣剝 hop-by-hop 與 content-length / content-encoding（framing
+// 由本 server 對外重算；SSE 回應本來就沒有 content-length，Content-Type、
+// X-Accel-Buffering 等原樣保留）。date 也剝掉：本 server 對外回應時會自己補
+// 一個 Date，保留 upstream 的會變成重複兩個 Date header。
+const stripResponseHeaders = (src: Headers): Headers => {
+  const out = new Headers()
+  for (const [name, value] of src) {
+    if (HOP_BY_HOP_HEADERS.has(name)) continue
+    if (name === 'content-length' || name === 'content-encoding' || name === 'date') continue
+    out.set(name, value)
+  }
+  return out
+}
+
+for (const [prefix, port] of PROXY_ROUTES) {
+  app.all(`${prefix}/*`, async c => {
+    // 用字串串接組 target，不用 new URL(path, base)——path 若以 // 開頭會被
+    // URL 建構子當成 protocol-relative host，變成對外任意轉發（open proxy）。
+    const url = new URL(c.req.url)
+    const targetUrl = `http://localhost:${port}${url.pathname.slice(prefix.length)}${url.search}`
+    let upstream: Response
+    try {
+      upstream = await fetch(targetUrl, {
+        method: c.req.method,
+        headers: stripForwardHeaders(c.req.raw.headers),
+        body: c.req.raw.body,
+        // 3xx 原樣轉回呼叫端，proxy 不代為跟隨（跟隨會把後端的 localhost
+        // redirect 目標當成 proxy 自己要去打的地址）。
+        redirect: 'manual',
+        // @ts-expect-error duplex 是 fetch 串流 request body 的必要選項，型別定義未含
+        duplex: 'half',
+      })
+    } catch {
+      // 後端未啟動（如 /toolsmith 的 8788）或連線失敗：回乾淨的 502，不讓
+      // 例外冒泡、不影響其他 route；刻意不 log（見上方安全紀律）。
+      return c.text('Bad Gateway', 502)
+    }
+    // 401（未帶/帶錯 Bearer token，由 hosted server 自己的認證判定）對外一律
+    // 改回與下面 catch-all 完全一致的 401 + 空 body——不轉發 hosted server 的
+    // 401 body 與 WWW-Authenticate 之類 header，讓「路徑存在但沒過認證」與
+    // 「路徑不存在」從外部不可區分，維持 T14 均一回應防線。MCP client 端只
+    // 依 401 狀態碼判定認證失敗，不需要 body。
+    if (upstream.status === 401) {
+      void upstream.body?.cancel()
+      c.status(401)
+      return c.body('')
+    }
+    return new Response(upstream.body, {
+      status: upstream.status,
+      headers: stripResponseHeaders(upstream.headers),
+    })
+  })
+}
+
 // 任何沒命中上面路由的請求（含猜錯 webhook 路徑）一律回跟「secret_token 錯誤」
 // 一模一樣的回應：401 + 空 body——這正是 grammy hono adapter 對 secret_token
 // 錯誤的原生回應（見 node_modules/grammy/out/convenience/frameworks.js 的
@@ -142,4 +255,13 @@ const port = Number(process.env.PORT ?? 8787)
 export default {
   fetch: app.fetch,
   port,
+  // H14：Bun.serve 預設 idleTimeout 10 秒——低於 MCP SDK SSE keep-alive 的
+  // 15 秒間隔，proxy 轉發的 text/event-stream 長連線會在 frame 間隙被 Bun
+  // 掐斷（實測：SSE 經 proxy 約 10 秒斷線、收不到 15 秒的 keep-alive frame）。
+  // 提高到 120 秒讓 SSE 長連線活得過 keep-alive 週期（8 倍 margin）。對
+  // webhook / 其他短請求的影響只是 idle 連線可掛更久，本服務前面有 ngrok、
+  // 流量極小，可接受。注意 Bun 的 idleTimeout 上限是 255 秒：若未來 hosted
+  // 端出現超過 120 秒完全無輸出的同步長請求（如 toolsmith 生成），這一跳
+  // 仍會斷，屆時要靠應用層週期輸出（SSE keep-alive）解，不是再調大這裡。
+  idleTimeout: 120,
 }
