@@ -6,6 +6,7 @@ import { sendDemandList } from '../webhook-server/demand-list.ts'
 import { handleClaim } from '../locking/claim.ts'
 import { handleDemandClaim } from '../locking/demand-claim.ts'
 import { createReplayGuard } from './replay-guard.ts'
+import { handleKitCommand, isKitAdminChat } from '../webhook-server/kit-issue.ts'
 
 // grammy 的 secretToken（見 lib/webhook-server/bot.ts / server.ts）只驗證請求
 // 真的來自 Telegram，不驗證是不是授權使用者；chat_id 白名單要在這一層自己做
@@ -15,8 +16,9 @@ import { createReplayGuard } from './replay-guard.ts'
  * 掛載 bot.on('message') 與 bot.on('callback_query:data')，白名單外的 chat_id
  * 一律靜默 return，不執行任何後續 Notion/tracker 查詢或 keyboard 組裝。
  * 白名單內的 chat_id 通過後往下流動——訊息走 T30 指令式路由（/bug 直接列
- * 清單 / /req 需求池清單 / /menu 頂層選單 / 其他回用法提示，見 handler 內
- * 註解）；callback_query 依 callback_data 分流 menu:bug（T29，觸發 T6/T8
+ * 清單 / /req 需求池清單 / /menu 頂層選單 / /kit 核發企劃 starter kit
+ * （僅 TG_KIT_ADMIN_CHAT_ID，見 kit-issue.ts） / 其他回用法提示，見 handler
+ * 內註解）；callback_query 依 callback_data 分流 menu:bug（T29，觸發 T6/T8
  * 查詢列清單）/ reqpool:noop（T9 建立、T32 接上真實需求池清單）/
  * claim:{ticket}（T10）/ demand-claim:{ticket}（T33，上鎖＋更新 Notion
  * AI分析，不觸發任何自動化 pipeline）。
@@ -59,7 +61,9 @@ export function registerHandlers(bot: Bot): void {
       //   /menu → 頂層選單（既有 inline keyboard 流程保留，按鈕路由不變）
       //   其他  → 回覆用法提示。維持「白名單內沒有安靜失敗的路徑」原則，
       //           所以不是靜默忽略；比對大小寫不敏感、含前後空白容忍。
-      const text = (ctx.message?.text ?? '').trim().toLowerCase()
+      const rawText = (ctx.message?.text ?? '').trim()
+      const text = rawText.toLowerCase()
+      const kitAdmin = isKitAdminChat(chatId)
       if (text === '/bug') {
         await ctx.replyWithChatAction('typing') // 跟 menu:bug 按鈕同款：真的打 Notion 前先給讀取中提示
         await sendTicketList(ctx, techUser)
@@ -68,8 +72,16 @@ export function registerHandlers(bot: Bot): void {
         await sendDemandList(ctx, techUser)
       } else if (text === '/menu') {
         await sendTopLevelMenu(ctx)
+      } else if (kitAdmin && /^\/kit(\s|$)/i.test(rawText)) {
+        // 只有 TG_KIT_ADMIN_CHAT_ID 這個 chat_id 走得到這裡；其他白名單內的
+        // 技術打 /kit 會直接落到最下面的 else，回一般用法提示，不洩漏這個
+        // 指令存在（見 kit-issue.ts 檔頭註解）。
+        await handleKitCommand(ctx, rawText)
       } else {
-        await ctx.reply('可用指令：/bug（列出可認領 Bug 工單）、/req（需求池）、/menu（選單）')
+        const usage = kitAdmin
+          ? '可用指令：/bug（列出可認領 Bug 工單）、/req（需求池）、/menu（選單）、/kit <id> <name>（核發企劃 kit）'
+          : '可用指令：/bug（列出可認領 Bug 工單）、/req（需求池）、/menu（選單）'
+        await ctx.reply(usage)
       }
     } catch (err) {
       replayGuard.forget(updateId)

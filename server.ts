@@ -43,6 +43,23 @@ await bot.api.setMyCommands(
   { scope: { type: 'all_private_chats' } },
 )
 
+// /kit 只給 TG_KIT_ADMIN_CHAT_ID 這一個 chat 看得到「/」選單裡的 autocomplete
+// （chat 專屬 scope 優先序高於上面的 all_private_chats，其他人的選單不受
+// 影響）。這只影響 UI 提示，實際授權判斷在 whitelist.ts 的 isKitAdminChat——
+// 就算這裡沒設定，非授權者手動打 /kit 也一樣被擋掉，見 kit-issue.ts 檔頭註解。
+const kitAdminChatId = process.env.TG_KIT_ADMIN_CHAT_ID
+if (kitAdminChatId) {
+  await bot.api.setMyCommands(
+    [
+      { command: 'bug', description: '列出你可認領的 Bug 工單' },
+      { command: 'req', description: '需求池（開發中，見 T23）' },
+      { command: 'menu', description: '顯示頂層選單' },
+      { command: 'kit', description: '核發企劃 starter kit（/kit <id> <name>）' },
+    ],
+    { scope: { type: 'chat', chat_id: Number(kitAdminChatId) } },
+  )
+}
+
 const app = new Hono()
 
 // T24 review 順帶發現並修正：空 body／格式錯誤的 JSON（帶對的 secret_token）
