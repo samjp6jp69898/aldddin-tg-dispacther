@@ -1,6 +1,7 @@
 import { afterAll, describe, expect, test } from 'bun:test'
 import { Hono } from 'hono'
 import { isAuthenticatedUpstreamStatus, registerProxyRoutes } from './mcp-proxy.ts'
+import { respondUniform401 } from '../security/uniform-401.ts'
 
 // 這份測試的兩個目標（對應 M1 / M4 兩個缺陷）：
 // 1. M1：從外部看，「前綴不存在」與「前綴存在但（認證失敗 / 服務沒開 / 帶了
@@ -404,5 +405,118 @@ describe('設定完整性', () => {
   test('缺少額度設定的 route 在啟動時就拒絕註冊（不會靜默變成無限制）', () => {
     const app = new Hono()
     expect(() => registerProxyRoutes(app, { routes: [['/no-limit-defined', 9999]] })).toThrow()
+  })
+})
+
+// F-1：帶 body 的請求會間歇回 400，構成機率型前綴/存活預言機。
+//
+// 這一組**必須走真的 TCP socket**（Bun.serve + 真的 fetch），不能用 Hono 的
+// app.request()：那個 400 不是 Hono 產生的，是 Bun 在回應路徑之外、偵測到
+// 「回應已送出但入站 request body 還在傳輸中被中止」時自己送的，in-process
+// 呼叫根本沒有那條連線，重現不出來。
+describe('F-1 — 帶 body 的假 token 請求，三類前綴必須逐位元組一致', () => {
+  // 上游比照 hosted server 的 Bearer guard（agrabah-admin/src/auth.ts）：
+  // 認證失敗立刻回 401，**完全不讀 request body**——這正是觸發條件。
+  const upstream = Bun.serve({
+    port: 0,
+    hostname: '127.0.0.1',
+    fetch: () => new Response('Unauthorized', { status: 401 }),
+  })
+
+  const app = new Hono()
+  registerProxyRoutes(app, {
+    routes: [
+      ['/p-up', upstream.port], // 前綴存在、後端在跑
+      ['/p-down', CLOSED_PORT], // 前綴存在、後端沒開
+    ],
+    buckets: {
+      authed: { capacity: 1_000_000, refillPerSecond: 0 },
+      forward: { capacity: 1_000_000, refillPerSecond: 0 },
+    },
+  })
+  app.all('*', c => respondUniform401(c))
+  const proxy = Bun.serve({ port: 0, hostname: '127.0.0.1', fetch: app.fetch, idleTimeout: 120 })
+
+  afterAll(() => {
+    proxy.stop(true)
+    upstream.stop(true)
+  })
+
+  // 一發請求的完整可觀測面：狀態碼 + body 位元組 + header 名稱集合。
+  async function fingerprint(prefix: string): Promise<string> {
+    const res = await fetch(`http://127.0.0.1:${proxy.port}${prefix}/mcp`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer fake-token', 'content-type': 'application/json' },
+      body: PROBE_BODY,
+    })
+    const bytes = (await res.bytes()).length
+    const headers = [...res.headers.keys()].filter(name => name !== 'date').sort().join(',')
+    return `${res.status}|bytes=${bytes}|headers=${headers}`
+  }
+
+  // body 越大，「上游已回 401 但入站 body 還在傳輸中」的窗口越大、400 越容易
+  // 出現：實測修正前 200 位元組的 body 約 2%、900KB 約 13%。這裡取 256KB 搭配
+  // 150 發，讓回歸幾乎必然被抓到（實測對修正前的程式碼 5 次全中）。用固定發數
+  // 而不是等待/重試，測試不靠時間成立。
+  const PROBE_BODY = 'x'.repeat(256 * 1024)
+  const N = 150
+
+  test('後端在跑的前綴：60 發全部是均一 401，沒有任何 400', async () => {
+    const seen = new Set<string>()
+    for (let i = 0; i < N; i++) seen.add(await fingerprint('/p-up'))
+    expect([...seen]).toEqual(['401|bytes=0|headers=content-length'])
+  })
+
+  test('三類前綴（後端在跑 / 後端沒開 / 前綴不存在）的回應完全無法區分', async () => {
+    const seen = new Set<string>()
+    for (let i = 0; i < N; i++) {
+      seen.add(await fingerprint('/p-up'))
+      seen.add(await fingerprint('/p-down'))
+      seen.add(await fingerprint('/nonexistent-prefix'))
+    }
+    expect(seen.size).toBe(1)
+  })
+})
+
+describe('F-1 — 轉發改成先讀完 body（race 在結構上不可能，不是機率被壓低）', () => {
+  test('body 完整送達後端，且以 Content-Length 送出（不是串流 chunked）', async () => {
+    const seen: Array<{ length: number; contentLength: string | null; transferEncoding: string | null }> = []
+    const upstream = Bun.serve({
+      port: 0,
+      hostname: '127.0.0.1',
+      async fetch(req) {
+        seen.push({
+          length: (await req.bytes()).length,
+          contentLength: req.headers.get('content-length'),
+          transferEncoding: req.headers.get('transfer-encoding'),
+        })
+        return new Response('ok', { status: 200 })
+      },
+    })
+    const app = buildApp({ port: upstream.port })
+
+    const payload = 'a'.repeat(4096)
+    expect((await get(app, '/mcp-test/files', { method: 'POST', body: payload })).status).toBe(200)
+
+    expect(seen).toEqual([{ length: 4096, contentLength: '4096', transferEncoding: null }])
+    upstream.stop(true)
+  })
+
+  test('沒有 body 的 GET 不受影響（不會憑空生出一個空 body）', async () => {
+    const seen: Array<string | null> = []
+    const upstream = Bun.serve({
+      port: 0,
+      hostname: '127.0.0.1',
+      fetch(req) {
+        seen.push(req.headers.get('content-length'))
+        return new Response('ok', { status: 200 })
+      },
+    })
+    const app = buildApp({ port: upstream.port })
+
+    expect((await get(app, '/mcp-test/mcp')).status).toBe(200)
+
+    expect(seen).toEqual([null])
+    upstream.stop(true)
   })
 })

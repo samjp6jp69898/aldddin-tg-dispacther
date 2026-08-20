@@ -1,5 +1,6 @@
 import type { MiddlewareHandler } from 'hono'
 import { timingSafeEqual } from 'node:crypto'
+import { respondUniform401 } from './uniform-401.ts'
 
 const SECRET_HEADER = 'X-Telegram-Bot-Api-Secret-Token'
 
@@ -21,19 +22,23 @@ const SECRET_HEADER = 'X-Telegram-Bot-Api-Secret-Token'
 // （用naive比較等於在 grammy 已經做好的防護之前，自己重新開一個計時側錄
 // 破口）。webhookCallback 通過後還會再驗一次 secret_token，是可接受的
 // 重複（cheap，不是本次要解決的問題）。
+//
+// F-1 之後兩個失敗分支改走 lib/security/uniform-401.ts：回應位元組完全不變，
+// 差別是送出之前會先把還在傳輸中的 request body 讀掉丟棄，讓「secret 錯誤」
+// 與 catch-all、proxy 各道 guard 連「回應在請求生命週期的哪個時點送出」都
+// 一致（理由見該模組檔頭）。只影響驗證失敗的請求——通過驗證的正常 Telegram
+// update 直接 next()，body 原封不動交給 bodyLimit 與 webhookCallback。
 export function createWebhookSecretGuard(expectedToken: string): MiddlewareHandler {
   const expected = Buffer.from(expectedToken)
 
   return async (c, next) => {
     const header = c.req.header(SECRET_HEADER)
     if (header === undefined) {
-      c.status(401)
-      return c.body('')
+      return respondUniform401(c)
     }
     const actual = Buffer.from(header)
     if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) {
-      c.status(401)
-      return c.body('')
+      return respondUniform401(c)
     }
     await next()
   }

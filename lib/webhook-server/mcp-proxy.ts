@@ -12,12 +12,15 @@
 // 與測試用的注入點。
 //
 // 安全紀律（H14 AC11）：/login 的明文密碼會流經這一跳，本模組嚴禁任何
-// console.log / console.error 印出 request/response 的 body 或 headers，
-// body 只以串流原樣轉發、不讀取不緩衝。
+// console.log / console.error 印出 request/response 的 body 或 headers。
+// request body 會在轉發前完整讀進記憶體（上限 MAX_PROXY_BODY_SIZE，理由見
+// F-1 修正說明），但只是原樣交給 fetch，全程不檢視、不記錄、不落地；
+// response body 仍是串流原樣轉回，SSE 長連線不受影響。
 
 import type { Context, Hono, MiddlewareHandler } from 'hono'
 import { bodyLimit } from 'hono/body-limit'
 import { createTokenBucket, type TokenBucket } from '../security/rate-limit.ts'
+import { respondUniform401 } from '../security/uniform-401.ts'
 
 export type ProxyRoute = [prefix: string, port: number]
 
@@ -49,8 +52,10 @@ const HOP_BY_HOP_HEADERS = new Set([
 // - hop-by-hop 移除（含 Connection 點名的）。
 // - host 移除：讓 fetch 依 target 自動補 localhost:<port>，不把 ngrok domain
 //   的 Host 帶給後端。
-// - content-length 移除：body 是串流轉發，由執行環境重算 framing；沿用原始
-//   Content-Length 配串流 body 是最典型的 proxy 破法。
+// - content-length 移除：framing 一律由執行環境依實際送出的 body 重算（F-1
+//   之後 body 是先讀進記憶體再交給 fetch，fetch 會自己補正確的
+//   Content-Length）；沿用入站那份原始 Content-Length 是最典型的 proxy 破法，
+//   它跟我們實際送出的位元組數不保證一致。
 // - accept-encoding 移除：fetch 收到壓縮回應會自動解壓，但 Content-Encoding
 //   header 仍留在回應上，原樣回傳會變成「header 說壓縮、body 已解壓」的
 //   不一致；讓後端直接回未壓縮內容最單純（本機 loopback 無壓縮效益）。
@@ -88,15 +93,16 @@ const stripResponseHeaders = (src: Headers): Headers => {
 /**
  * proxy 這一層所有的拒絕都必須跟 server.ts 那條 catch-all 逐位元組一致：
  * 401 + 空 body（那正是 grammy hono adapter 對 secret_token 錯誤的原生回應）。
- * 只要有任何一種拒絕長得不一樣，「前綴存在」就會被外部區分出來。
+ * 只要有任何一種拒絕長得不一樣，「前綴存在」就會被外部區分出來。回應內容與
+ * 「在請求生命週期的哪個時點送出」都由 uniform-401.ts 統一定義，proxy 這裡
+ * 只多做一件 proxy 才需要的事：把上游回應收乾淨。
  */
 const uniform401 = (c: Context, upstream?: Response) => {
   // 已經開始接收的上游 body 要主動關掉，否則連線與緩衝區不會被釋放。串流若
   // 已中斷，cancel() 會 reject——這裡明確吞掉：沒有可做的補救，也不能 log
   // （見檔頭安全紀律），未處理的 rejection 反而會變成噪音。
   upstream?.body?.cancel().catch(() => {})
-  c.status(401)
-  return c.body('')
+  return respondUniform401(c)
 }
 
 /**
@@ -354,17 +360,48 @@ export function registerProxyRoutes(app: Hono, opts: RegisterProxyRoutesOptions 
       async c => {
         const url = new URL(c.req.url)
         const targetUrl = `http://localhost:${port}${url.pathname.slice(prefix.length)}${url.search}`
+
+        // F-1：request body 先完整讀進記憶體才轉發，不再把入站串流直接交給
+        // fetch（原本是 `body: c.req.raw.body` + `duplex: 'half'`）。
+        //
+        // 串流轉發時，上游只要沒讀 body 就先回認證失敗（hosted server 的
+        // Bearer guard 正是如此，見 agrabah-admin/src/auth.ts），fetch 會在
+        // 入站 body 還在傳輸途中中止它，Bun 因此在 Hono 的回應路徑之外送出
+        // 400 + 空 body——一個只在「前綴存在且後端在跑」時才出現的旁通道，
+        // isAuthenticatedUpstreamStatus 看不到它，正規化無從介入。先讀完再
+        // 轉發之後，入站串流不再有「被讀到一半才中止」的狀態，這條 race 是
+        // 結構上不可能發生，不是機率被壓低（實測見 mcp-proxy.test.ts）。
+        //
+        // 取捨（刻意接受）：轉發中的請求會各自佔住最多 MAX_PROXY_BODY_SIZE
+        // 的記憶體，原本串流轉發幾乎不佔。上限由三者相乘夾住：單一 body
+        // ≤1MB（下面的 bodyLimit）、每條 route 每分鐘最多 120 發能走到這裡
+        // （M4 轉發閘）、停在半途的連線 120 秒被 Bun idleTimeout 回收。而且
+        // 要佔住記憶體就得真的把位元組送上來，等於必須打出 ngrok 流量統計上
+        // 看得見的量——這正是 M4 轉發閘刻意要逼出來的性質。
+        //
+        // 對正常路徑無影響：MCP 的 JSON-RPC body、/login 的 JSON、/files 的
+        // 圖片上傳都是有限且 ≤1MB 的 body（SSE 是**回應**側，仍然串流，見
+        // 下面 new Response(upstream.body)）。
+        let forwardBody: ArrayBuffer | null = null
+        try {
+          if (c.req.raw.body !== null) {
+            forwardBody = await c.req.raw.arrayBuffer()
+          }
+        } catch {
+          // bodyLimit 的串流分支（沒有 Content-Length／chunked）超量時就是在
+          // 這裡拋出來的，跟其他所有拒絕一樣回均一 401。
+          return uniform401(c)
+        }
+
         let upstream: Response
         try {
           upstream = await fetch(targetUrl, {
             method: c.req.method,
             headers: stripForwardHeaders(c.req.raw.headers),
-            body: c.req.raw.body,
+            body: forwardBody,
             // 3xx 原樣轉回呼叫端，proxy 不代為跟隨（跟隨會把後端的 localhost
             // redirect 目標當成 proxy 自己要去打的地址）。
             redirect: 'manual',
-            // @ts-expect-error duplex 是 fetch 串流 request body 的必要選項，型別定義未含
-            duplex: 'half',
           })
         } catch {
           // 後端未啟動（如 /toolsmith 的 8788）或連線失敗。M1 之前這裡回 502，

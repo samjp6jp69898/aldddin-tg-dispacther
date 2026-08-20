@@ -8,6 +8,7 @@ import { bot } from './lib/webhook-server/bot.ts'
 import { registerHandlers } from './lib/security/whitelist.ts'
 import { createRateLimitMiddleware } from './lib/security/rate-limit.ts'
 import { createWebhookSecretGuard } from './lib/security/webhook-secret-guard.ts'
+import { respondUniform401 } from './lib/security/uniform-401.ts'
 import { createHealthMonitor } from './lib/webhook-server/health-monitor.ts'
 import { registerProxyRoutes } from './lib/webhook-server/mcp-proxy.ts'
 
@@ -136,15 +137,11 @@ app.post(
 registerProxyRoutes(app)
 
 // 任何沒命中上面路由的請求（含猜錯 webhook 路徑）一律回跟「secret_token 錯誤」
-// 一模一樣的回應：401 + 空 body——這正是 grammy hono adapter 對 secret_token
-// 錯誤的原生回應（見 node_modules/grammy/out/convenience/frameworks.js 的
-// hono() adapter unauthorized 分支：c.status(401); c.body("")），不是我們自己
-// 另外編一種格式去湊巧一致。刻意放在所有路由最後，只攔截真正沒命中的請求，
-// 不影響上面 '/' 健康檢查與正確 webhook 路徑本身。
-app.all('*', c => {
-  c.status(401)
-  return c.body('')
-})
+// 一模一樣的回應：401 + 空 body。回應內容與送出時點的定義都在
+// lib/security/uniform-401.ts（那裡也記著為什麼「拒絕也要先把 request body
+// 讀掉」——F-1）。刻意放在所有路由最後，只攔截真正沒命中的請求，不影響上面
+// '/' 健康檢查與正確 webhook 路徑本身。
+app.all('*', c => respondUniform401(c))
 
 // T19：每分鐘查一次本機 ngrok admin API，tunnel 狀態翻轉時發 tg-notify.sh
 // 告警給維運者（見 health-monitor.ts 註解）。用 setInterval 週期排程，不是
