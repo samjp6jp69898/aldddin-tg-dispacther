@@ -43,7 +43,7 @@ type Stub = {
 function startStub(): Stub {
   const received: Array<{ method: string; path: string }> = []
   let respond: (req: Request) => Response = () => new Response('upstream-ok', { status: 200 })
-  // 綁 127.0.0.1 與正式 hosted server 一致（見 agrabah-admin/src/http.ts 檔頭
+  // 綁 127.0.0.1 與正式 hosted server 一致（見 aladdin-admin/src/http.ts 檔頭
   // 「綁定 127.0.0.1」），proxy 打的是 http://localhost:<port>。
   const server = Bun.serve({
     port: 0,
@@ -237,7 +237,7 @@ describe('M1 — 合法業務回應必須原樣通過（不能為了關預言機
 
   // 405 是 MCP SDK client 的功能性依賴，不是可有可無的錯誤碼：GET /mcp 回 405
   // client 才會判定「沒有 GET SSE」而安靜下來，換成 401 會被當成認證失敗。
-  // 見 agrabah-admin/src/http.ts:37-49 對 SDK client 行為的實測記錄。
+  // 見 aladdin-admin/src/http.ts:37-49 對 SDK client 行為的實測記錄。
   test('405（GET /mcp）原樣通過，Allow header 保留', async () => {
     const app = buildApp()
     stub.setResponder(() => new Response('Method Not Allowed', { status: 405, headers: { allow: 'POST, DELETE' } }))
@@ -415,7 +415,7 @@ describe('設定完整性', () => {
 // 「回應已送出但入站 request body 還在傳輸中被中止」時自己送的，in-process
 // 呼叫根本沒有那條連線，重現不出來。
 describe('F-1 — 帶 body 的假 token 請求，三類前綴必須逐位元組一致', () => {
-  // 上游比照 hosted server 的 Bearer guard（agrabah-admin/src/auth.ts）：
+  // 上游比照 hosted server 的 Bearer guard（aladdin-admin/src/auth.ts）：
   // 認證失敗立刻回 401，**完全不讀 request body**——這正是觸發條件。
   const upstream = Bun.serve({
     port: 0,

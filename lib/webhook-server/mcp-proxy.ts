@@ -108,12 +108,12 @@ const uniform401 = (c: Context, upstream?: Response) => {
 /**
  * M1：判定「這個上游狀態碼是否證明請求通過了 Bearer 認證」。
  *
- * 三支 hosted server（agrabah-admin / agrabah-platform / agrabah-toolsmith 的
+ * 三支 hosted server（aladdin-admin / aladdin-platform / aladdin-toolsmith 的
  * src/http.ts）結構完全一致：Origin guard（403，**認證之前**）→ Bearer guard
  * （401，唯一例外是 path === '/health'）→ 各 route。所以「只可能由已認證請求
  * 收到的狀態碼」是可以逐一列舉的：
  *   - 2xx：正常業務回應（MCP、/login、/files）——全部在認證之後。
- *   - 400：/login、/files 的 JSON／參數錯誤（agrabah-admin/src/http.ts:177,192,265,271,280）。
+ *   - 400：/login、/files 的 JSON／參數錯誤（aladdin-admin/src/http.ts:177,192,265,271,280）。
  *   - 405：GET /mcp（同檔 :326）。
  *   - 413：/files 超過檔案大小上限（同檔 :255）。
  *   - 429：/login 帳號層節流（同檔 :166）。
@@ -131,7 +131,7 @@ const uniform401 = (c: Context, upstream?: Response) => {
  * 為什麼是白名單而不是「所有非 2xx 一律正規化」：405 對 MCP client 是功能性
  * 依賴，不是可有可無的錯誤碼——GET /mcp 必須回 405，client 才會判定「server
  * 沒有提供 GET SSE」而安靜下來；換成 401 會被當成認證失敗（見
- * agrabah-admin/src/http.ts:37-49 對 SDK client 行為的實測記錄）。400/413/429
+ * aladdin-admin/src/http.ts:37-49 對 SDK client 行為的實測記錄）。400/413/429
  * 同理，是企劃端 skill 用來分辨「參數寫錯 / 檔案太大 / 被節流」與「要重新
  * 登入」的唯一依據，全部壓成 401 會讓每個錯誤都被誤導成「去重新登入」。
  *
@@ -260,7 +260,7 @@ const createRawPrefixGuard = (prefix: string): MiddlewareHandler => {
 
 /**
  * M1：/health 是三支 hosted server 刻意豁免 Bearer 認證的端點
- * （agrabah-admin/src/http.ts:103-108，platform / toolsmith 同構），所以只要
+ * （aladdin-admin/src/http.ts:103-108，platform / toolsmith 同構），所以只要
  * 塞一個假 Authorization header 就能拿到 `200 {"status":"ok",
  * "uptime_seconds":N}`——同時確認「這個前綴後面有服務」「它活著」「它上次
  * 重啟在多久以前」。它是 2xx，靠回應正規化關不掉（2xx 必須放行，否則正常
@@ -365,7 +365,7 @@ export function registerProxyRoutes(app: Hono, opts: RegisterProxyRoutesOptions 
         // fetch（原本是 `body: c.req.raw.body` + `duplex: 'half'`）。
         //
         // 串流轉發時，上游只要沒讀 body 就先回認證失敗（hosted server 的
-        // Bearer guard 正是如此，見 agrabah-admin/src/auth.ts），fetch 會在
+        // Bearer guard 正是如此，見 aladdin-admin/src/auth.ts），fetch 會在
         // 入站 body 還在傳輸途中中止它，Bun 因此在 Hono 的回應路徑之外送出
         // 400 + 空 body——一個只在「前綴存在且後端在跑」時才出現的旁通道，
         // isAuthenticatedUpstreamStatus 看不到它，正規化無從介入。先讀完再

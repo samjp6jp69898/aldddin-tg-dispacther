@@ -44,7 +44,7 @@ export async function checkNgrokTunnelReachable(apiUrl: string = NGROK_API_URL):
 }
 
 // F-3：hosted server 的 Bearer token 名冊。名冊載入是 fail-closed 的（見
-// obsidian mcps/agrabah-admin/src/auth.ts 的 loadRegistry，commit 0d102dc4）：
+// obsidian mcps/aladdin-admin/src/auth.ts 的 loadRegistry，commit 0d102dc4）：
 // 檔案讀不到、JSON 壞掉、條目缺欄位、id/token 重複——任何一種都讓那台 hosted
 // server 對**所有** token 一律回 401，直到檔案修好。
 //
@@ -53,13 +53,13 @@ export async function checkNgrokTunnelReachable(apiUrl: string = NGROK_API_URL):
 // hosted /health 的能力；唯一的線索是 hosted server 寫在 launchd err log 裡
 // 的一行 stderr，沒有人在看。
 //
-// agrabah-toolsmith 不在清單裡：它沒有名冊檔（認證機制不同），列進來只會變成
+// aladdin-toolsmith 不在清單裡：它沒有名冊檔（認證機制不同），列進來只會變成
 // 永遠告警的假陽性。
 const TOKEN_REGISTRY_PATHS = [
-  '/Users/user/aladdin/obsidian/mcps/agrabah-admin/tokens.json',
-  '/Users/user/aladdin/obsidian/mcps/agrabah-admin/tokens.pre.json',
-  '/Users/user/aladdin/obsidian/mcps/agrabah-admin/tokens.evi.json',
-  '/Users/user/aladdin/obsidian/mcps/agrabah-platform/tokens.json',
+  '/Users/user/aladdin/obsidian/mcps/aladdin-admin/tokens.json',
+  '/Users/user/aladdin/obsidian/mcps/aladdin-admin/tokens.pre.json',
+  '/Users/user/aladdin/obsidian/mcps/aladdin-admin/tokens.evi.json',
+  '/Users/user/aladdin/obsidian/mcps/aladdin-platform/tokens.json',
 ]
 
 /**
