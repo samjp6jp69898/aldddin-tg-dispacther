@@ -2,14 +2,14 @@
 // inline keyboard、認領流程等留給後續 task（見 tasks.json）。
 
 import { Hono } from 'hono'
-import type { MiddlewareHandler } from 'hono'
 import { bodyLimit } from 'hono/body-limit'
 import { webhookCallback } from 'grammy'
 import { bot } from './lib/webhook-server/bot.ts'
 import { registerHandlers } from './lib/security/whitelist.ts'
-import { createRateLimitMiddleware, createTokenBucket } from './lib/security/rate-limit.ts'
+import { createRateLimitMiddleware } from './lib/security/rate-limit.ts'
 import { createWebhookSecretGuard } from './lib/security/webhook-secret-guard.ts'
 import { createHealthMonitor } from './lib/webhook-server/health-monitor.ts'
+import { registerProxyRoutes } from './lib/webhook-server/mcp-proxy.ts'
 
 registerHandlers(bot)
 
@@ -124,219 +124,16 @@ app.post(
 
 // H14：hosted MCP path 分流 proxy——共用既有 ngrok domain，把五個前綴各自
 // 剝掉後轉發到本機對應 port 的 hosted server（例：/mcp-admin-dev/login →
-// http://localhost:8789/login）。認證由各 hosted server 自己的 Bearer token
-// 把關，這裡只做純轉發，跟 webhook 的 secret guard 無關（那道 guard 只掛在
-// webhook 那一條 route 上，不是全域 middleware）。
+// http://localhost:8789/login）。整段實作（含 M1 的回應正規化與 M4 的雙
+// bucket 額度）搬到 lib/webhook-server/mcp-proxy.ts，那裡有完整的設計說明
+// 與端到端測試（mcp-proxy.test.ts）——本檔在 import 時就會 bot.init() 並對
+// 正式 bot 呼叫 setMyCommands，測試無法載入，proxy 邏輯留在這裡等於沒有任何
+// 自動驗證。
 //
-// 註冊順序是硬約束：Hono 依註冊順序匹配，這五條必須在 webhook route 之後、
-// 下面 catch-all `app.all('*')` 之前，否則全部被 catch-all 的 401 吃掉。
-//
-// 安全紀律（H14 AC11）：/login 的明文密碼會流經這一跳，本段落嚴禁任何
-// console.log / console.error 印出 request/response 的 body 或 headers，
-// body 只以串流原樣轉發、不讀取不緩衝。
-const PROXY_ROUTES: Array<[prefix: string, port: number]> = [
-  ['/mcp-admin-dev', 8789],
-  ['/mcp-admin-pre', 8791],
-  ['/mcp-admin-evi', 8792],
-  ['/mcp-platform', 8790],
-  ['/toolsmith', 8788],
-]
-
-// RFC 9110/7230 hop-by-hop headers：只屬於「這一跳」的連線層 header，
-// 轉發前必須移除（Connection header 自己點名的 header 也一併移除）。
-const HOP_BY_HOP_HEADERS = new Set([
-  'connection',
-  'keep-alive',
-  'proxy-authenticate',
-  'proxy-authorization',
-  'te',
-  'trailer',
-  'transfer-encoding',
-  'upgrade',
-])
-
-// 轉發用 request headers：
-// - hop-by-hop 移除（含 Connection 點名的）。
-// - host 移除：讓 fetch 依 target 自動補 localhost:<port>，不把 ngrok domain
-//   的 Host 帶給後端。
-// - content-length 移除：body 是串流轉發，由執行環境重算 framing；沿用原始
-//   Content-Length 配串流 body 是最典型的 proxy 破法。
-// - accept-encoding 移除：fetch 收到壓縮回應會自動解壓，但 Content-Encoding
-//   header 仍留在回應上，原樣回傳會變成「header 說壓縮、body 已解壓」的
-//   不一致；讓後端直接回未壓縮內容最單純（本機 loopback 無壓縮效益）。
-// - 其餘（含 Accept、Authorization）原樣保留。
-const stripForwardHeaders = (src: Headers): Headers => {
-  const connectionListed = new Set(
-    (src.get('connection') ?? '')
-      .split(',')
-      .map(name => name.trim().toLowerCase())
-      .filter(name => name !== ''),
-  )
-  const out = new Headers()
-  for (const [name, value] of src) {
-    if (HOP_BY_HOP_HEADERS.has(name) || connectionListed.has(name)) continue
-    if (name === 'host' || name === 'content-length' || name === 'accept-encoding') continue
-    out.set(name, value)
-  }
-  return out
-}
-
-// 回應 headers 同樣剝 hop-by-hop 與 content-length / content-encoding（framing
-// 由本 server 對外重算；SSE 回應本來就沒有 content-length，Content-Type、
-// X-Accel-Buffering 等原樣保留）。date 也剝掉：本 server 對外回應時會自己補
-// 一個 Date，保留 upstream 的會變成重複兩個 Date header。
-const stripResponseHeaders = (src: Headers): Headers => {
-  const out = new Headers()
-  for (const [name, value] of src) {
-    if (HOP_BY_HOP_HEADERS.has(name)) continue
-    if (name === 'content-length' || name === 'content-encoding' || name === 'date') continue
-    out.set(name, value)
-  }
-  return out
-}
-
-// H31：五條 proxy route 各自的流量層量體控制（rate limit + body size）。
-//
-// 【硬性要求：bucket 絕不共用】——每條 route 在下面迴圈裡各自呼叫一次
-// createTokenBucket()，彼此獨立（三條 admin 路由之間也各自獨立，避免一個
-// 環境的高頻使用波及另一個環境的企劃），也都不與上面 webhook 那顆 bucket
-// 共用：webhook 的 createRateLimitMiddleware() 沒帶參數、內部自建自己的
-// bucket（見 rate-limit.ts createRateLimitMiddleware 預設值），本段落每次
-// 呼叫都另外自建一顆，物件各自獨立、互不影響——MCP 流量吃掉 TG 的額度會讓
-// 團隊的 bug 認領入口失效，反之亦然。
-//
-// admin 三條與 platform 給較寬鬆的容量：MCP 一次對話可能連續呼叫多支 tool，
-// 訂太小會誤擋企劃正常操作。toolsmith 因為後端 N=1 併發、單次操作數分鐘，
-// 容量另訂且明顯較小，避免一個長任務就把整個 process 對 toolsmith 的額度
-// 耗盡太久。這裡的數字只抓量級，不追求精確到某個神聖數值；toolsmith 的
-// capacity 訂在 10 而非更貼近下限的 5——已知一次 MCP 冷啟動握手
-// （initialize + notifications/initialized + tools/list 三個 POST）就吃掉
-// 3 顆，訂太緊握手都做不完就先被 429。
-const MCP_ROUTE_CAPACITY = 30
-const MCP_ROUTE_REFILL_PER_SECOND = 30 / 60 // 每分鐘 30 次
-const TOOLSMITH_CAPACITY = 10
-const TOOLSMITH_REFILL_PER_SECOND = 5 / 60 // 每分鐘 5 次
-
-// 未認證的巨大 body 會被 proxy 串流轉發到 localhost（認證是在 hosted server
-// 那端才發生），這一層要擋在 proxy，跟上面 webhook 的量級一致。
-const MAX_PROXY_BODY_SIZE = 1024 * 1024 // 1MB
-
-const PROXY_ROUTE_LIMITS: Record<string, { capacity: number; refillPerSecond: number }> = {
-  '/mcp-admin-dev': { capacity: MCP_ROUTE_CAPACITY, refillPerSecond: MCP_ROUTE_REFILL_PER_SECOND },
-  '/mcp-admin-pre': { capacity: MCP_ROUTE_CAPACITY, refillPerSecond: MCP_ROUTE_REFILL_PER_SECOND },
-  '/mcp-admin-evi': { capacity: MCP_ROUTE_CAPACITY, refillPerSecond: MCP_ROUTE_REFILL_PER_SECOND },
-  '/mcp-platform': { capacity: MCP_ROUTE_CAPACITY, refillPerSecond: MCP_ROUTE_REFILL_PER_SECOND },
-  '/toolsmith': { capacity: TOOLSMITH_CAPACITY, refillPerSecond: TOOLSMITH_REFILL_PER_SECOND },
-}
-
-// H31 review 收尾（正確性 + 安全兩份 fresh-context review 獨立判定為同一個
-// 真實回歸，非可接受取捨）：rateLimit 與 bodyLimit 原本掛在任何認證檢查之
-// 前（甚至在下面 handler 內、fetch 之前才做的 raw-prefix 字面檢查之前），
-// 兩個後果：
-// 1. 未認證的請求也能消耗額度做 DoS——違反 rate-limit.ts:15-18 自己寫明的
-//    掛載前提（webhook 版本的同一類問題 T25 修過一次，這裡在 proxy route
-//    上重現）：任何人不帶 token、以 1 req/s 打 /toolsmith 就能讓它永久
-//    429，合法企劃連坐被擋。
-// 2. bodyLimit 413（以及打滿額度的 429）是比 ec1a3dd 剛修掉的 502 更強的
-//    側信道：單一請求（>1MB body、完全不需認證）就能 100% 確定性探測出
-//    前綴是否存在，直接架空 ec1a3dd 剛修好的均一 401 防線。
-//
-// 修法（範圍限定，不是完整認證——真正認證仍在各 hosted server 那端）：
-// - rawPrefixGuard：把原本在 handler 內才做的字面前綴檢查，搬到 middleware
-//   鏈最前面，讓 percent-encoding 前綴探測在消耗任何額度之前就被均一 401
-//   擋下。
-// - authPresenceGuard：沒有 Authorization header 的請求視為零知識攻擊者，
-//   直接回均一 401，不進 rateLimit（不消耗額度）、不進 bodyLimit。這只墊
-//   高「零知識」攻擊門檻——攻擊者只要塞一個假 Authorization header 仍能
-//   通過這道閘、繼續消耗額度觸發合法 429，這是刻意接受的已知殘餘缺口：
-//   若要徹底根治，要把 tryConsume() 移到收到 upstream 回應「確定是 401」
-//   之後才呼叫，那是結構更大的改動（rate limit 的意義也會反過來——變成
-//   保護後端不被打，而不是先擋在門口），本次不做，留給未來視實際濫用情況
-//   再評估。
-// - bodyLimit 的 onError 從 413 改回均一 401：關掉「帶一個假 Authorization
-//   header 通過前兩道閘之後，仍能用超大 body 觸發 413 oracle」這個殘餘
-//   缺口。注意這只覆蓋 bodyLimit「有 Content-Length、進 handler 前就短路」
-//   那條分支；沒有 Content-Length／chunked 傳輸時超量走的是 fetch 對已中
-//   斷串流拋例外 → handler 的 catch → 回 502（既有行為，不是本次新增），
-//   502 不構成新側信道（/toolsmith 這類後端本來就常態未啟動、平時就回
-//   502，403/502 混雜早已是這幾條路由的常態雜訊）。
-const authPresenceGuard: MiddlewareHandler = async (c, next) => {
-  if (c.req.header('authorization') === undefined) {
-    c.status(401)
-    return c.body('')
-  }
-  await next()
-}
-
-const createRawPrefixGuard = (prefix: string): MiddlewareHandler => {
-  return async (c, next) => {
-    // 用字串串接組 target，不用 new URL(path, base)——path 若以 // 開頭會被
-    // URL 建構子當成 protocol-relative host，變成對外任意轉發（open proxy）。
-    const url = new URL(c.req.url)
-    // Review 修正：Hono 路由匹配會解碼非斜線的 %XX（如 /mcp-admin-de%76/…
-    // 會命中 /mcp-admin-dev/*），但這裡的 url.pathname 是未解碼的原文，
-    // slice(prefix.length) 會切錯位、組出無效 target 而落到 502——502 與
-    // catch-all 的 401 可被外部區分，等於免 token 探測出前綴存在。前綴段
-    // 的字面文字不符時（合法 client 的前綴本來就不含編碼字元），直接回
-    // 與 catch-all 一致的 401 + 空 body，不進轉發邏輯。
-    if (url.pathname !== prefix && !url.pathname.startsWith(prefix + '/')) {
-      c.status(401)
-      return c.body('')
-    }
-    await next()
-  }
-}
-
-for (const [prefix, port] of PROXY_ROUTES) {
-  const rateLimit = createRateLimitMiddleware(createTokenBucket(PROXY_ROUTE_LIMITS[prefix]))
-  app.all(
-    `${prefix}/*`,
-    createRawPrefixGuard(prefix),
-    authPresenceGuard,
-    rateLimit,
-    bodyLimit({
-      maxSize: MAX_PROXY_BODY_SIZE,
-      onError: c => {
-        c.status(401)
-        return c.body('')
-      },
-    }),
-    async c => {
-    const url = new URL(c.req.url)
-    const targetUrl = `http://localhost:${port}${url.pathname.slice(prefix.length)}${url.search}`
-    let upstream: Response
-    try {
-      upstream = await fetch(targetUrl, {
-        method: c.req.method,
-        headers: stripForwardHeaders(c.req.raw.headers),
-        body: c.req.raw.body,
-        // 3xx 原樣轉回呼叫端，proxy 不代為跟隨（跟隨會把後端的 localhost
-        // redirect 目標當成 proxy 自己要去打的地址）。
-        redirect: 'manual',
-        // @ts-expect-error duplex 是 fetch 串流 request body 的必要選項，型別定義未含
-        duplex: 'half',
-      })
-    } catch {
-      // 後端未啟動（如 /toolsmith 的 8788）或連線失敗：回乾淨的 502，不讓
-      // 例外冒泡、不影響其他 route；刻意不 log（見上方安全紀律）。
-      return c.text('Bad Gateway', 502)
-    }
-    // 401（未帶/帶錯 Bearer token，由 hosted server 自己的認證判定）對外一律
-    // 改回與下面 catch-all 完全一致的 401 + 空 body——不轉發 hosted server 的
-    // 401 body 與 WWW-Authenticate 之類 header，讓「路徑存在但沒過認證」與
-    // 「路徑不存在」從外部不可區分，維持 T14 均一回應防線。MCP client 端只
-    // 依 401 狀態碼判定認證失敗，不需要 body。
-    if (upstream.status === 401) {
-      void upstream.body?.cancel()
-      c.status(401)
-      return c.body('')
-    }
-    return new Response(upstream.body, {
-      status: upstream.status,
-      headers: stripResponseHeaders(upstream.headers),
-    })
-  })
-}
+// 註冊位置是硬約束：Hono 依註冊順序匹配，這一行必須在上面 webhook route
+// 之後、下面 catch-all `app.all('*')` 之前，否則五條 proxy route 全部被
+// catch-all 的 401 吃掉。
+registerProxyRoutes(app)
 
 // 任何沒命中上面路由的請求（含猜錯 webhook 路徑）一律回跟「secret_token 錯誤」
 // 一模一樣的回應：401 + 空 body——這正是 grammy hono adapter 對 secret_token

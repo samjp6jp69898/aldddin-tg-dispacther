@@ -75,6 +75,22 @@ curl http://localhost:8787/health
 # {"status":"ok","uptime_seconds":123}
 ```
 
+> **hosted MCP 後端（8788-8792）的存活探測一律走本機，不要經公網。** 這支
+> server 同時是五條 hosted MCP path 的 proxy（`/mcp-admin-dev`、`/mcp-platform`
+> 等，見 `lib/webhook-server/mcp-proxy.ts`），而各 hosted server 自己的
+> `/health` 是刻意不驗證 Bearer token 的。先前這條路徑經 proxy 對公網可達，
+> 等於任何人塞一個假 `Authorization` header 就能問出「哪些前綴存在、後面的
+> 服務活著沒、上次重啟在多久以前」——proxy 現在會直接攔掉 `/<前綴>/health`
+> 不轉發，公網打過去跟猜錯前綴一樣只拿到 401 空 body。
+>
+> 要確認某支 hosted server 有沒有在跑，改用本機直連（launchd 與人工排查本來
+> 就走這條）：
+>
+> ```bash
+> curl http://127.0.0.1:8789/health   # agrabah-admin (dev)
+> curl http://127.0.0.1:8790/health   # agrabah-platform
+> ```
+
 > T22（正式上線）已於 2026-08-16／17 由使用者本人在場確認完成，`setWebhook`
 > 已呼叫過一次（見下方「查目前 Telegram 端實際登記的 webhook 狀態」）。以上
 > launchd 啟動指令目前可以正常操作；唯一仍需要使用者在場確認的情境是**換

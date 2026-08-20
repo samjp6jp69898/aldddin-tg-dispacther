@@ -32,6 +32,15 @@ export const DEFAULT_REFILL_PER_SECOND = 60 / 60 // 對應「每分鐘 60 次」
 export type TokenBucket = {
   /** 嘗試消耗一顆 token；額度足夠回 true 並扣掉，額度不足回 false（不扣）。 */
   tryConsume: () => boolean
+  /**
+   * 只查詢、不消耗：補回這段時間累積的額度之後，是否還有至少一顆 token。
+   *
+   * 給「先決定放不放行、等確定結果之後才計費」的情境用——proxy 的已認證額度
+   * 必須在收到上游回應、確認請求真的通過認證之後才扣款（見
+   * lib/webhook-server/mcp-proxy.ts 的 M4 說明），但放行與否又得在轉發之前就
+   * 決定，所以需要一個不扣款的查詢。
+   */
+  hasTokens: () => boolean
 }
 
 /**
@@ -48,13 +57,19 @@ export function createTokenBucket(
   let tokens = capacity
   let lastRefill = now()
 
-  function tryConsume(): boolean {
+  // 補回「上次結算到現在」累積的額度。tryConsume 與 hasTokens 都必須先走這一
+  // 步，否則 hasTokens 會拿到還沒補回額度的舊狀態，回報出假的「額度已用盡」。
+  function refill(): void {
     const current = now()
     const elapsedSeconds = (current - lastRefill) / 1000
     if (elapsedSeconds > 0) {
       tokens = Math.min(capacity, tokens + elapsedSeconds * refillPerSecond)
       lastRefill = current
     }
+  }
+
+  function tryConsume(): boolean {
+    refill()
     if (tokens >= 1) {
       tokens -= 1
       return true
@@ -62,7 +77,12 @@ export function createTokenBucket(
     return false
   }
 
-  return { tryConsume }
+  function hasTokens(): boolean {
+    refill()
+    return tokens >= 1
+  }
+
+  return { tryConsume, hasTokens }
 }
 
 /**

@@ -94,6 +94,46 @@ describe('createTokenBucket — 純邏輯層', () => {
   })
 })
 
+// M4：proxy 的已認證額度要「轉發前先查、確定認證成功後才扣」，所以需要一個
+// 不消耗 token 的查詢（見 mcp-proxy.ts 的 quota gate）。
+describe('createTokenBucket.hasTokens — 只查詢、不消耗', () => {
+  test('查詢本身不扣額度：連查多次之後仍能消耗滿額', () => {
+    const clock = makeClock()
+    const bucket = createTokenBucket({ capacity: 2, refillPerSecond: 0, now: clock.now })
+    for (let i = 0; i < 10; i++) {
+      expect(bucket.hasTokens()).toBe(true)
+    }
+    expect(bucket.tryConsume()).toBe(true)
+    expect(bucket.tryConsume()).toBe(true)
+    expect(bucket.tryConsume()).toBe(false)
+  })
+
+  test('額度用盡時回 false，與 tryConsume 的判定一致', () => {
+    const clock = makeClock()
+    const bucket = createTokenBucket({ capacity: 1, refillPerSecond: 0, now: clock.now })
+    expect(bucket.hasTokens()).toBe(true)
+    expect(bucket.tryConsume()).toBe(true)
+    expect(bucket.hasTokens()).toBe(false)
+    expect(bucket.tryConsume()).toBe(false)
+  })
+
+  // 這是實作上最容易錯的一點：hasTokens 若忘了先補回時間額度，就會在額度其實
+  // 已經補回來的時候回報 false，讓合法請求被擋在轉發之前。
+  test('查詢前會先補回這段時間累積的額度（不會回報過期的「已用盡」）', () => {
+    const clock = makeClock()
+    const bucket = createTokenBucket({ capacity: 1, refillPerSecond: 1, now: clock.now })
+    expect(bucket.tryConsume()).toBe(true)
+    expect(bucket.hasTokens()).toBe(false)
+
+    clock.advance(500) // 補回 0.5 顆，還不夠
+    expect(bucket.hasTokens()).toBe(false)
+
+    clock.advance(600) // 累計 1.1 秒，足夠 1 顆
+    expect(bucket.hasTokens()).toBe(true)
+    expect(bucket.tryConsume()).toBe(true)
+  })
+})
+
 describe('createRateLimitMiddleware — Hono 路由層', () => {
   function buildApp(bucket: ReturnType<typeof createTokenBucket>) {
     const app = new Hono()
