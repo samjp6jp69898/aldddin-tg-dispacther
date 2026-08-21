@@ -45,13 +45,13 @@ function log(msg: string): void {
  * 檔案系統起點。分支名故意跟 setup-worktree.sh 的 mr/{ticket} 不同（改用
  * plan/{ticket}），避免跟真的要拿去開 MR 的分支語意混在一起。
  *
- * 建立前先呼叫 T28 既有的 cleanupWorktreesForTicket 清掉這個 ticket 底下
- * 可能殘留的舊 worktree（例如同一張單先前用過舊版本機啟動設計跑過），避免
- * `git worktree add` 因為路徑已被註冊而失敗。
+ * 不在這裡呼叫 cleanupWorktreesForTicket——那個函式一次會清掉 MAIN_REPOS
+ * 全部 4 個 repo 底下這個 ticket 的殘留 worktree，若跨 repo 需求在迴圈裡
+ * 對每個 repo 各自呼叫一次這個函式，後面的呼叫會把前面 repo 剛建好的
+ * worktree 也一併清掉；清理改成由呼叫端（createLightweightWorktrees）在
+ * 迴圈開始前只做一次。
  */
 async function createLightweightWorktree(ticket: string, repo: string): Promise<{ ok: true; path: string } | { ok: false; reason: string }> {
-  cleanupWorktreesForTicket(ticket)
-
   const repoRoot = join(ROOT, repo)
   const wtPath = join(ROOT, 'worktrees', ticket, repo)
   const branch = `plan/${ticket}`
@@ -60,7 +60,7 @@ async function createLightweightWorktree(ticket: string, repo: string): Promise<
     // 分支可能是上一次執行留下的（cleanupWorktreesForTicket 只刪 worktree
     // 目錄，不刪分支）——先嘗試刪掉同名舊分支（分支沒有任何 worktree 綁定
     // 的情況下才刪得掉，刪不掉就順著往下用 -B 強制覆蓋，兩者其中一個必然
-    // 成功，因為上一行已經先移除了唯一可能綁定這個分支的 worktree）。
+    // 成功，因為呼叫端已經先移除了唯一可能綁定這個分支的 worktree）。
     try {
       execFileSync('git', ['-C', repoRoot, 'branch', '-D', branch], { encoding: 'utf8', timeout: 10_000 })
     } catch {
@@ -75,6 +75,30 @@ async function createLightweightWorktree(ticket: string, repo: string): Promise<
   } catch (err) {
     return { ok: false, reason: String((err as any)?.message ?? err).slice(0, 500) }
   }
+}
+
+/**
+ * 2026-08-21 使用者定案新增：cross-repo 需求單也要能自動執行，不再卡在
+ * repo-scope-gate。這個函式對 repo-scope-gate 判斷到的全部 repo 各自建立
+ * 一個輕量 worktree，全部放在同一個 worktrees/{ticket}/ 目錄下（單一 repo
+ * 的情況等同舊行為，只是清單長度是 1）。cleanupWorktreesForTicket 只在最
+ * 前面呼叫一次（見 createLightweightWorktree 的註解，原因同上）；只要其中
+ * 一個 repo 建立失敗就整批清掉、不留半套 worktree 讓後續步驟誤用不完整的
+ * 起點。
+ */
+async function createLightweightWorktrees(ticket: string, repos: string[]): Promise<{ ok: true; paths: Record<string, string> } | { ok: false; reason: string }> {
+  cleanupWorktreesForTicket(ticket)
+
+  const paths: Record<string, string> = {}
+  for (const repo of repos) {
+    const result = await createLightweightWorktree(ticket, repo)
+    if (!result.ok) {
+      cleanupWorktreesForTicket(ticket)
+      return { ok: false, reason: `${repo}: ${result.reason}` }
+    }
+    paths[repo] = result.path
+  }
+  return { ok: true, paths }
 }
 
 /** 唯讀自由文字 agent 呼叫（draft/review/synthesize 共用）：固定工具白名單＋bypassPermissions（headless 無人核准）＋清 CLAUDE_EFFORT。 */
@@ -173,33 +197,39 @@ function diffMainReposSnapshot(before: Record<string, string | null>, after: Rec
  * 兩份 draft）→ synthesize ×1 → 寫 plan.md → classify ×1（嚴格 JSON）。
  * 不管哪一步失敗都拋出例外，交給呼叫端（run-demand-pipeline.ts）分類成
  * implementer-error（技術性失敗），不在這裡吞掉細節。
+ *
+ * 2026-08-21 使用者定案：repo 參數改成陣列——跨 repo 需求單不再被
+ * repo-scope-gate 擋下，一樣走這條 pipeline，只是目標 repo 從一個變多個，
+ * 每個都各自一份輕量 worktree（見 createLightweightWorktrees）。所有 agent
+ * 的 cwd 都指到這些 worktree 的共同父目錄（worktreeRoot），讓 draft/review
+ * 都能跨目標 repo 讀取，不是只有 draft 才看得到其他 repo。
  */
-export async function runDemandPlanPipeline(ticket: string, specText: string, comments: string[], repo: string): Promise<DemandOutcome> {
+export async function runDemandPlanPipeline(ticket: string, specText: string, comments: string[], repos: string[]): Promise<DemandOutcome> {
   const beforeSnapshot = snapshotMainRepos()
 
-  const setup = await createLightweightWorktree(ticket, repo)
+  const setup = await createLightweightWorktrees(ticket, repos)
   if (!setup.ok) {
     return { kind: 'setup-failed', reason: setup.reason }
   }
-  const worktreePath = setup.path
+  const worktreeRoot = join(ROOT, 'worktrees', ticket)
 
   try {
-    log(`${ticket} plan pipeline：draft 階段開始（2 個 agent 平行）`)
+    log(`${ticket} plan pipeline：draft 階段開始（2 個 agent 平行，目標 repo=${repos.join(', ')}）`)
     const draftTexts = await Promise.all(
-      [0, 1].map(i => runFreeformAgent(buildDraftPrompt(ticket, specText, comments, repo, worktreePath), worktreePath)),
+      [0, 1].map(i => runFreeformAgent(buildDraftPrompt(ticket, specText, comments, repos, worktreeRoot), worktreeRoot)),
     )
     const drafts = draftTexts.map((text, i) => ({ label: `Draft ${String.fromCharCode(65 + i)}`, text }))
     log(`${ticket} plan pipeline：draft 階段完成`)
 
     log(`${ticket} plan pipeline：review 階段開始（3 個角度平行）`)
     const reviewTexts = await Promise.all(
-      REVIEW_LENSES.map(({ lens }) => runFreeformAgent(buildReviewPrompt(lens, ticket, specText, drafts), worktreePath)),
+      REVIEW_LENSES.map(({ lens }) => runFreeformAgent(buildReviewPrompt(lens, ticket, specText, drafts), worktreeRoot)),
     )
     const reviews = REVIEW_LENSES.map(({ label }, i) => ({ label, text: reviewTexts[i]! }))
     log(`${ticket} plan pipeline：review 階段完成`)
 
     log(`${ticket} plan pipeline：synthesize 階段開始`)
-    const planContent = await runFreeformAgent(buildSynthesizePrompt(ticket, specText, drafts, reviews), worktreePath)
+    const planContent = await runFreeformAgent(buildSynthesizePrompt(ticket, specText, drafts, reviews), worktreeRoot)
     log(`${ticket} plan pipeline：synthesize 階段完成`)
 
     const planPath = join(PLAN_DIR, `${ticket}-plan.md`)

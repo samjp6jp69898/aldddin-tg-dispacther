@@ -14,9 +14,6 @@ describe('classifyAiAnalysis', () => {
   test('insufficient-spec → 待釐清', () => {
     expect(classifyAiAnalysis({ kind: 'insufficient-spec', missing: '缺欄位' })).toBe('待釐清')
   })
-  test('cross-repo → 待釐清', () => {
-    expect(classifyAiAnalysis({ kind: 'cross-repo', repos: ['abu', 'agrabah'] })).toBe('待釐清')
-  })
   test('setup-failed → 分析失敗', () => {
     expect(classifyAiAnalysis({ kind: 'setup-failed', reason: 'timeout' })).toBe('分析失敗')
   })
@@ -32,7 +29,6 @@ describe('shouldUploadPlan', () => {
   test('只有 kind:plan 才上傳', () => {
     expect(shouldUploadPlan({ kind: 'plan', status: 'success', planPath: '/x', summary: 's' })).toBe(true)
     expect(shouldUploadPlan({ kind: 'insufficient-spec', missing: 'x' })).toBe(false)
-    expect(shouldUploadPlan({ kind: 'cross-repo', repos: ['abu'] })).toBe(false)
     expect(shouldUploadPlan({ kind: 'setup-failed', reason: 'x' })).toBe(false)
     expect(shouldUploadPlan({ kind: 'implementer-error', detail: 'x' })).toBe(false)
     expect(shouldUploadPlan({ kind: 'unexpected-error', detail: 'x' })).toBe(false)
@@ -40,12 +36,6 @@ describe('shouldUploadPlan', () => {
 })
 
 describe('buildNotionCommentText', () => {
-  test('cross-repo 留言列出全部 repo 名稱', () => {
-    const text = buildNotionCommentText('ALDREQ-1', { kind: 'cross-repo', repos: ['abu', 'agrabah'] })
-    expect(text).toContain('abu')
-    expect(text).toContain('agrabah')
-    expect(text).toContain('2 個 repo')
-  })
   test('insufficient-spec 留言帶出缺什麼', () => {
     const text = buildNotionCommentText('ALDREQ-1', { kind: 'insufficient-spec', missing: '缺驗收標準' })
     expect(text).toContain('缺驗收標準')
@@ -74,12 +64,6 @@ describe('buildTelegramText', () => {
   test('plan 結果缺連結時仍不拋錯，只是少列一行', () => {
     const text = buildTelegramText('ALDREQ-746', { kind: 'plan', status: 'already-satisfied', planPath: '/x', summary: 's' }, {})
     expect(text).toContain('ALDREQ-746 已完成')
-  })
-
-  test('cross-repo 維持詳細說明（無 plan.md 可連）', () => {
-    const text = buildTelegramText('ALDREQ-1', { kind: 'cross-repo', repos: ['abu', 'agrabah'] }, {})
-    expect(text).toContain('跨 2 個 repo')
-    expect(text).toContain('不會自動分析')
   })
 
   test('unexpected-error 帶警示符號', () => {

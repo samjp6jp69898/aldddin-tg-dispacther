@@ -26,11 +26,10 @@ const DEMAND_POOL_DRIVE_PARENT_ID = '1E21H-5UycBfCvfWs06ZChV-E84bs-vzP'
  * SIGKILL 情境下的最後安全網（見該檔案 WRAPPER_SCRIPT 註解）。
  *
  * 流程：(1) 抓需求單內容 (2) T34 gate：規格不足 → 收尾＋結束 (3) T36 範圍
- * 偵測：跨 ≥2 個 repo → 收尾（標記『需人工複核』）＋結束 (4) 單一 repo：
- * 交給 demand-plan-pipeline.ts 跑 draft×2 → review×3 → synthesize →
- * classify，產出 plan.md（不改任何 repo 程式碼）(5) finalize：分類結果 →
- * （若有 plan.md）上傳 Google Drive → Notion 留言＋更新 AI分析 → Telegram
- * 通知。
+ * 偵測：判斷會動到哪些 repo（不再拿來擋——見下方 2026-08-21 定案）(4) 交給
+ * demand-plan-pipeline.ts 跑 draft×2 → review×3 → synthesize → classify，
+ * 產出 plan.md（不改任何 repo 程式碼）(5) finalize：分類結果 →（若有
+ * plan.md）上傳 Google Drive → Notion 留言＋更新 AI分析 → Telegram 通知。
  *
  * 2026-08-18 使用者定案二次修正（見 tasks.json T36 changelog 完整脈絡）：
  * 第一版重新設計（implementer agent 直接改 code）→ 第二版（本機啟動全服務
@@ -41,6 +40,15 @@ const DEMAND_POOL_DRIVE_PARENT_ID = '1E21H-5UycBfCvfWs06ZChV-E84bs-vzP'
  * RESULT_STATUS 被包進一句話裡，regex 解析失敗，已改用 T34/T36 gate 既有
  * 的可靠模式）。實際 draft/review/synthesize/classify 呼叫細節見
  * demand-plan-pipeline.ts。
+ *
+ * 2026-08-21 使用者定案：跨 ≥2 個 repo 的需求單不再被 repo-scope-gate 擋下
+ * 直接收尾成『需人工複核』（原本 2026-08-17 的定案，理由是 T35 回溯測試
+ * 證實跨 repo 範圍窮盡性不可靠）——實測發現這個關卡連「加一個欄位、明確
+ * 知道要動哪三個 repo」這種小需求都會擋，太保守。detectRepoScope 的判斷
+ * 結果現在只決定 demand-plan-pipeline.ts 要建幾個 repo 的 worktree，不再
+ * 是收尾分支的判準；跨 repo 範圍窮盡性不可靠的風險本身沒有消失，只是改由
+ * plan pipeline 產出的 plan.md 走人工複核把關（跟單一 repo 的既有流程一
+ * 致），不再用「repo 數量」這個粗粒度訊號提前攔截。
  */
 
 function log(msg: string): void {
@@ -98,12 +106,6 @@ function uploadPlanToDrive(ticket: string, planPath: string): string {
  * 更新 AI分析 → Telegram 通知。每個子步驟各自 try/catch，一個失敗不阻斷
  * 其他步驟（比照 drive-uploader.md『無論如何都要嘗試更新 AI分析欄位』的
  * 既有原則），但都會記進 demand-pipeline.log 供事後排查。
- *
- * 2026-08-21 使用者定案：kind:'cross-repo' 不再發 Telegram 通知——Notion
- * 留言＋AI分析=待釐清已經完整記錄「跨幾個 repo、需要人工處理」，Telegram
- * 訊息對使用者來說只是重複同一句話，不是新資訊。buildTelegramText 的
- * cross-repo 分支本身不刪（demand-finalize.test.ts 仍鎖住那段文字的內容），
- * 只是這裡不呼叫。
  */
 function finalize(ticket: string, email: string, outcome: DemandOutcome): void {
   const aiAnalysis = classifyAiAnalysis(outcome)
@@ -136,11 +138,6 @@ function finalize(ticket: string, email: string, outcome: DemandOutcome): void {
     }
   } catch (err) {
     log(`${ticket} finalize：Notion 留言/更新失敗: ${err}`)
-  }
-
-  if (outcome.kind === 'cross-repo') {
-    log(`${ticket} finalize：cross-repo，Notion 已記錄，略過 Telegram 通知`)
-    return
   }
 
   const text = buildTelegramText(ticket, outcome, { driveLink, notionUrl: notionUrl ?? undefined })
@@ -179,17 +176,8 @@ async function main(): Promise<void> {
     const repos = await detectRepoScope(ticket, bodyText, comments)
     log(`${ticket} 範圍偵測結果：${repos.join(', ')}`)
 
-    if (repos.length >= 2) {
-      // 使用者 2026-08-17 定案：跨 ≥2 個 repo 的需求不自動分析，T35 回溯
-      // 測試證實這種需求的範圍窮盡性不可靠（複雜樣本漏了 2 個獨立呼叫點），
-      // 標記需人工複核而非直接視為完成。
-      finalize(ticket, assigneeEmail, { kind: 'cross-repo', repos })
-      return
-    }
-
-    const repo = repos[0]!
-    log(`${ticket} 開始 plan pipeline（repo=${repo}）`)
-    const outcome = await runDemandPlanPipeline(ticket, bodyText, comments, repo)
+    log(`${ticket} 開始 plan pipeline（repos=${repos.join(', ')}）`)
+    const outcome = await runDemandPlanPipeline(ticket, bodyText, comments, repos)
     log(`${ticket} plan pipeline 結束，分類=${outcome.kind}${outcome.kind === 'plan' ? `/${outcome.status}` : ''}`)
     finalize(ticket, assigneeEmail, outcome)
   } catch (err) {

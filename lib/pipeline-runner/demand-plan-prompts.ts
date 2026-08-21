@@ -13,12 +13,18 @@
  * 3. 單一 agent 自己審自己，實測抓到一次「結尾格式沒有確實遵守」的真實
  *    問題（RESULT_STATUS 被包進一句話裡，regex 解析失敗，見 changelog）。
  *
- * 改成：不建全服務 worktree，只用一個輕量 git worktree（純 checkout，跳過
+ * 改成：不建全服務 worktree，只用輕量 git worktree（純 checkout，跳過
  * bootstrap/migrate）給目標 repo 當唯讀分析起點；2 個 draft agent 各自獨立
  * 產出調查與變更建議 → 3 個 review agent 各自獨立角度審查（coding
  * convention／安全性／可行性-對衝性）→ 1 個 synthesize agent 彙整成最終
  * plan.md → 1 個 classify agent 用 T34/T36 既有的「零工具、只回嚴格 JSON」
  * 模式（不是靠自由文字結尾格式）分類最終結果，避免重蹈同一個解析失敗。
+ *
+ * 2026-08-21 使用者定案：跨 repo 需求單不再直接被 repo-scope-gate 擋下，
+ * 一樣走這條 pipeline——差別只是「目標 repo」從單一個變成一份清單，每個
+ * repo 各自一份輕量 worktree，全部放在同一個 worktrees/{ticket}/ 目錄下，
+ * draft/review/synthesize agent 的 cwd 指到這個共同目錄，範圍涵蓋每個目標
+ * repo 的子目錄。
  */
 
 export type ReviewLens = 'convention' | 'security' | 'conflict'
@@ -61,12 +67,16 @@ const EXHAUSTIVENESS_LESSONS = `
  * 仍會有真實差異（見 tasks.json T36 changelog 的 A/B 兩份 draft 對照），
  * 這正是後面 conflict review 要合併互補的價值所在。
  */
-export function buildDraftPrompt(ticket: string, specText: string, comments: string[], repo: string, worktreePath: string): string {
+export function buildDraftPrompt(ticket: string, specText: string, comments: string[], repos: string[], worktreeRoot: string): string {
+  const repoLines = repos.map(r => `- ${r}：${worktreeRoot}/${r}`).join('\n')
   return `你正在調查一張需求單（${ticket}），目標是產出一份**調查草稿**，供後續彙整成正式 plan.md，不是最終文件，不需要顧慮格式美觀，重點是內容真實、有 file:line 實證。
 
 **這是唯讀分析任務，不要用 Edit/Write 類工具改動任何檔案**（這次執行環境本來就沒有提供這類工具）。
 
-**起點 repo**：${repo}（唯讀 git worktree：${worktreePath}，內容跟 origin/dev 一致）。這張單判斷主要落在這個 repo，但實際範圍可能跨到其他 repo（agrabah/abu/lago/rajah 都在 /Users/user/aladdin/ 底下，是開發者的真實工作目錄，唯讀讀取沒問題，但**絕對不要對這些路徑執行任何寫入/修改指令**）。
+**目標 repo**（判斷這張單會動到以下 ${repos.length} 個 repo，各自都有唯讀 git worktree，內容跟 origin/dev 一致）：
+${repoLines}
+
+實際範圍仍可能延伸到列表外的其他 repo（agrabah/abu/lago/rajah 都在 /Users/user/aladdin/ 底下，是開發者的真實工作目錄，唯讀讀取沒問題，但**絕對不要對這些路徑執行任何寫入/修改指令**）。
 
 **需求單內容（已由前一道 gate 判斷過規格充足）**：
 ${specText.trim() || '（頁面內文是空的——這不應該發生，若你看到這行代表上游 gate 有問題，停下來回報而不是憑空腦補）'}

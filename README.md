@@ -184,17 +184,18 @@ webhook 完全收不到訊息的空窗，選一個沒人在用的時段切換。
    2026-08-21 使用者定案改成給 Read/Grep/Glob 唯讀工具，先探索 codebase
    既有邏輯／同類欄位再判斷，不再只憑 Notion 文字表面判斷——不夠會直接
    通知你「規格不足，缺什麼」，不會硬做）(b) 判斷這張單會動到哪些 repo
-   （T36 範圍偵測）——**跨 ≥2 個 repo 的需求目前不會自動實作**（2026-08-17
-   使用者定案：T35 回溯測試證實跨 repo 需求的範圍窮盡性不可靠，見
-   tasks.json T35 changelog），會在 Notion 留言＋把 AI分析 標成「待釐清」，
-   但**不會**額外發 Telegram 通知（2026-08-21 使用者定案：這個結論已經
-   完整記在 Notion 上，Telegram 訊息只是重複，需要人工複核時請直接看
-   Notion）(c) 單一 repo 的需求才會真的建隔離環境、呼叫實作 agent 產出
-   程式碼＋測試。同一時間全域最多 **2** 條需求 pipeline（獨立於上面 Bug
-   的 N=5，不共用計數器，見「已知操作風險」）。**這整條路徑目前是輔助
-   草稿性質，不是自動完成**——除了 (b) 跨 repo 分支外，其他分支結束都會
-   發 Telegram 通知，成功產出的情況下通知會附工作目錄路徑，**產出的程式
-   碼不會自動 commit/push，必須人工複核**（T36）。
+   （T36 範圍偵測）——單一 repo 或跨多個 repo 都會繼續往下跑（2026-08-21
+   使用者定案：原本跨 ≥2 個 repo 會直接標「需人工複核」不自動分析，2026-08-17
+   定案的理由是 T35 回溯測試證實跨 repo 範圍窮盡性不可靠，但實測發現這個
+   關卡連「明確知道要動哪三個 repo」的小需求都會擋，太保守；範圍窮盡性
+   不可靠的風險本身沒有消失，改成一樣產出 plan.md 交人工複核把關，不再用
+   「repo 數量」提前攔截）(c) 交給 demand-plan-pipeline.ts：判斷到的每個
+   repo 各自建一個唯讀 worktree，draft×2→review×3→synthesize×1→classify×1，
+   產出一份 plan.md，**不改任何 repo 程式碼**。同一時間全域最多 **2** 條
+   需求 pipeline（獨立於上面 Bug 的 N=5，不共用計數器，見「已知操作風險」）。
+   **這整條路徑目前是輔助草稿性質，不是自動完成**——不管哪個分支結束都會
+   發 Telegram 通知，成功產出的情況下通知會附工作目錄路徑，**產出的內容
+   不會自動 commit/push，必須人工複核**（T36）。
 
 ## 需要的環境變數（都放在根目錄 `/Users/user/aladdin/.env`）
 
@@ -254,13 +255,16 @@ log 或任何被 git 追蹤的檔案裡（見 T15）。
   # 手動清理某張需求單的 worktree（ALDREQ-* 也支援，不是只有 FAQ-*）
   bun /Users/user/aladdin/telegram-dispatcher/lib/pipeline-runner/cleanup-worktree.ts ALDREQ-1234
   ```
-- **需求 pipeline 的實作 agent 給了完整工具權限（`--permission-mode
-  bypassPermissions`，沒有限制工具）**，這點跟 T34 的規格判斷／T36 的範圍
-  偵測（兩者都用 `--tools "" --strict-mcp-config` 結構性清空工具）不同——
-  給工具權限是這一步的必要條件（它真的要讀寫程式碼），風險跟既有
-  `/create-mr` 面對真實 bug report 外部內容時承擔的是同一類，但需求池
-  內容的可編輯人員範圍可能比 Bug List 更廣，尚未逐一核實兩者信任等級是
-  否真的對等，先如實記錄這個未驗證的假設。
+- **需求 pipeline 的 draft/review/synthesize agent 給了唯讀工具權限
+  （`--tools Bash,Read,Grep,Glob` + `--permission-mode bypassPermissions`，
+  不含 Edit/Write/MultiEdit）**，這點跟 T36 的範圍偵測（`--tools ""
+  --strict-mcp-config` 結構性清空工具）不同——給工具權限是這一步的必要
+  條件（它真的要讀程式碼調查範圍與細節），風險跟既有 `/create-mr` 面對
+  真實 bug report 外部內容時承擔的是同一類，但需求池內容的可編輯人員範圍
+  可能比 Bug List 更廣，尚未逐一核實兩者信任等級是否真的對等，先如實記錄
+  這個未驗證的假設。T34 的規格判斷（`spec-sufficiency-gate.ts`）
+  2026-08-21 起也改成唯讀工具（`Read,Grep,Glob`，比上面更窄、不含 Bash），
+  同一套理由。
 
 ## 工單鎖卡住時如何手動排除
 

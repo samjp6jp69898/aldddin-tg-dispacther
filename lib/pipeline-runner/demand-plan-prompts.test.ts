@@ -9,7 +9,7 @@ describe('REVIEW_LENSES', () => {
 
 describe('buildDraftPrompt', () => {
   test('帶入 ticket、規格、留言、repo、worktree 路徑', () => {
-    const prompt = buildDraftPrompt('ALDREQ-746', '規格內容', ['小明：留言'], 'abu', '/wt/ALDREQ-746/abu')
+    const prompt = buildDraftPrompt('ALDREQ-746', '規格內容', ['小明：留言'], ['abu'], '/wt/ALDREQ-746')
     expect(prompt).toContain('ALDREQ-746')
     expect(prompt).toContain('規格內容')
     expect(prompt).toContain('小明：留言')
@@ -17,14 +17,22 @@ describe('buildDraftPrompt', () => {
     expect(prompt).toContain('/wt/ALDREQ-746/abu')
   })
 
+  test('多個 repo：每個 repo 各自列出對應的 worktree 子路徑', () => {
+    const prompt = buildDraftPrompt('ALDREQ-765', '規格內容', [], ['agrabah', 'abu', 'rajah'], '/wt/ALDREQ-765')
+    expect(prompt).toContain('/wt/ALDREQ-765/agrabah')
+    expect(prompt).toContain('/wt/ALDREQ-765/abu')
+    expect(prompt).toContain('/wt/ALDREQ-765/rajah')
+    expect(prompt).toContain('3 個 repo')
+  })
+
   test('明確禁止 Edit/Write，強調唯讀', () => {
-    const prompt = buildDraftPrompt('ALDREQ-1', '規格', [], 'abu', '/wt/abu')
+    const prompt = buildDraftPrompt('ALDREQ-1', '規格', [], ['abu'], '/wt')
     expect(prompt).toContain('唯讀')
     expect(prompt).toContain('不要用 Edit/Write')
   })
 
   test('包含範圍窮盡紀律的關鍵字', () => {
-    const prompt = buildDraftPrompt('ALDREQ-1', '規格', [], 'abu', '/wt/abu')
+    const prompt = buildDraftPrompt('ALDREQ-1', '規格', [], ['abu'], '/wt')
     expect(prompt).toContain('換一個不同的搜尋角度重新驗證一次')
     expect(prompt).toContain('先搜尋鄰近既有慣例')
   })

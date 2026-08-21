@@ -12,11 +12,16 @@
  * drive-uploader 的既有慣例：無論 pipeline_status 為何都必須更新狀態欄
  * 位）。AI分析 的四個目標值（分析成功／不需分析／分析失敗／待釐清）皆已
  * 用 notion.sh 對總需求池資料庫 schema 實測確認存在，不是憑空造的字串。
+ *
+ * 2026-08-21 使用者定案移除 kind:'cross-repo'：原本跨 ≥2 個 repo 的需求單
+ * 會被 repo-scope-gate 直接攔下、標成這個結果分支（待釐清＋不發 Telegram，
+ * 見 git 歷史）。實測發現這個關卡太保守——連「明確知道要動哪三個 repo」的
+ * 小需求都會被擋，改成跨 repo 需求一樣走 kind:'plan' 那條路（見
+ * run-demand-pipeline.ts／demand-plan-pipeline.ts 2026-08-21 的變更）。
  */
 
 export type DemandOutcome =
   | { kind: 'insufficient-spec'; missing: string }
-  | { kind: 'cross-repo'; repos: string[] }
   | { kind: 'setup-failed'; reason: string }
   | { kind: 'implementer-error'; detail: string }
   | { kind: 'unexpected-error'; detail: string }
@@ -27,7 +32,7 @@ export type DemandAiAnalysisValue = '分析成功' | '不需分析' | '分析失
 /**
  * 這次結果要不要真的上傳 plan.md 到 Drive——只有 implementer 真的跑完、
  * 產出一份可讀 plan.md 的三種 kind:'plan' 分支才有文件可傳；其餘分支（規格
- * 不足／跨 repo／技術性失敗）根本沒有 plan.md 存在，不嘗試上傳。
+ * 不足／技術性失敗）根本沒有 plan.md 存在，不嘗試上傳。
  */
 export function shouldUploadPlan(outcome: DemandOutcome): outcome is Extract<DemandOutcome, { kind: 'plan' }> {
   return outcome.kind === 'plan'
@@ -37,8 +42,8 @@ export function shouldUploadPlan(outcome: DemandOutcome): outcome is Extract<Dem
  * 分類這次結果對應的 Notion AI分析 值（比照使用者 2026-08-18 定案）：
  * - plan.success            → 分析成功（產出可行動的變更建議）
  * - plan.already-satisfied  → 不需分析（調查後發現已被現有程式碼滿足）
- * - plan.needs-clarification / insufficient-spec / cross-repo → 待釐清
- *   （這三種本質上都是「AI 沒辦法自己判定，需要人」，歸同一類）
+ * - plan.needs-clarification / insufficient-spec → 待釐清
+ *   （這兩種本質上都是「AI 沒辦法自己判定，需要人」，歸同一類）
  * - setup-failed / implementer-error / unexpected-error → 分析失敗
  *   （pipeline 本身的技術性失敗，跟需求內容無關）
  */
@@ -49,7 +54,6 @@ export function classifyAiAnalysis(outcome: DemandOutcome): DemandAiAnalysisValu
       if (outcome.status === 'already-satisfied') return '不需分析'
       return '待釐清'
     case 'insufficient-spec':
-    case 'cross-repo':
       return '待釐清'
     case 'setup-failed':
     case 'implementer-error':
@@ -67,8 +71,6 @@ export function buildNotionCommentText(ticket: string, outcome: DemandOutcome): 
       return `${ticket} AI 調查過程中發現規格或範圍有無法自行判定的落差，需要人工釐清。詳細內容見 plan.md 連結。`
     case 'insufficient-spec':
       return `${ticket} AI 判定規格不足，無法自動分析：${outcome.missing}\n\n請在 Notion 補充規格後重新認領。`
-    case 'cross-repo':
-      return `${ticket} AI 判斷會跨 ${outcome.repos.length} 個 repo（${outcome.repos.join('、')}），目前的自動化 pipeline 對跨 repo 需求的範圍判斷還不夠可靠，需要人工處理，不會自動分析。`
     case 'setup-failed':
       return `${ticket} AI 分析環境建置失敗：${outcome.reason}\n請聯絡維運人員或自行處理。`
     case 'implementer-error':
@@ -96,8 +98,6 @@ export function buildTelegramText(ticket: string, outcome: DemandOutcome, links:
   switch (outcome.kind) {
     case 'insufficient-spec':
       return `${ticket} 規格不足，無法自動分析：\n${outcome.missing}\n\n請在 Notion 補充規格後重新認領。`
-    case 'cross-repo':
-      return `${ticket} 判斷會跨 ${outcome.repos.length} 個 repo（${outcome.repos.join('、')}），目前的自動化 pipeline 對跨 repo 需求的範圍判斷還不夠可靠，需要你自己動手處理，不會自動分析。`
     case 'setup-failed':
       return `${ticket} 環境建置失敗，無法自動分析：${outcome.reason}\n請聯絡維運人員或自行處理。`
     case 'implementer-error':
