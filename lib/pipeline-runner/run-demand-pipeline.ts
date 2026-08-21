@@ -98,6 +98,12 @@ function uploadPlanToDrive(ticket: string, planPath: string): string {
  * 更新 AI分析 → Telegram 通知。每個子步驟各自 try/catch，一個失敗不阻斷
  * 其他步驟（比照 drive-uploader.md『無論如何都要嘗試更新 AI分析欄位』的
  * 既有原則），但都會記進 demand-pipeline.log 供事後排查。
+ *
+ * 2026-08-21 使用者定案：kind:'cross-repo' 不再發 Telegram 通知——Notion
+ * 留言＋AI分析=待釐清已經完整記錄「跨幾個 repo、需要人工處理」，Telegram
+ * 訊息對使用者來說只是重複同一句話，不是新資訊。buildTelegramText 的
+ * cross-repo 分支本身不刪（demand-finalize.test.ts 仍鎖住那段文字的內容），
+ * 只是這裡不呼叫。
  */
 function finalize(ticket: string, email: string, outcome: DemandOutcome): void {
   const aiAnalysis = classifyAiAnalysis(outcome)
@@ -130,6 +136,11 @@ function finalize(ticket: string, email: string, outcome: DemandOutcome): void {
     }
   } catch (err) {
     log(`${ticket} finalize：Notion 留言/更新失敗: ${err}`)
+  }
+
+  if (outcome.kind === 'cross-repo') {
+    log(`${ticket} finalize：cross-repo，Notion 已記錄，略過 Telegram 通知`)
+    return
   }
 
   const text = buildTelegramText(ticket, outcome, { driveLink, notionUrl: notionUrl ?? undefined })

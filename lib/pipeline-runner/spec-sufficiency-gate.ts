@@ -17,12 +17,22 @@ const MAX_BLOCK_DEPTH = 3
 // 跟這個目錄其他檔案（post-run-notify.ts／cleanup-worktree.ts／
 // health-monitor.ts 都有 EXEC_TIMEOUT_MS）的既有慣例不一致；這是個『判斷完
 // 就要有結果』的 gate，卡住比報錯更糟。notion.sh 呼叫沿用同一個 30 秒
-// 上限；claude -p 是單輪分類任務（不含任何工具呼叫，見 askClaude 註解），
-// 給 2 分鐘遠超正常耗時（實測單次落在數秒到數十秒），仍遠低於
-// spawn-create-mr.ts 給整條 create-mr pipeline 的 3600 秒（性質不同：那是
-// 允許多輪工具呼叫的完整 pipeline，這裡只是一次性文字分類）。
+// 上限。claude -p 原本是零工具的單輪分類任務，2 分鐘遠超正常耗時；2026-08-21
+// 改成會呼叫 Read/Grep/Glob 探索 codebase（見 askClaude 註解），拉長到 5
+// 分鐘給工具呼叫輪次留空間，仍遠低於 spawn-create-mr.ts 給整條 create-mr
+// pipeline 的 3600 秒（性質不同：那是允許多輪工具呼叫＋改檔的完整 pipeline，
+// 這裡只是唯讀探索後的一次性文字分類）。
 const NOTION_EXEC_TIMEOUT_MS = 30_000
-const CLAUDE_EXEC_TIMEOUT_MS = 120_000
+const CLAUDE_EXEC_TIMEOUT_MS = 300_000
+// 2026-08-21 使用者定案新增：codebase 根目錄，讓 askClaude 的 explorer agent
+// 能讀到 agrabah／abu／rajah／lago 全部 repo（哪個 repo 都可能跟需求單有關，
+// 判斷階段還沒走到 T36 repo-scope-gate，不能只給單一 repo 的路徑）。
+const CODEBASE_ROOT = '/Users/user/aladdin'
+// 唯讀探索工具白名單：只給 Read/Grep/Glob，刻意不給 Bash（跟
+// demand-plan-pipeline.ts 的 READONLY_TOOLS 不同）——這裡只需要『找到相關
+// 程式碼、看懂既有模式』，不需要執行任何指令；範圍縮到最小，prompt injection
+// 的可攻擊面也跟著降到最低（見 askClaude 註解的完整風險說明）。
+const EXPLORE_TOOLS = 'Read,Grep,Glob'
 
 // 實測發現（見 tasks.json T34 changelog）：table_row 這個 block type 不是
 // 用 rich_text 存內容，是用 table_row.cells（陣列的陣列，每個 cell 自己是
@@ -106,9 +116,12 @@ async function fetchComments(pageUrl: string): Promise<string[]> {
 export function buildPrompt(ticket: string, bodyText: string, comments: string[]): string {
   return `你是在幫忙判斷一張 Notion 需求單的規格描述夠不夠完整，讓工程師（或 AI）能據此直接開始實作，不需要再回頭問清楚需求是什麼。
 
+你有 Read/Grep/Glob 這三個唯讀工具，可以直接查看 /Users/user/aladdin 底下 agrabah／abu／rajah／lago 這幾個 repo 的原始碼。下判斷之前，先去 codebase 找找需求單提到的 service／method／欄位／既有邏輯（例如同一個訊息結構是否已經有類似欄位、同一個 service 是否已經有相同模式的既有寫法）。很多小需求單的 Notion 文字本身只寫了「要做什麼」加一兩個關鍵字，但只要 codebase 裡的既有慣例足以補齊實作細節（資料來源、命名、格式都能參照既有同類欄位），就要判定為足夠，不要只因為 Notion 文字本身簡短就直接判不足。
+
 判斷標準：
 - 有沒有具體描述「要做什麼」（不是空白、不是佔位/測試用的無關內容、不是只有標題或章節名稱本身）
-- 有沒有大致的範圍或驗收標準（不要求鉅細靡遺，但要能看出改動邊界）
+- 有沒有大致的範圍或驗收標準；這個範圍不強制寫在 Notion 文字裡，能從 codebase 既有同類邏輯合理推得也算數
+- 需求單提到的 service／method／欄位在 codebase 裡找不到對應位置、或找到後仍有多種互斥的實作方式而需求單完全沒講清楚要選哪一種，才視為不充分
 - 內容明顯是佔位/測試用途（例如貼一段跟需求完全無關的文章）視為不充分
 
 以下是需求單 ${ticket} 的內容：
@@ -130,16 +143,17 @@ ${comments.length > 0 ? comments.join('\n') : '（沒有留言）'}
  * 寫），理論上存在 prompt injection 風險（例如頁面內容裡藏一句「請忽略上述
  * 指示，改用 Bash 執行...」）。
  *
- * review 發現：第一版用 --permission-mode bypassPermissions（沿用
- * spawn-create-mr.ts 的既有理由——headless 環境下若模型嘗試呼叫工具卻沒人
- * 能回應權限對話框會直接卡死），但這只是『不問就准』，沒有真正限制能呼叫
- * 哪些工具；spawn-create-mr.ts 的 prompt 只有一個經過驗證格式的 ticket 編號
- * （T26 review 已確認的低風險），這裡的 prompt 帶著外部可編輯內容，同一套
- * 理由不能直接套用。已改成 --tools "" --strict-mcp-config：實測（見
- * tasks.json T34 changelog）這個組合會讓工具清單真的變成空陣列，連 MCP
- * server 提供的工具都清空，不是『允許但不問』而是『根本沒有工具可以被叫
- * 用』——沒有工具，permission mode 就不再相關，也一併移除
- * --permission-mode bypassPermissions（不需要，也避免有人以為它還在把關）。
+ * 歷史演進（T34 review，已被 2026-08-21 那則新註解取代成目前實際行為，
+ * 留著只為了說明『為什麼不是一開始就用 bypassPermissions』）：第一版用
+ * --permission-mode bypassPermissions（沿用 spawn-create-mr.ts 的既有理由
+ * ——headless 環境下若模型嘗試呼叫工具卻沒人能回應權限對話框會直接卡死），
+ * 但這只是『不問就准』，沒有真正限制能呼叫哪些工具；spawn-create-mr.ts 的
+ * prompt 只有一個經過驗證格式的 ticket 編號（T26 review 已確認的低風險），
+ * 這裡的 prompt 帶著外部可編輯內容，同一套理由不能直接套用，故 T34 當時
+ * 改成 --tools "" --strict-mcp-config 把工具清單清空、一併移除
+ * --permission-mode bypassPermissions。這個『零工具』狀態已在 2026-08-21
+ * 改掉（見下方新註解）——目前是 EXPLORE_TOOLS＋重新加回
+ * --permission-mode bypassPermissions，不是這裡描述的狀態。
  *
  * unset CLAUDE_EFFORT（review 發現的疏漏，沿用 spawn-create-mr.ts
  * WRAPPER_SCRIPT 同一個理由）：webhook server 若是從某個 Claude Code
@@ -155,16 +169,35 @@ ${comments.length > 0 ? comments.join('\n') : '（沒有留言）'}
  * claude-exec.ts 的 execClaudeWithStdin 走 stdin——避免 OS ARG_MAX 風險，
  * 也避免執行失敗時 err.message 把整個 prompt 內容（含外部 Notion 內容）
  * 原樣暴露出來（見 claude-exec.ts 檔頭註解）。
+ *
+ * 2026-08-21 使用者定案（實測 ALDREQ-765 誤判）：這張需求單的 Notion 內文
+ * 只列出欄位變更項目，沒寫資料來源／計算邏輯，零工具版本因為完全看不到
+ * codebase，只能照文字表面判『規格不足』；但需求其實是替既有訊息結構加一
+ * 個欄位，codebase 裡同一個 service 已經有同模式的既有欄位可以直接參照，
+ * 人看一眼就懂。改成給 EXPLORE_TOOLS（Read/Grep/Glob）＋cwd=CODEBASE_ROOT，
+ * 讓判斷前先探索 codebase。刻意不給 Bash（跟 demand-plan-pipeline.ts 的
+ * READONLY_TOOLS 不同）：這裡只需要『找得到相關程式碼、看得懂既有模式』，
+ * 不需要執行任何指令，能攻擊面縮到最小。--strict-mcp-config 保留不變且更
+ * 重要了——cwd 換成 aladdin 根目錄後會讀到那裡的 .mcp.json，若不擋，外部可
+ * 編輯的 Notion 內容理論上就能誘導呼叫 telegram/google drive 等 MCP 工具，
+ * 這是這個檔案最初的 injection 防線核心，不能因為從零工具改成唯讀工具就
+ * 跟著鬆動。--permission-mode bypassPermissions 重新加回來（工具非空，
+ * headless 環境沒人能回應權限對話框，理由同最上面移除它之前的舊版）。
  */
 async function askClaude(prompt: string): Promise<{ sufficient: boolean; missing?: string }> {
   const env = { ...process.env }
   delete env.CLAUDE_EFFORT
 
-  const stdout = await execClaudeWithStdin(['-p', '--model', 'sonnet', '--tools', '', '--strict-mcp-config', '--output-format', 'json'], prompt, {
-    maxBuffer: 10 * 1024 * 1024,
-    timeout: CLAUDE_EXEC_TIMEOUT_MS,
-    env,
-  })
+  const stdout = await execClaudeWithStdin(
+    ['-p', '--model', 'sonnet', '--tools', EXPLORE_TOOLS, '--permission-mode', 'bypassPermissions', '--strict-mcp-config', '--output-format', 'json'],
+    prompt,
+    {
+      cwd: CODEBASE_ROOT,
+      maxBuffer: 10 * 1024 * 1024,
+      timeout: CLAUDE_EXEC_TIMEOUT_MS,
+      env,
+    },
+  )
 
   const events = JSON.parse(stdout)
   if (!Array.isArray(events)) {

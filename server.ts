@@ -37,7 +37,7 @@ console.error(`telegram-dispatcher: bot initialized as @${bot.botInfo.username}`
 await bot.api.setMyCommands(
   [
     { command: 'bug', description: '列出你可認領的 Bug 工單' },
-    { command: 'req', description: '需求池（開發中，見 T23）' },
+    { command: 'req', description: '列出你可認領的需求單' },
     { command: 'menu', description: '顯示頂層選單' },
   ],
   { scope: { type: 'all_private_chats' } },
@@ -52,7 +52,7 @@ if (kitAdminChatId) {
   await bot.api.setMyCommands(
     [
       { command: 'bug', description: '列出你可認領的 Bug 工單' },
-      { command: 'req', description: '需求池（開發中，見 T23）' },
+      { command: 'req', description: '列出你可認領的需求單' },
       { command: 'menu', description: '顯示頂層選單' },
       { command: 'kit', description: '核發企劃 starter kit（/kit <id> <name>）' },
     ],
