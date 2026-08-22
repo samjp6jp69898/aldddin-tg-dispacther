@@ -11,8 +11,9 @@
 
 1. **webhook server**（`bun run server.ts`）：接 Telegram 送來的訊息/按鈕，
    查 Notion、觸發背景 pipeline。
-2. **ngrok tunnel**：把上面的 server 對外暴露成 Telegram 打得到的 HTTPS
-   網址。
+2. **Cloudflare tunnel**（`cloudflared`，2026-08-22 起取代 ngrok）：把上面的
+   server 對外暴露成 Telegram 打得到的 HTTPS 網址，`mcp.aladdin-assistant.cc`
+   （自有網域，Cloudflare Registrar 註冊）。
 
 ## 啟動 / 停止 / 查狀態
 
@@ -23,7 +24,7 @@
 zsh /Users/user/aladdin/telegram-dispatcher/launchd/run-server.sh
 
 # 啟動 tunnel（另開一個 terminal；一旦執行就會真的對外開放，見下方風險）
-zsh /Users/user/aladdin/telegram-dispatcher/launchd/run-tunnel.sh
+zsh /Users/user/aladdin/telegram-dispatcher/launchd/run-cloudflared-tunnel.sh
 ```
 
 兩支 wrapper script 都會自動從根目錄 `.env` 讀必要的環境變數，不需要自己
@@ -113,10 +114,15 @@ aladdin/obsidian 生態系（`obsidian/commands/create-mr/references/tech-users.
    `/create-mr:create-mr` 這個 slash command）。
 2. **bun**（跟原機器同版本或相容版本）：`cd telegram-dispatcher && bun install`
    （目前依賴只有 `grammy`/`hono`，見 `package.json`，很輕量）。
-3. **ngrok**：安裝後執行 `ngrok config add-authtoken <token>`——**必須是同一個
-   ngrok 帳號**才能沿用既有的 reserved domain
-   `unrefreshing-trudy-subsequently.ngrok-free.dev`；帳號不同這個 domain 用
-   不了，換新 domain 或轉移 domain 的擁有權都超出本文件範圍，另外處理。
+3. **cloudflared**（2026-08-22 起取代 ngrok）：安裝後執行 `cloudflared tunnel login`
+   （互動式瀏覽器授權，只有帳號擁有者能做）建立 `~/.cloudflared/cert.pem`。
+   但**新機器不需要重新 `login` + `tunnel create`**——那會建出一條全新、不同 id
+   的 tunnel。正確做法是把既有 tunnel 的 credentials-file
+   （`~/.cloudflared/6906f8e7-e46e-43f3-abd5-b43bbaa96e3e.json`，等同私鑰）從
+   原本那台機器安全複製過來（AirDrop/`scp`/USB，不要走任何會落地存放的通道），
+   完整說明見 `mcps/_hosted-rollout/DEPLOY-TO-NEW-MACHINE.md` §4.1。網域
+   `mcp.aladdin-assistant.cc` 是自有網域（Cloudflare Registrar 註冊），不像
+   ngrok reserved domain 那樣綁在帳號的免費方案配額上。
 4. **根目錄 `.env`**（`/Users/user/aladdin/.env`）：至少要有下面「需要的
    環境變數」章節列的四個 `TG_*`/`PORT` 變數；`/create-mr` pipeline 本身還
    需要 aladdin 主線既有的其他環境變數（Notion token 等），隨 aladdin 主線
@@ -130,9 +136,10 @@ aladdin/obsidian 生態系（`obsidian/commands/create-mr/references/tech-users.
 | 檔案 | 寫死的內容 |
 |---|---|
 | `launchd/com.aladdin.tg-dispatch-server.plist` | `ProgramArguments`、`WorkingDirectory`、`StandardOutPath`、`StandardErrorPath`、`PATH`（含 `/Users/user/.bun/bin`） |
-| `launchd/com.aladdin.tg-dispatch-tunnel.plist` | 同上四項 |
+| `launchd/com.aladdin.tg-dispatch-tunnel-cloudflare.plist` | 同上四項 |
 | `launchd/run-server.sh` | `ALADDIN="/Users/user/aladdin"`、`BUN="/Users/user/.bun/bin/bun"` |
-| `launchd/run-tunnel.sh` | `NGROK="/opt/homebrew/bin/ngrok"`（Apple Silicon 的 Homebrew 路徑；Intel Mac 通常是 `/usr/local/bin/ngrok`，裝之前先 `which ngrok` 確認） |
+| `launchd/run-cloudflared-tunnel.sh` | `CLOUDFLARED="/opt/homebrew/bin/cloudflared"`（Apple Silicon 的 Homebrew 路徑；Intel Mac 通常是 `/usr/local/bin/cloudflared`，裝之前先 `which cloudflared` 確認） |
+| `launchd/cloudflared-config.yml` | `credentials-file` 指到 `~/.cloudflared/<tunnel-id>.json`（見上方前置安裝第 3 點） |
 
 - **新機器帳號同樣叫 `user`、aladdin 也 clone 在完全一樣的 `/Users/user/aladdin`**
   → 以上檔案不用改，直接把整個 repo（連同 `.env`）搬過去即可。
@@ -141,13 +148,21 @@ aladdin/obsidian 生態系（`obsidian/commands/create-mr/references/tech-users.
 
 ### 換機器時「要不要重新 `setWebhook`」
 
-**不需要**——只要新機器用的是同一個 ngrok 帳號、同一個 reserved domain，
-Telegram 端登記的 webhook 網址完全不變（`getWebhookInfo` 查到的 `url` 不會
-變），換機器只是換了「誰在背後接手機請求」。**但兩台機器不能同時開著**
-（ngrok 免費方案同時間只允許 1 個 tunnel session，見「已知操作風險」）：
-正確順序是先在舊機器 `launchctl bootout` 兩支服務（或直接關機/停用），確認
-舊 tunnel 真的斷了，再到新機器 `launchctl bootstrap` 啟動。中間會有一段
-webhook 完全收不到訊息的空窗，選一個沒人在用的時段切換。
+**不需要**——只要新機器用的是同一個 Cloudflare 帳號、同一個網域
+（`mcp.aladdin-assistant.cc`），Telegram 端登記的 webhook 網址完全不變
+（`getWebhookInfo` 查到的 `url` 不會變），換機器只是換了「誰在背後接手機請求」。
+
+**跟 ngrok 版的關鍵差異**：ngrok 免費方案同時間只允許 1 個 tunnel session，
+換機器必須先關舊的才能開新的，中間必然有空窗；cloudflared **可以同時在多台
+機器上為同一條 tunnel 跑多個 connector**（Cloudflare 官方支援的高可用模式，
+邊緣會在多個 connector 之間分流），理論上兩台機器**可以同時開著**、逐步把
+流量切過去。但這不代表隨便兩台機器同時開就是安全的：兩台機器各自跑的
+`aladdin-admin`/`aladdin-platform` hosted server 是**各自獨立的行程**，各自
+有獨立的 per-token 登入態容器（`sessions: Map`）與 `tokens.json` 名冊拷貝——
+如果兩台機器的 `tokens.json` 內容不同步，同一個企劃打進來可能隨機落在
+兩台不同的機器上、拿到不一致的登入態或名冊判定結果。**除非刻意要做多機
+高可用（目前沒有這個設計），否則同一時間應該只有一台機器在跑完整的四個
+launchd job**，只是「切換 tunnel connector」這一步本身不再需要製造空窗。
 
 切換完務必**實際驗證一次**（比照 T21/T22 的收尾方式，不能只憑 process 有
 在跑就判定成功）：`curl /health`、`getWebhookInfo` 確認網址與 `last_error_message`
@@ -217,22 +232,25 @@ log 或任何被 git 追蹤的檔案裡（見 T15）。
   關掉「插電時允許進入睡眠」（系統設定 → 電池/節能 → 關閉螢幕後防止自動
   睡眠），否則整台機器睡著時 Telegram 送過來的更新會直接送達失敗，不會排隊
   等醒來後補送。
-- **ngrok 免費方案同時間只允許 1 個 agent session**：如果有人在別台機器或
-  同一台機器手動另外開一個 `ngrok http ...`，會把這支常駐的 tunnel 直接踢
-  下線，且 `bun run server.ts` process 本身完全不會發現（它只是本機 port 沒
-  人連得到，process 照樣活著）——**不要手動另開 ngrok session**。T19 的
-  健康檢查（每分鐘查一次本機 ngrok admin API）會在這個情境發生時發 Telegram
-  告警給維運者，但這是事後偵測，不是預防；最好的做法就是不要手動開第二個。
+- **（2026-08-22 起已改善，保留紀錄）ngrok 免費方案同時間只允許 1 個 agent
+  session**：舊版風險——如果有人手動另外開一個 `ngrok http ...`，會把常駐的
+  tunnel 直接踢下線，且 `bun run server.ts` process 本身完全不會發現。改用
+  cloudflared 後這個限制不存在（同一條 tunnel 可以有多個 connector 同時連
+  Cloudflare 邊緣，見上方「換機器時要不要重新 setWebhook」一節），但 T19 的
+  健康檢查（每分鐘查一次本機 cloudflared metrics `/ready`）如果偵測到
+  `readyConnections` 掉到 0，仍然是事後偵測、不是預防——本機 process 或
+  網路本身出問題時，這個風險依然存在，只是觸發原因不再是「別人搶了 session」。
 - **log 沒有 rotation，需要自行規劃**：`telegram-dispatcher/logs/` 底下的
   `*.log`（含 `launchd-*.log`、`post-run-notify.log`、`health-monitor.log`、
   以及每次觸發 `/create-mr` 產生的 `FAQ-*.stdout.log`/`.stderr.log`）會一直
   累積，沒有內建的自動清理或輪替機制。長期跑建議定期手動清（或另外排一個
   簡單的 cron 清舊檔），不清也不會讓服務壞掉，只是磁碟空間會一直長。
-- **ngrok request inspector（本機 4040 web UI）不可對外開放**：`run-tunnel.sh`
-  刻意沒有加任何會改變 `--web-addr` 綁定位址的旗標，維持 ngrok 預設只
-  bind `127.0.0.1`（見 T18）。之後如果有人想改這支腳本，**不要**加
-  `--web-addr 0.0.0.0:4040` 之類的設定對外開放——4040 admin API 沒有任何
-  認證機制，對外開放等於任何人都能看到即時流量內容。
+- **cloudflared metrics server（本機 20241）不可對外開放**（2026-08-22 起，
+  取代 ngrok 4040 admin/inspector 的同類風險）：預設只 bind `127.0.0.1`（見
+  `run-cloudflared-tunnel.sh` 啟動時的 log「Starting metrics server on
+  127.0.0.1:20241」）。之後如果有人想改 `cloudflared-config.yml` 或啟動參數，
+  **不要**加任何會讓 metrics server 綁到 `0.0.0.0` 的設定對外開放——`/metrics`
+  沒有任何認證機制，對外開放等於任何人都能看到 tunnel 連線/流量統計。
 - **全域併發上限 N=5（T26），in-memory、webhook server 重啟會歸零**：同一時間
   最多 5 個 `claude -p /create-mr:create-mr` 背景流程在跑，第 6 個觸發會被
   明確拒絕（Telegram 回覆「已達全域併發上限，請稍後再試」），不會安靜排隊
@@ -311,11 +329,11 @@ BOT_TOKEN=$(grep '^TG_DISPATCH_BOT_TOKEN=' /Users/user/aladdin/.env | cut -d= -f
 curl -s "https://api.telegram.org/bot${BOT_TOKEN}/getWebhookInfo"
 ```
 
-回應裡的 `url` 欄位就是目前 Telegram 端實際打的網址——ngrok 這邊的網址是
-**固定 reserved domain**（`launchd/run-tunnel.sh` 裡的 `TUNNEL_URL` 常數，
-不會因為 tunnel 重啟而變），所以正常情況下 `url` 應該長期不變，跟
-`launchd/run-tunnel.sh` 裡寫的網址 + `.env` 的 `TG_WEBHOOK_PATH` 兜起來要
-完全一致；不一致或 `last_error_message` 不是空的，代表要重新呼叫
+回應裡的 `url` 欄位就是目前 Telegram 端實際打的網址——Cloudflare Tunnel 這邊
+的網址是**自有固定網域**（`mcp.aladdin-assistant.cc`，由 `cloudflared tunnel
+route dns` 建立 DNS route，不會因為 tunnel 重啟而變），所以正常情況下 `url`
+應該長期不變，跟 `mcp.aladdin-assistant.cc` + `.env` 的 `TG_WEBHOOK_PATH` 兜
+起來要完全一致；不一致或 `last_error_message` 不是空的，代表要重新呼叫
 `setWebhook`（見下一節）。
 
 ## `TG_WEBHOOK_SECRET` 懷疑外洩時的手動輪替程序
@@ -344,12 +362,12 @@ curl -s "https://api.telegram.org/bot${BOT_TOKEN}/getWebhookInfo"
    BOT_TOKEN=$(grep '^TG_DISPATCH_BOT_TOKEN=' "$ENV_FILE" | cut -d= -f2- | tr -d '\r\n')
    WEBHOOK_PATH=$(grep '^TG_WEBHOOK_PATH=' "$ENV_FILE" | cut -d= -f2- | tr -d '\r\n')
    WEBHOOK_SECRET=$(grep '^TG_WEBHOOK_SECRET=' "$ENV_FILE" | cut -d= -f2- | tr -d '\r\n')
-   # ngrok 網址是固定 reserved domain（launchd/run-tunnel.sh 裡的
-   # TUNNEL_URL 常數，不會因 tunnel 重啟而變），不是每次要另外去查的值。
-   NGROK_URL="https://unrefreshing-trudy-subsequently.ngrok-free.dev"
+   # 網址是自有固定網域（2026-08-22 起，先前為 ngrok reserved domain），
+   # 不會因 tunnel 重啟而變，不是每次要另外去查的值。
+   TUNNEL_URL="https://mcp.aladdin-assistant.cc"
 
    curl -s "https://api.telegram.org/bot${BOT_TOKEN}/setWebhook" \
-     -d "url=${NGROK_URL}/${WEBHOOK_PATH}" \
+     -d "url=${TUNNEL_URL}/${WEBHOOK_PATH}" \
      -d "secret_token=${WEBHOOK_SECRET}"
    ```
    （正式上線本身 `setWebhook` 只在 T22 執行一次，這裡只是輪替 secret 時要

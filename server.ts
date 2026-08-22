@@ -140,7 +140,8 @@ app.post(
   webhookCallback(bot, 'hono', { secretToken: webhookSecret }),
 )
 
-// H14：hosted MCP path 分流 proxy——共用既有 ngrok domain，把五個前綴各自
+// H14：hosted MCP path 分流 proxy——共用既有 tunnel domain（2026-08-22 起為
+// Cloudflare Tunnel，先前為 ngrok），把五個前綴各自
 // 剝掉後轉發到本機對應 port 的 hosted server（例：/mcp-admin-dev/login →
 // http://localhost:8789/login）。整段實作（含 M1 的回應正規化與 M4 的雙
 // bucket 額度）搬到 lib/webhook-server/mcp-proxy.ts，那裡有完整的設計說明
@@ -160,9 +161,9 @@ registerProxyRoutes(app)
 // '/' 健康檢查與正確 webhook 路徑本身。
 app.all('*', c => respondUniform401(c))
 
-// T19：每分鐘查一次本機 ngrok admin API，tunnel 狀態翻轉時發 tg-notify.sh
-// 告警給維運者（見 health-monitor.ts 註解）。用 setInterval 週期排程，不是
-// sleep/輪詢規避競態。
+// T19：每分鐘查一次本機 cloudflared metrics /ready（2026-08-22 起，先前為
+// ngrok admin API），tunnel 狀態翻轉時發 tg-notify.sh 告警給維運者（見
+// health-monitor.ts 註解）。用 setInterval 週期排程，不是 sleep/輪詢規避競態。
 createHealthMonitor().start()
 
 const port = Number(process.env.PORT ?? 8787)
@@ -174,8 +175,8 @@ export default {
   // 15 秒間隔，proxy 轉發的 text/event-stream 長連線會在 frame 間隙被 Bun
   // 掐斷（實測：SSE 經 proxy 約 10 秒斷線、收不到 15 秒的 keep-alive frame）。
   // 提高到 120 秒讓 SSE 長連線活得過 keep-alive 週期（8 倍 margin）。對
-  // webhook / 其他短請求的影響只是 idle 連線可掛更久，本服務前面有 ngrok、
-  // 流量極小，可接受。注意 Bun 的 idleTimeout 上限是 255 秒：若未來 hosted
+  // webhook / 其他短請求的影響只是 idle 連線可掛更久，本服務前面有 Cloudflare
+  // Tunnel（2026-08-22 起，先前為 ngrok），流量極小，可接受。注意 Bun 的 idleTimeout 上限是 255 秒：若未來 hosted
   // 端出現超過 120 秒完全無輸出的同步長請求（如 toolsmith 生成），這一跳
   // 仍會斷，屆時要靠應用層週期輸出（SSE keep-alive）解，不是再調大這裡。
   idleTimeout: 120,

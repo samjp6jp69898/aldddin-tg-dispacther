@@ -1,4 +1,9 @@
 #!/bin/zsh
+# 【DEPRECATED，2026-08-22】已被 run-cloudflared-tunnel.sh 取代（使用者裁定，
+# H28 risk_notes (12) 收斂）。ngrok tunnel 已停用、對應 launchd plist 已從
+# ~/Library/LaunchAgents/ 移除，webhook 已重新註冊到 Cloudflare 網域。這支
+# 腳本保留在 repo 供歷史參考與應急回退，**不應再 bootstrap**。
+#
 # launchd wrapper：啟動 ngrok tunnel，指向本機 telegram-dispatcher webhook server。
 #
 # risk_notes（見 tasks.json T18）：明確不用 `ngrok service install`（會另建一

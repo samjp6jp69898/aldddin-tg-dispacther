@@ -1,4 +1,4 @@
-// hosted MCP path 分流 proxy——共用既有 ngrok domain，把五個前綴各自剝掉後
+// hosted MCP path 分流 proxy——共用既有 tunnel domain（2026-08-22 起為 Cloudflare Tunnel，先前為 ngrok），把五個前綴各自剝掉後
 // 轉發到本機對應 port 的 hosted server（例：/mcp-admin-dev/login →
 // http://localhost:8789/login）。認證由各 hosted server 自己的 Bearer token
 // 把關，這裡只做純轉發，跟 webhook 的 secret guard 無關（那道 guard 只掛在
@@ -54,8 +54,8 @@ const HOP_BY_HOP_HEADERS = new Set([
 
 // 轉發用 request headers：
 // - hop-by-hop 移除（含 Connection 點名的）。
-// - host 移除：讓 fetch 依 target 自動補 localhost:<port>，不把 ngrok domain
-//   的 Host 帶給後端。
+// - host 移除：讓 fetch 依 target 自動補 localhost:<port>，不把 tunnel 前面
+//   掛的 domain 的 Host 帶給後端。
 // - content-length 移除：framing 一律由執行環境依實際送出的 body 重算（F-1
 //   之後 body 是先讀進記憶體再交給 fetch，fetch 會自己補正確的
 //   Content-Length）；沿用入站那份原始 Content-Length 是最典型的 proxy 破法，
@@ -194,7 +194,7 @@ export const PROXY_ROUTE_LIMITS: Record<string, BucketLimit> = {
 //
 // 為什麼是 120 而不是沿用 30：M4 的攻擊之所以「便宜又隱形」，正是因為 30/分鐘
 // 這種業務級數字用 1 req/2s 就能長期壓在底部。把轉發閘拉到 2 req/s，攻擊者要
-// 觸發它就必須持續打出 ngrok 流量統計上看得見的量，而且觸發之後拿到的仍是跟
+// 觸發它就必須持續打出 tunnel 供應商流量統計上看得見的量（現為 Cloudflare，先前為 ngrok），而且觸發之後拿到的仍是跟
 // 猜錯前綴一模一樣的 401——他既問不出新資訊，也拿不到「悄悄讓別人被擋」的
 // 效果（合法使用者的額度另計，見下方 quota gate）。
 const FORWARD_CAPACITY = 120
@@ -279,7 +279,7 @@ const createRawPrefixGuard = (prefix: string): MiddlewareHandler => {
  * 匹配到 /health，只比對原文會被繞過。query string 不影響判定，因為
  * url.pathname 本來就不含 query（`/health?x=1` 在後端一樣命中 /health）。
  *
- * 權衡：經公網（ngrok）打 /<prefix>/health 這個外部健康檢查手段不再可用。
+ * 權衡：經公網（現為 Cloudflare Tunnel，先前為 ngrok）打 /<prefix>/health 這個外部健康檢查手段不再可用。
  * hosted server 的存活探測改用本機直連 http://127.0.0.1:<port>/health——
  * launchd 與人工排查本來就走本機，這條公網路徑本來就非必要。dispatcher
  * 自己的 /health（server.ts）不經過 proxy，不受影響。
@@ -384,7 +384,7 @@ export function registerProxyRoutes(app: Hono, opts: RegisterProxyRoutesOptions 
         // 的記憶體，原本串流轉發幾乎不佔。上限由三者相乘夾住：單一 body
         // ≤1MB（下面的 bodyLimit）、每條 route 每分鐘最多 120 發能走到這裡
         // （M4 轉發閘）、停在半途的連線 120 秒被 Bun idleTimeout 回收。而且
-        // 要佔住記憶體就得真的把位元組送上來，等於必須打出 ngrok 流量統計上
+        // 要佔住記憶體就得真的把位元組送上來，等於必須打出 tunnel 供應商流量統計上
         // 看得見的量——這正是 M4 轉發閘刻意要逼出來的性質。
         //
         // 對正常路徑無影響：MCP 的 JSON-RPC body、/login 的 JSON、/files 的

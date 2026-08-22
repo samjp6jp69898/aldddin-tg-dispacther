@@ -2,55 +2,58 @@ import { afterAll, beforeEach, describe, expect, mock, test } from 'bun:test'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { checkNgrokTunnelReachable, checkTokenRegistryLoadable, createHealthMonitor } from './health-monitor.ts'
+import { checkCloudflaredTunnelReachable, checkTokenRegistryLoadable, createHealthMonitor } from './health-monitor.ts'
 
-// 用一個真的最小 Bun.serve 假裝 ngrok 的 admin API（不接觸真實 ngrok，也不
-// mock fetch——這裡就是要驗證真的打了一次 HTTP request 並正確解析回應）。
-let tunnelCount = 1
-const fakeNgrokServer = Bun.serve({
+// 用一個真的最小 Bun.serve 假裝 cloudflared 的 metrics /ready 端點（不接觸
+// 真實 cloudflared，也不 mock fetch——這裡就是要驗證真的打了一次 HTTP
+// request 並正確解析回應）。2026-08-22：改用 cloudflared 取代 ngrok（H28
+// risk_notes (12) 收斂），/ready 回傳 readyConnections 而不是 ngrok 版的
+// tunnels 陣列，語意等價（>0 即健康）。
+let readyConnections = 1
+const fakeCloudflaredServer = Bun.serve({
   port: 0,
   fetch(req) {
     const url = new URL(req.url)
-    if (url.pathname === '/api/tunnels') {
-      return Response.json({ tunnels: Array.from({ length: tunnelCount }, (_, i) => ({ name: `t${i}` })) })
+    if (url.pathname === '/ready') {
+      return Response.json({ status: 200, readyConnections, connectorId: 'fake-connector' })
     }
-    if (url.pathname === '/api/tunnels-empty') {
-      return Response.json({ tunnels: [] })
+    if (url.pathname === '/ready-empty') {
+      return Response.json({ status: 503, readyConnections: 0, connectorId: 'fake-connector' })
     }
-    if (url.pathname === '/api/tunnels-500') {
+    if (url.pathname === '/ready-500') {
       return new Response('error', { status: 500 })
     }
     return new Response('not found', { status: 404 })
   },
 })
-const BASE = `http://127.0.0.1:${fakeNgrokServer.port}`
+const BASE = `http://127.0.0.1:${fakeCloudflaredServer.port}`
 
 afterAll(() => {
-  fakeNgrokServer.stop(true)
+  fakeCloudflaredServer.stop(true)
 })
 
-describe('checkNgrokTunnelReachable', () => {
-  test('有 active tunnel → true', async () => {
-    expect(await checkNgrokTunnelReachable(`${BASE}/api/tunnels`)).toBe(true)
+describe('checkCloudflaredTunnelReachable', () => {
+  test('有 ready connection → true', async () => {
+    expect(await checkCloudflaredTunnelReachable(`${BASE}/ready`)).toBe(true)
   })
 
-  test('tunnels 陣列是空的 → false', async () => {
-    expect(await checkNgrokTunnelReachable(`${BASE}/api/tunnels-empty`)).toBe(false)
+  test('readyConnections 是 0 → false', async () => {
+    expect(await checkCloudflaredTunnelReachable(`${BASE}/ready-empty`)).toBe(false)
   })
 
   test('API 回 500 → false（不拋例外）', async () => {
-    expect(await checkNgrokTunnelReachable(`${BASE}/api/tunnels-500`)).toBe(false)
+    expect(await checkCloudflaredTunnelReachable(`${BASE}/ready-500`)).toBe(false)
   })
 
   test('連不上（port 沒人聽）→ false（不拋例外）', async () => {
-    expect(await checkNgrokTunnelReachable('http://127.0.0.1:1')).toBe(false)
+    expect(await checkCloudflaredTunnelReachable('http://127.0.0.1:1')).toBe(false)
   })
 })
 
 describe('createHealthMonitor — 狀態翻轉才通知，避免洗版', () => {
   test('第一次檢查只記基準值，不通知（避免剛啟動 tunnel 還沒起來就誤報）', async () => {
     const notify = mock((_text: string) => {})
-    const monitor = createHealthMonitor({ apiUrl: `${BASE}/api/tunnels-empty`, notify, registryPaths: [] })
+    const monitor = createHealthMonitor({ apiUrl: `${BASE}/ready-empty`, notify, registryPaths: [] })
 
     const result = await monitor.runOnce()
 
@@ -61,13 +64,13 @@ describe('createHealthMonitor — 狀態翻轉才通知，避免洗版', () => {
   test('健康 → 不健康：翻轉時通知一次；持續不健康：不重複通知', async () => {
     const notify = mock((_text: string) => {})
     // 先給一個會動態切換的假 server 端點，模擬「原本健康，後來變不健康」。
-    tunnelCount = 1
-    const monitor = createHealthMonitor({ apiUrl: `${BASE}/api/tunnels`, notify, registryPaths: [] })
+    readyConnections = 1
+    const monitor = createHealthMonitor({ apiUrl: `${BASE}/ready`, notify, registryPaths: [] })
 
     await monitor.runOnce() // 基準：健康，不通知
     expect(notify).not.toHaveBeenCalled()
 
-    tunnelCount = 0 // 模擬 tunnel 掉了
+    readyConnections = 0 // 模擬 tunnel 掉了
     await monitor.runOnce() // 翻轉：健康→不健康，該通知
     expect(notify).toHaveBeenCalledTimes(1)
     expect(notify.mock.calls[0]![0]).toContain('偵測不到')
@@ -75,7 +78,7 @@ describe('createHealthMonitor — 狀態翻轉才通知，避免洗版', () => {
     await monitor.runOnce() // 持續不健康，不該重複通知
     expect(notify).toHaveBeenCalledTimes(1)
 
-    tunnelCount = 1 // 恢復
+    readyConnections = 1 // 恢復
     await monitor.runOnce() // 翻轉：不健康→健康，該通知恢復
     expect(notify).toHaveBeenCalledTimes(2)
     expect(notify.mock.calls[1]![0]).toContain('已恢復')
@@ -152,10 +155,10 @@ describe('createHealthMonitor — 名冊故障告警', () => {
   const writeRegistry = (content: string) => writeFileSync(join(dir, 'tokens.json'), content)
   // tunnel 那半在這組測試裡固定健康且不翻轉，notify 只會來自名冊檢查。
   const monitorWith = (notify: (t: string) => void) =>
-    createHealthMonitor({ apiUrl: `${BASE}/api/tunnels`, notify, registryPaths: paths() })
+    createHealthMonitor({ apiUrl: `${BASE}/ready`, notify, registryPaths: paths() })
 
   test('名冊壞掉 → 告警一次；持續壞掉 → 不重複洗版；修好 → 報恢復', async () => {
-    tunnelCount = 1
+    readyConnections = 1
     const notify = mock((_t: string) => {})
     writeRegistry(JSON.stringify({ tokens: [{ id: 'a', token: 't1' }] }))
     const monitor = monitorWith(notify)
@@ -180,7 +183,7 @@ describe('createHealthMonitor — 名冊故障告警', () => {
   })
 
   test('開機時名冊就已經壞掉 → 第一次檢查就告警（沒有「只記基準值」的寬限）', async () => {
-    tunnelCount = 1
+    readyConnections = 1
     const notify = mock((_t: string) => {})
     writeRegistry('not json at all')
 
@@ -191,7 +194,7 @@ describe('createHealthMonitor — 名冊故障告警', () => {
   })
 
   test('壞掉的原因變了 → 再發一次（維運者才知道自己改動的結果）', async () => {
-    tunnelCount = 1
+    readyConnections = 1
     const notify = mock((_t: string) => {})
     writeRegistry('{"tokens": [')
     const monitor = monitorWith(notify)
@@ -206,14 +209,14 @@ describe('createHealthMonitor — 名冊故障告警', () => {
   })
 
   test('多份名冊各自記狀態：第一份壞掉不會遮蔽第二份接著壞掉', async () => {
-    tunnelCount = 1
+    readyConnections = 1
     const notify = mock((_t: string) => {})
     const a = join(dir, 'tokens.json')
     const b = join(dir, 'tokens.pre.json')
     const good = JSON.stringify({ tokens: [{ id: 'a', token: 't1' }] })
     writeFileSync(a, good)
     writeFileSync(b, good)
-    const monitor = createHealthMonitor({ apiUrl: `${BASE}/api/tunnels`, notify, registryPaths: [a, b] })
+    const monitor = createHealthMonitor({ apiUrl: `${BASE}/ready`, notify, registryPaths: [a, b] })
 
     await monitor.runOnce()
     expect(notify).not.toHaveBeenCalled()

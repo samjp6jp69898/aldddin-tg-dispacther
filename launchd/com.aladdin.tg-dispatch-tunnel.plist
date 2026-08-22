@@ -1,5 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- DEPRECATED 2026-08-22：已被 com.aladdin.tg-dispatch-tunnel-cloudflare.plist 取代
+     （使用者裁定，H28 risk_notes (12) 收斂）。已從 ~/Library/LaunchAgents/ 移除，
+     不應再 bootstrap。保留在 repo 供歷史參考與應急回退。 -->
 <plist version="1.0">
 <dict>
     <key>Label</key>
