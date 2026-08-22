@@ -1,0 +1,18 @@
+# cloudflared tunnel 設定（2026-08-22，取代 ngrok 免費方案，H28 risk_notes (12) 收斂）。
+#
+# 只有一條 ingress 規則：telegram-dispatcher（server.ts）本身已經在內部用路徑分流
+# webhook / /mcp-admin-* / /mcp-platform / /toolsmith（見 server.ts:168 單一 port
+# 8787），跟 ngrok 現行做法一致，不需要像 ngrok 那樣為每個 admin 環境（dev/pre/evi）
+# 各申請一個保留網域——一個子網域、一個 tunnel、全部指到同一個本機 port 就夠。
+#
+# tunnel id/credentials-file 由 `cloudflared tunnel create aladdin-mcp` 產生
+# （2026-08-22 建立，tunnel id 6906f8e7-e46e-43f3-abd5-b43bbaa96e3e）；DNS route
+# 由 `cloudflared tunnel route dns aladdin-mcp mcp.aladdin-assistant.cc` 建立。
+tunnel: 6906f8e7-e46e-43f3-abd5-b43bbaa96e3e
+credentials-file: /Users/user/.cloudflared/6906f8e7-e46e-43f3-abd5-b43bbaa96e3e.json
+
+ingress:
+  - hostname: mcp.aladdin-assistant.cc
+    service: http://localhost:8787
+  # 兜底規則：cloudflared 要求 ingress 清單最後一條沒有 hostname，否則啟動時直接拒絕。
+  - service: http_status:404
