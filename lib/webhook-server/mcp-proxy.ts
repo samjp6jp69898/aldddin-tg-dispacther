@@ -31,7 +31,11 @@ export const PROXY_ROUTES: ProxyRoute[] = [
   ['/mcp-admin-dev', 8789],
   ['/mcp-admin-pre', 8791],
   ['/mcp-admin-evi', 8792],
-  ['/mcp-platform', 8790],
+  ['/mcp-platform', 8790], // 既有現役部署，即 platform dev×PK，別名沿用舊名不改
+  ['/mcp-platform-dev-6t', 8793],
+  ['/mcp-platform-pre-pk', 8794],
+  ['/mcp-platform-pre-6t', 8795],
+  ['/mcp-platform-evi-6t', 8796], // evi 目前只有 6T 產品的後台網址，沒有 evi×PK
   ['/toolsmith', 8788],
 ]
 
@@ -174,6 +178,10 @@ export const PROXY_ROUTE_LIMITS: Record<string, BucketLimit> = {
   '/mcp-admin-pre': { capacity: MCP_ROUTE_CAPACITY, refillPerSecond: MCP_ROUTE_REFILL_PER_SECOND },
   '/mcp-admin-evi': { capacity: MCP_ROUTE_CAPACITY, refillPerSecond: MCP_ROUTE_REFILL_PER_SECOND },
   '/mcp-platform': { capacity: MCP_ROUTE_CAPACITY, refillPerSecond: MCP_ROUTE_REFILL_PER_SECOND },
+  '/mcp-platform-dev-6t': { capacity: MCP_ROUTE_CAPACITY, refillPerSecond: MCP_ROUTE_REFILL_PER_SECOND },
+  '/mcp-platform-pre-pk': { capacity: MCP_ROUTE_CAPACITY, refillPerSecond: MCP_ROUTE_REFILL_PER_SECOND },
+  '/mcp-platform-pre-6t': { capacity: MCP_ROUTE_CAPACITY, refillPerSecond: MCP_ROUTE_REFILL_PER_SECOND },
+  '/mcp-platform-evi-6t': { capacity: MCP_ROUTE_CAPACITY, refillPerSecond: MCP_ROUTE_REFILL_PER_SECOND },
   '/toolsmith': { capacity: TOOLSMITH_CAPACITY, refillPerSecond: TOOLSMITH_REFILL_PER_SECOND },
 }
 
