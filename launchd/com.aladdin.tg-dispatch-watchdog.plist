@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.aladdin.tg-dispatch-watchdog</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/zsh</string>
+        <string>/Users/user/aladdin/telegram-dispatcher/launchd/health-watchdog.sh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/user/aladdin/telegram-dispatcher</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/user/.bun/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>LANG</key>
+        <string>en_US.UTF-8</string>
+    </dict>
+
+    <!-- 跟 server/tunnel 兩支 KeepAlive 常駐 job 不同：這支是「每隔一段時間跑
+         一次、跑完就結束」的探測腳本，用 StartInterval 週期觸發，不是常駐
+         process，也不用 KeepAlive（腳本本來就會正常結束，不該被當成崩潰重
+         啟）。120 秒一次：配合腳本內 FAILURE_THRESHOLD=2，最慢在真的卡死後
+         約 4 分鐘內完成偵測＋通知＋嘗試自動重啟。 -->
+    <key>StartInterval</key>
+    <integer>120</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/user/aladdin/telegram-dispatcher/logs/launchd-watchdog.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/user/aladdin/telegram-dispatcher/logs/launchd-watchdog.err.log</string>
+</dict>
+</plist>

@@ -11,6 +11,7 @@ import { createWebhookSecretGuard } from './lib/security/webhook-secret-guard.ts
 import { respondUniform401 } from './lib/security/uniform-401.ts'
 import { createHealthMonitor } from './lib/webhook-server/health-monitor.ts'
 import { registerProxyRoutes } from './lib/webhook-server/mcp-proxy.ts'
+import { startStaleLockReaper } from './lib/pipeline-runner/stale-lock-reaper.ts'
 
 registerHandlers(bot)
 
@@ -165,6 +166,12 @@ app.all('*', c => respondUniform401(c))
 // ngrok admin API），tunnel 狀態翻轉時發 tg-notify.sh 告警給維運者（見
 // health-monitor.ts 註解）。用 setInterval 週期排程，不是 sleep/輪詢規避競態。
 createHealthMonitor().start()
+
+// T26：每 10 分鐘掃一次 bug-lock.sh 的鎖，回收持有超過 70 分鐘（遠高於
+// WRAPPER_SCRIPT 的 timeout 3600 上限）的逾時鎖——見 stale-lock-reaper.ts
+// 檔頭註解，涵蓋手動 kill -9 整組砍掉背景流程、或機器斷電重開機這兩種 EXIT
+// trap 完全沒機會執行的情境。跟上面的 tunnel 健康檢查一樣是週期性排程器。
+startStaleLockReaper()
 
 const port = Number(process.env.PORT ?? 8787)
 

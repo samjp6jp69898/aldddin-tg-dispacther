@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process'
 import { openSync, closeSync, mkdirSync, appendFileSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { GLOBAL_CONCURRENCY_LIMIT, createConcurrencyLimiter } from './concurrency-limiter.ts'
+import { markPipelineActive, clearPipelineActive } from './active-pipeline-marker.ts'
 
 const LOG_DIR = '/Users/user/aladdin/telegram-dispatcher/logs'
 const SPAWN_ERROR_LOG = join(LOG_DIR, 'spawn-errors.log')
@@ -235,6 +236,11 @@ export function spawnCreateMr(
     const stdoutPath = join(LOG_DIR, `${base}.stdout.log`)
     const stderrPath = join(LOG_DIR, `${base}.stderr.log`)
 
+    // T26 review 修正：在真的 spawn 之前標記「這張單是 dispatcher 觸發的」
+    // （見 active-pipeline-marker.ts 檔頭註解）——stale-lock-reaper.ts 只會
+    // 對有這份標記的 ticket 動手，避免誤殺人工/批次跑的 pipeline 持有的鎖。
+    markPipelineActive(ticket)
+
     const pid = spawnDetachedProcess('bash', ['-c', WRAPPER_SCRIPT, 'run-create-mr', ticket, stdoutPath], {
       cwd: '/Users/user/aladdin',
       stdoutPath,
@@ -246,12 +252,18 @@ export function spawnCreateMr(
       env: { DISPATCHER_TRIGGERED: '1' },
       // T26：不管背景流程最後是成功、失敗、被 timeout 殺、還是中途 crash，
       // 只要真的結束就釋放名額——見 spawnDetachedProcess 的 'exit'/'error'
-      // handler，兩者都保證只呼叫一次。
-      onExit: () => concurrencyLimiter.release(),
+      // handler，兩者都保證只呼叫一次。正常結束時一併清掉 active-pipeline
+      // 標記（被 kill -9/斷電打斷、onExit 沒機會執行時標記會殘留，這是
+      // stale-lock-reaper 需要偵測的訊號，不是缺陷，見該檔案註解）。
+      onExit: () => {
+        concurrencyLimiter.release()
+        clearPipelineActive(ticket)
+      },
     })
     return { ok: true, pid }
   } catch (err) {
     concurrencyLimiter.release()
+    clearPipelineActive(ticket)
     mkdirSync(dirname(SPAWN_ERROR_LOG), { recursive: true })
     appendFileSync(SPAWN_ERROR_LOG, `${new Date().toISOString()} spawnCreateMr 失敗（${ticket}）: ${err}\n`)
     return { ok: false, reason: 'spawn_error' }

@@ -1,6 +1,7 @@
 import { execFileSync } from 'node:child_process'
 import { appendFileSync, mkdirSync, readFileSync } from 'node:fs'
 import { basename, join } from 'node:path'
+import { OPERATOR_CHAT_ID } from '../notify/operator.ts'
 
 // 2026-08-22：改用 cloudflared 取代 ngrok（使用者裁定，H28 risk_notes (12) 收斂）。
 // cloudflared 在 launchd/cloudflared-config.yml 沒有另外指定 --metrics 位址時，
@@ -9,10 +10,10 @@ import { basename, join } from 'node:path'
 // /api/tunnels 更直接，不需要自己數陣列長度以外的欄位。
 const CLOUDFLARED_READY_URL = 'http://127.0.0.1:20241/ready'
 const TG_NOTIFY_SH = '/Users/user/aladdin/scripts/tg-notify.sh'
-// 見 cron/bug-report-run.sh 同一套維運告警慣例：維運對象（Landon）的
-// chat_id 直接寫死，不透過 tech-users.csv 查——這是給「人」的維運告警，不是
-// 給某張 ticket 的技術指派，跟 T13 補發通知的判準（Notion 當前指派）不同。
-const OPERATOR_CHAT_ID = '5022865804'
+// OPERATOR_CHAT_ID（見 cron/bug-report-run.sh 同一套維運告警慣例：維運對象
+// 「Landon」的 chat_id 直接寫死，不透過 tech-users.csv 查）2026-08-23 起搬到
+// ../notify/operator.ts 集中管理，跟 post-run-notify.ts／stale-lock-reaper.ts
+// 共用同一個值。
 const FETCH_TIMEOUT_MS = 5000
 const EXEC_TIMEOUT_MS = 10_000
 const LOG_DIR = '/Users/user/aladdin/telegram-dispatcher/logs'

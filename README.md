@@ -7,13 +7,26 @@
 
 ## 系統組成
 
-兩支獨立常駐行程（各自一支 launchd job，互不依賴對方的 process 存活）：
+三支獨立 launchd job（互不依賴對方的 process 存活）：
 
 1. **webhook server**（`bun run server.ts`）：接 Telegram 送來的訊息/按鈕，
-   查 Notion、觸發背景 pipeline。
+   查 Notion、觸發背景 pipeline。process 內部另有兩個 setInterval 週期任務：
+   T19 tunnel 健康檢查（見下方「已知操作風險」）與 T26 逾時鎖回收（見「工單
+   鎖卡住時如何手動排除」）。
 2. **Cloudflare tunnel**（`cloudflared`，2026-08-22 起取代 ngrok）：把上面的
    server 對外暴露成 Telegram 打得到的 HTTPS 網址，`mcp.aladdin-assistant.cc`
    （自有網域，Cloudflare Registrar 註冊）。
+3. **外部健康守門員（watchdog，2026-08-23 新增，預設未啟用）**：跟第 1 點
+   webhook server 內部的健康檢查不同層次——它是 process「自己裡面」的定時
+   任務，若 process 本身卡死（event loop 卡住，不是被殺掉），連這個定時任務
+   自己都不會觸發，等於完全偵測不到。watchdog 是完全獨立的 launchd
+   `StartInterval` job（`launchd/health-watchdog.sh`，每 120 秒觸發一次，不是
+   常駐 process），從外部定期打 `/health`，連續 2 次打不到才判定掛掉（避免
+   單次慢請求誤報），翻轉那一刻通知維運者並嘗試 `launchctl kickstart -k`
+   自我修復一次（不會每次都重啟造成迴圈），持續掛著不重複通知，恢復時另外
+   報一次恢復。**這支 job 目前只是把 plist／腳本寫好放著，尚未 bootstrap
+   上線**（比照下方 webhook server／tunnel 的部署方式，需要另外手動啟用，
+   見下一節）。
 
 ## 啟動 / 停止 / 查狀態
 
@@ -38,7 +51,7 @@ plist 定義檔放在 `telegram-dispatcher/launchd/`，**要先複製一份到
 
 ```bash
 cp /Users/user/aladdin/telegram-dispatcher/launchd/com.aladdin.tg-dispatch-server.plist \
-   /Users/user/aladdin/telegram-dispatcher/launchd/com.aladdin.tg-dispatch-tunnel.plist \
+   /Users/user/aladdin/telegram-dispatcher/launchd/com.aladdin.tg-dispatch-tunnel-cloudflare.plist \
    ~/Library/LaunchAgents/
 ```
 
@@ -46,14 +59,14 @@ cp /Users/user/aladdin/telegram-dispatcher/launchd/com.aladdin.tg-dispatch-serve
 
 ```bash
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.aladdin.tg-dispatch-server.plist
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.aladdin.tg-dispatch-tunnel.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.aladdin.tg-dispatch-tunnel-cloudflare.plist
 ```
 
 停止（`bootout`；舊語法 `launchctl unload <path>`）：
 
 ```bash
 launchctl bootout gui/$(id -u)/com.aladdin.tg-dispatch-server
-launchctl bootout gui/$(id -u)/com.aladdin.tg-dispatch-tunnel
+launchctl bootout gui/$(id -u)/com.aladdin.tg-dispatch-tunnel-cloudflare
 ```
 
 查狀態：
@@ -62,8 +75,28 @@ launchctl bootout gui/$(id -u)/com.aladdin.tg-dispatch-tunnel
 launchctl list | grep tg-dispatch
 # 或看單一 job 的詳細狀態（PID、上次結束碼等）：
 launchctl print gui/$(id -u)/com.aladdin.tg-dispatch-server
-launchctl print gui/$(id -u)/com.aladdin.tg-dispatch-tunnel
+launchctl print gui/$(id -u)/com.aladdin.tg-dispatch-tunnel-cloudflare
 ```
+
+### （可選）啟用外部健康守門員 watchdog
+
+見上方「系統組成」第 3 點——這支 job 預設不會跟著上面兩支一起啟用，要另外
+手動裝：
+
+```bash
+cp /Users/user/aladdin/telegram-dispatcher/launchd/com.aladdin.tg-dispatch-watchdog.plist \
+   ~/Library/LaunchAgents/
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.aladdin.tg-dispatch-watchdog.plist
+
+# 查狀態 / 停用
+launchctl print gui/$(id -u)/com.aladdin.tg-dispatch-watchdog
+launchctl bootout gui/$(id -u)/com.aladdin.tg-dispatch-watchdog
+```
+
+log 檔：`logs/health-watchdog.log`（腳本自己的判斷紀錄）、
+`logs/launchd-watchdog.{out,err}.log`（launchd 層級）、
+`logs/watchdog-state`（目前記的健康狀態，純文字 `state=`/`consecutive_failures=`
+兩行，人工可直接看，不需要工具解析）。
 
 log 檔位置：`telegram-dispatcher/logs/launchd-server.{out,err}.log`、
 `launchd-tunnel.{out,err}.log`（兩支 plist 各自指定，見 T18）。
@@ -137,14 +170,20 @@ aladdin/obsidian 生態系（`obsidian/commands/create-mr/references/tech-users.
 |---|---|
 | `launchd/com.aladdin.tg-dispatch-server.plist` | `ProgramArguments`、`WorkingDirectory`、`StandardOutPath`、`StandardErrorPath`、`PATH`（含 `/Users/user/.bun/bin`） |
 | `launchd/com.aladdin.tg-dispatch-tunnel-cloudflare.plist` | 同上四項 |
+| `launchd/com.aladdin.tg-dispatch-watchdog.plist`（2026-08-23 新增，見下方「啟用外部健康守門員」）| 同上四項 |
 | `launchd/run-server.sh` | `ALADDIN="/Users/user/aladdin"`、`BUN="/Users/user/.bun/bin/bun"` |
 | `launchd/run-cloudflared-tunnel.sh` | `CLOUDFLARED="/opt/homebrew/bin/cloudflared"`（Apple Silicon 的 Homebrew 路徑；Intel Mac 通常是 `/usr/local/bin/cloudflared`，裝之前先 `which cloudflared` 確認） |
 | `launchd/cloudflared-config.yml` | `credentials-file` 指到 `~/.cloudflared/<tunnel-id>.json`（見上方前置安裝第 3 點） |
+| `launchd/health-watchdog.sh` | `HEALTH_URL`（組出 `http://127.0.0.1:8787/health`，跟 `PORT` 一致即可不用改）、`TG_NOTIFY_SH="/Users/user/aladdin/scripts/tg-notify.sh"`、`SERVICE_LABEL` |
 
 - **新機器帳號同樣叫 `user`、aladdin 也 clone 在完全一樣的 `/Users/user/aladdin`**
   → 以上檔案不用改，直接把整個 repo（連同 `.env`）搬過去即可。
-- **帳號或路徑不一樣** → 上面四個檔案都要對應改成新路徑，改完才能
+- **帳號或路徑不一樣** → 上面幾個檔案都要對應改成新路徑，改完才能
   `cp ... ~/Library/LaunchAgents/` 並 `launchctl bootstrap`（見上一節）。
+- **watchdog 是獨立的第三支 job，不會跟著 server/tunnel 自動一起裝**：換機器
+  時如果也要它，記得額外照著「（可選）啟用外部健康守門員 watchdog」那節的
+  三個指令（`cp` → `bootstrap` → 用 `launchctl print` 確認）另外裝一次，不在
+  上面 server/tunnel 的啟動流程裡。
 
 ### 換機器時「要不要重新 `setWebhook`」
 
@@ -240,11 +279,36 @@ log 或任何被 git 追蹤的檔案裡（見 T15）。
   健康檢查（每分鐘查一次本機 cloudflared metrics `/ready`）如果偵測到
   `readyConnections` 掉到 0，仍然是事後偵測、不是預防——本機 process 或
   網路本身出問題時，這個風險依然存在，只是觸發原因不再是「別人搶了 session」。
+  這個內建健康檢查本身還有一個範圍缺口：它跑在 webhook server process
+  「自己裡面」，若 process 本身卡死（event loop 卡住，不是被殺掉），連這個
+  檢查自己都不會觸發——2026-08-23 新增的外部 watchdog（見上方「系統組成」
+  第 3 點）就是補這個缺口，但預設未啟用，需要另外手動 bootstrap。
+- **啟用外部 watchdog 前建議先知道的風險（2026-08-23 對抗性 review 發現）**：
+  `stale-lock-reaper.ts`（T26）真的抓到逾時鎖時，回收動作（release／清
+  worktree／通知）全程同步、跟 webhook server 共用同一條主 event loop，
+  最壞情況（單一 repo 就要跑到 4 段各 30 秒上限的 git 操作）理論上可以讓
+  event loop 卡住到數分鐘，同一段時間內 webhook 完全無回應。日常沒有逾時
+  鎖時無感，只在真的觸發回收（斷電重開機、kill -9 這類 T26 本來就要處理的
+  情境）才會發生。**若這段時間剛好碰上外部 watchdog 的偵測窗口**（連續 2 次
+  ×120 秒 = 4 分鐘），`/health` 答不出來可能被誤判成「掛了」，觸發不必要的
+  `launchctl kickstart -k`，反而中斷正在進行的回收流程。目前 watchdog 還沒
+  上線，這個交互作用不會發生；之後真的要啟用 watchdog，建議先把
+  `reapStaleLocks` 的回收動作改成非同步，或至少知悉這個風險存在
+  （`lib/pipeline-runner/stale-lock-reaper.ts` 檔頭有對應註解）。
 - **log 沒有 rotation，需要自行規劃**：`telegram-dispatcher/logs/` 底下的
   `*.log`（含 `launchd-*.log`、`post-run-notify.log`、`health-monitor.log`、
-  以及每次觸發 `/create-mr` 產生的 `FAQ-*.stdout.log`/`.stderr.log`）會一直
-  累積，沒有內建的自動清理或輪替機制。長期跑建議定期手動清（或另外排一個
-  簡單的 cron 清舊檔），不清也不會讓服務壞掉，只是磁碟空間會一直長。
+  `stale-lock-reaper.log`、`health-watchdog.log`，以及每次觸發 `/create-mr`
+  產生的 `FAQ-*.stdout.log`/`.stderr.log`）會一直累積，沒有內建的自動清理或
+  輪替機制。長期跑建議定期手動清（或另外排一個簡單的 cron 清舊檔），不清也
+  不會讓服務壞掉，只是磁碟空間會一直長。
+- **push/MR 建立失敗會通知維運者，不是這張 ticket 的指派人**（2026-08-23）：
+  `/create-mr` 內部 Step 6 review PASSED 就會把完成報告的 Pipeline status 定
+  為 success，即使後續 mr-pusher 的 `git push` 成功但 `glab mr create` 全數
+  失敗、把 Notion「AI分析」改回「分析失敗」也不會回頭改那份報告。
+  `post-run-notify.ts` 對每個回報 success 的 ticket 都會額外查一次 Notion 的
+  AI分析 真實值，兩者不一致時直接 TG 通知維運者（不是走一般 ticket 指派人
+  補發通知那條路——這是基礎設施層級的異常，指派人不一定有權限排查
+  push/MR 失敗原因）。
 - **cloudflared metrics server（本機 20241）不可對外開放**（2026-08-22 起，
   取代 ngrok 4040 admin/inspector 的同類風險）：預設只 bind `127.0.0.1`（見
   `run-cloudflared-tunnel.sh` 啟動時的 log「Starting metrics server on
@@ -295,9 +359,28 @@ log 或任何被 git 追蹤的檔案裡（見 T15）。
 
 `bug-lock.sh` 用 `mkdir` 做這個短暫的 race-condition mutex（見
 `scripts/bug-lock.sh`）。正常情況下 `/create-mr` 自己的 Step 8（所有出口
-路徑必經）與 T13 的 EXIT trap 安全網會確保鎖一定被釋放；如果懷疑某張單的
-鎖卡住了（例如 `claim:{ticket}` 按鈕一直回「已被其他 session 認領」，但
-實際上沒有任何背景流程真的在跑）：
+路徑必經）與 T13 的 EXIT trap 安全網會確保鎖一定被釋放。
+
+**2026-08-23 起大多數情況不需要手動處理了**：webhook server 內建
+`lib/pipeline-runner/stale-lock-reaper.ts`，每 10 分鐘掃一次所有鎖，持有
+超過 70 分鐘（遠高於 WRAPPER_SCRIPT 的 `timeout 3600` 上限，見該檔案檔頭
+註解）的鎖會被自動釋放並清理對應 worktree，Bug 工單（`FAQ-*`）額外自動重試
+一次（`ALDREQ-*` 需求單不自動重試，需人工重新認領，沿用 T36 既有的保守
+政策），每次自動回收都會 Telegram 通知維運者。這涵蓋了 T26 已知操作風險
+記錄的「手動 `kill -9` 整組砍掉背景流程」與「機器斷電重開機」這兩種 EXIT
+trap 完全沒機會執行的情境——不必再手動判斷。
+
+**只回收 dispatcher 自己 spawn 的鎖**（review 發現並修正的重要邊界）：
+`bug-lock.sh` 是全 aladdin 共用的鎖，人工在終端機互動跑 `/create-mr`、
+`/create-mrs` 批次、back-testing pipeline claim 的鎖跟 dispatcher 觸發的鎖
+用的是**同一個**鎖目錄。stale-lock-reaper 靠 `lib/pipeline-runner/
+active-pipeline-marker.ts`（dispatcher spawn 背景流程時另外寫的標記檔，跟
+`bug-lock.sh` 完全分開）分辨「這個鎖是不是我 spawn 的」——沒有標記的鎖（人工
+/批次觸發）完全不會被自動回收，就算持有超過 70 分鐘也一樣，避免打斷正在
+合法進行中的人工 review/暫停查證。
+
+以下手動排除方式保留給**逾時鎖回收還沒觸發（70 分鐘內）就想確認狀態**、或
+自動回收本身失敗（見 `logs/stale-lock-reaper.log`）的情況：
 
 ```bash
 # 查某張單目前鎖的狀態
