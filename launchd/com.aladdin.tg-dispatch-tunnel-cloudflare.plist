@@ -1,16 +1,14 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- DEPRECATED（2026-08-25）：ngrok 版，已被 com.aladdin.tg-dispatch-tunnel-cloudflare.plist
-     取代。不再 bootstrap，不會出現在 ~/Library/LaunchAgents/，僅保留本檔供緊急回退參考。 -->
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.aladdin.tg-dispatch-tunnel</string>
+    <string>com.aladdin.tg-dispatch-tunnel-cloudflare</string>
 
     <key>ProgramArguments</key>
     <array>
         <string>/bin/zsh</string>
-        <string>/Users/user/aladdin/telegram-dispatcher/launchd/run-tunnel.sh</string>
+        <string>/Users/user/aladdin/telegram-dispatcher/launchd/run-cloudflare-tunnel.sh</string>
     </array>
 
     <key>WorkingDirectory</key>
@@ -19,7 +17,7 @@
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/Users/user/.bun/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
         <key>LANG</key>
         <string>en_US.UTF-8</string>
     </dict>
@@ -30,9 +28,9 @@
     <true/>
 
     <key>StandardOutPath</key>
-    <string>/Users/user/aladdin/telegram-dispatcher/logs/launchd-tunnel.out.log</string>
+    <string>/Users/user/aladdin/telegram-dispatcher/logs/launchd-tunnel-cloudflare.out.log</string>
 
     <key>StandardErrorPath</key>
-    <string>/Users/user/aladdin/telegram-dispatcher/logs/launchd-tunnel.err.log</string>
+    <string>/Users/user/aladdin/telegram-dispatcher/logs/launchd-tunnel-cloudflare.err.log</string>
 </dict>
 </plist>

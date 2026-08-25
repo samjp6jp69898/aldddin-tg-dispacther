@@ -1,4 +1,10 @@
 #!/bin/zsh
+# DEPRECATED（2026-08-25）：已被 run-cloudflare-tunnel.sh 取代（tunnel aladdin-mcp，
+# 網域 mcp.aladdin-assistant.cc，DNS 已指到 Cloudflare Tunnel，不再指向這支腳本啟動
+# 的 ngrok 網址）。對應 launchd job com.aladdin.tg-dispatch-tunnel 已 bootout 並從
+# ~/Library/LaunchAgents/ 移除，不再自動啟動。保留本檔與同目錄 .plist 只供緊急回退
+# 參考，不會被 bootstrap。
+#
 # launchd wrapper：啟動 ngrok tunnel，指向本機 telegram-dispatcher webhook server。
 #
 # risk_notes（見 tasks.json T18）：明確不用 `ngrok service install`（會另建一

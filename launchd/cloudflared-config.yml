@@ -1,0 +1,7 @@
+tunnel: 6906f8e7-e46e-43f3-abd5-b43bbaa96e3e
+credentials-file: /Users/user/.cloudflared/6906f8e7-e46e-43f3-abd5-b43bbaa96e3e.json
+
+ingress:
+  - hostname: mcp.aladdin-assistant.cc
+    service: http://localhost:8787
+  - service: http_status:404

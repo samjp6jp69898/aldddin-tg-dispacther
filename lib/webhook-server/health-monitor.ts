@@ -2,7 +2,7 @@ import { execFileSync } from 'node:child_process'
 import { appendFileSync, mkdirSync, readFileSync } from 'node:fs'
 import { basename, join } from 'node:path'
 
-const NGROK_API_URL = 'http://127.0.0.1:4040/api/tunnels'
+const CLOUDFLARED_METRICS_URL = 'http://127.0.0.1:20241/ready'
 const TG_NOTIFY_SH = '/Users/user/aladdin/scripts/tg-notify.sh'
 // 見 cron/bug-report-run.sh 同一套維運告警慣例：維運對象（Landon）的
 // chat_id 直接寫死，不透過 tech-users.csv 查——這是給「人」的維運告警，不是
@@ -27,17 +27,18 @@ function log(msg: string): void {
 }
 
 /**
- * 唯讀查詢本機 ngrok admin API（launchd/run-tunnel.sh 沒有覆寫 --web-addr，
- * 維持預設只 bind 127.0.0.1，見 T18），判斷 tunnel 是否還活著。查不到／
- * 逾時／回應格式不對都當作不健康，不拋例外——健康檢查本身出錯不該連帶讓
- * process 掛掉。
+ * 唯讀查詢本機 cloudflared metrics `/ready`（launchd/run-cloudflare-tunnel.sh
+ * 沒有覆寫 --metrics，維持預設只 bind 127.0.0.1），判斷 tunnel 是否還活著。
+ * 2026-08-25：取代原本查 ngrok `4040/api/tunnels` 的版本（ngrok 已退役，該
+ * launchd job 已 bootout）。查不到／逾時／回應格式不對都當作不健康，不拋
+ * 例外——健康檢查本身出錯不該連帶讓 process 掛掉。
  */
-export async function checkNgrokTunnelReachable(apiUrl: string = NGROK_API_URL): Promise<boolean> {
+export async function checkCloudflaredTunnelReachable(apiUrl: string = CLOUDFLARED_METRICS_URL): Promise<boolean> {
   try {
     const res = await fetch(apiUrl, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) })
     if (!res.ok) return false
-    const data = (await res.json()) as { tunnels?: unknown }
-    return Array.isArray(data.tunnels) && data.tunnels.length > 0
+    const data = (await res.json()) as { readyConnections?: unknown }
+    return typeof data.readyConnections === 'number' && data.readyConnections > 0
   } catch {
     return false
   }
@@ -122,9 +123,10 @@ export type HealthMonitor = {
 
 /**
  * T19：週期性健康檢查。risk_notes 講的核心風險是『KeepAlive 只保證 process
- * 存活，不保證 ngrok tunnel 真的還連著』（ngrok 免費方案同時間只允許 1 個
- * agent session，被踢下線後 bun server 本身完全不會發現）——這裡直接查
- * ngrok 本機 admin API 判斷 tunnel 是否還在，只在『健康 ↔ 不健康』狀態真的
+ * 存活，不保證 tunnel 真的還連著』（2026-08-25 起 tunnel 換成 Cloudflare
+ * Tunnel，但這個風險本質不變：cloudflared 行程活著不代表它跟 Cloudflare 邊緣
+ * 的連線還在，bun server 本身完全不會發現）——這裡直接查 cloudflared 本機
+ * metrics API 判斷 tunnel 是否還在，只在『健康 ↔ 不健康』狀態真的
  * 翻轉時才發 tg-notify.sh（避免每次 tick 都通知洗版），第一次檢查只記基準
  * 值不發通知（避免程式剛啟動、tunnel 還沒起來就誤報）。用 setInterval 做
  * 週期排程——硬規則明文允許的合法用途（週期性排程器），不是拿 sleep/輪詢
@@ -145,7 +147,7 @@ export function createHealthMonitor(
     registryPaths?: string[]
   } = {},
 ): HealthMonitor {
-  const apiUrl = deps.apiUrl ?? NGROK_API_URL
+  const apiUrl = deps.apiUrl ?? CLOUDFLARED_METRICS_URL
   const chatId = deps.chatId ?? OPERATOR_CHAT_ID
   const registryPaths = deps.registryPaths ?? TOKEN_REGISTRY_PATHS
   const notify =
@@ -197,7 +199,7 @@ export function createHealthMonitor(
   async function runOnce(): Promise<boolean> {
     checkRegistries()
 
-    const healthy = await checkNgrokTunnelReachable(apiUrl)
+    const healthy = await checkCloudflaredTunnelReachable(apiUrl)
 
     if (lastKnownHealthy === null) {
       lastKnownHealthy = healthy
@@ -206,8 +208,8 @@ export function createHealthMonitor(
     if (healthy !== lastKnownHealthy) {
       lastKnownHealthy = healthy
       const text = healthy
-        ? '✅ [dispatcher 健康檢查] ngrok tunnel 已恢復連線'
-        : '⚠️ [dispatcher 健康檢查] ngrok tunnel 偵測不到（本機 4040 admin API 打不到或沒有 active tunnel），Telegram webhook 可能已經收不到訊息，請檢查 tunnel 是否被踢下線'
+        ? '✅ [dispatcher 健康檢查] Cloudflare tunnel 已恢復連線'
+        : '⚠️ [dispatcher 健康檢查] Cloudflare tunnel 偵測不到（本機 20241 metrics API 打不到或 readyConnections=0），Telegram webhook 可能已經收不到訊息，請檢查 cloudflared 行程是否還在跑'
       notify(text)
     }
     return healthy
