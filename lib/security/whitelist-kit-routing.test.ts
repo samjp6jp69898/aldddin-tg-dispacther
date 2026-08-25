@@ -72,6 +72,33 @@ describe('registerHandlers — /kit 路由（mock 掉 runKitScript，只測路�
     }
   })
 
+  test('kitAdmin + 核發成功：zip 之後補發一則可直接轉傳給企劃的使用說明（含 name 與中文環境標籤）', async () => {
+    process.env.TG_KIT_ADMIN_CHAT_ID = String(KIT_ADMIN_CHAT_ID)
+    const testId = 'kit-usage-text-test-fixture'
+    const distDir = join(KIT_DIST_DIR, testId)
+    mkdirSync(distDir, { recursive: true })
+    writeFileSync(join(distDir, 'dummy.txt'), 'hello')
+
+    try {
+      runKitScriptMock.mockImplementationOnce(() => ({ success: true, stdout: '完成：測試輸出', stderr: '' }))
+      const handlers = captureHandlers()
+      const ctx = makeCtx({ chat: { id: KIT_ADMIN_CHAT_ID }, message: { text: `/kit ${testId} 信融` } })
+      await handlers['message']!(ctx)
+
+      // 第 1 則 reply 是 runKitScript 的 stdout、第 2 則是給企劃的使用說明
+      expect(ctx.reply).toHaveBeenCalledTimes(2)
+      const usageText = String(ctx.reply.mock.calls[1]![0])
+      expect(usageText).toContain('信融')
+      // 未指定 grants 時用預設環境，且以中文標籤呈現、不出現原始 key
+      expect(usageText).toContain('後台管理')
+      expect(usageText).toContain('平台管理')
+      expect(usageText).not.toContain('admin-dev')
+      expect(usageText).not.toContain('platform-dev-pk')
+    } finally {
+      rmSync(distDir, { recursive: true, force: true })
+    }
+  })
+
   test('kitAdmin + runKitScript 失敗（例如 id 已存在未加 rotate）：原樣回 stderr，不打包不送檔案', async () => {
     process.env.TG_KIT_ADMIN_CHAT_ID = String(KIT_ADMIN_CHAT_ID)
     runKitScriptMock.mockImplementationOnce(() => ({ success: false, stdout: '', stderr: 'id "angelo" 已經存在，本次不做任何修改' }))
