@@ -5,6 +5,14 @@ const execFileAsync = promisify(execFile)
 
 const NOTION_SH = '/Users/user/aladdin/scripts/notion.sh'
 const DATA_SOURCE_ID = '21c87d78-618a-817f-ae71-000baa9ab11b'
+// 2026-08-23 review 發現：queryTicketPage 原本（getTicketNotionUrl 既有的
+// execFileSync 呼叫）沒有帶 timeout，跟這個檔案的 queryCandidateTickets、
+// post-run-notify.ts 其他所有 execFileSync 呼叫都刻意帶 timeout 的既有慣例
+//不一致。原本只有 NEEDS_NOTIFY 那四種失敗分類會走到 getTicketNotionUrl，
+// 現在 post-run-notify.ts 的 checkPushMismatch 讓 getTicketAiAnalysisStatus
+// 在**每一個 success 分類**都會呼叫一次——若 notion.sh 卡住，會讓收尾流程
+// 無限期不返回。補上跟其他檔案一致的 30 秒上限。
+const EXEC_TIMEOUT_MS = 30_000
 
 // 唯一可認領判準（見 tasks.json architecture_summary / changelog：使用者定案，
 // 不再拿 tracker.sh row 的 pending/rerun 狀態做二次篩選）。
@@ -64,10 +72,11 @@ export async function queryCandidateTickets(notionUserId: string): Promise<strin
 }
 
 /**
- * 查單一 ticket 目前在 Notion 的頁面 URL（給 T7 tracker.md 技術同步用）。
- * ticket 格式不是 FAQ-{number} 或查無此單都回傳 null，不丟例外。
+ * 依單號查該 ticket 在 Notion 的完整頁面物件（含 url／properties），供
+ * getTicketNotionUrl／getTicketAiAnalysisStatus 共用同一次查詢邏輯。ticket
+ * 格式不是 FAQ-{number} 或查無此單都回傳 null，不丟例外。
  */
-export function getTicketNotionUrl(ticket: string): string | null {
+function queryTicketPage(ticket: string): { url?: string; properties?: Record<string, unknown> } | null {
   const match = /^FAQ-(\d+)$/.exec(ticket)
   if (!match) return null
 
@@ -75,9 +84,32 @@ export function getTicketNotionUrl(ticket: string): string | null {
   const raw = execFileSync('bash', [NOTION_SH, 'query-datasource', DATA_SOURCE_ID, JSON.stringify(filter)], {
     encoding: 'utf8',
     maxBuffer: 10 * 1024 * 1024,
+    timeout: EXEC_TIMEOUT_MS,
   })
 
   const parsed = JSON.parse(raw)
   if (!Array.isArray(parsed.results) || parsed.results.length === 0) return null
-  return parsed.results[0]?.url ?? null
+  return parsed.results[0] ?? null
+}
+
+/**
+ * 查單一 ticket 目前在 Notion 的頁面 URL（給 T7 tracker.md 技術同步用）。
+ * ticket 格式不是 FAQ-{number} 或查無此單都回傳 null，不丟例外。
+ */
+export function getTicketNotionUrl(ticket: string): string | null {
+  return queryTicketPage(ticket)?.url ?? null
+}
+
+/**
+ * 查單一 ticket 目前在 Notion 的「AI分析」select 值（如「分析成功」／
+ * 「分析失敗」）。給 post-run-notify.ts 偵測『pipeline 回報 success，但
+ * mr-pusher 實際 push/glab mr create 全數失敗、已把這個欄位改成分析失敗』
+ * 這種不一致情境用（見該檔案頭已知限制註解）。查無此單或欄位不存在都回傳
+ * null，不丟例外——這是 best-effort 的補充判斷，不是唯一真相來源。
+ */
+export function getTicketAiAnalysisStatus(ticket: string): string | null {
+  const page = queryTicketPage(ticket)
+  const prop = page?.properties?.['AI分析'] as { select?: { name?: unknown } } | undefined
+  const name = prop?.select?.name
+  return typeof name === 'string' ? name : null
 }

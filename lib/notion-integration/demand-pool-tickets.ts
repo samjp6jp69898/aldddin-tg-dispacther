@@ -56,15 +56,15 @@ export async function queryDemandPoolTickets(notionUserId: string): Promise<stri
   if (!Array.isArray(parsed.results)) {
     throw new Error(`notion.sh query-datasource 回傳非預期格式: ${raw.slice(0, 500)}`)
   }
-  // T31 review 發現：notion.sh query-datasource 與這裡都沒有處理分頁
-  // （固定 page_size 100，不追 has_more/next_cursor）。實測今天單一技術
-  // 人員最多只有 2 張候選單，離 100 很遠，但這是『靜默丟資料』風險——比起
-  // 直接報錯更危險，所以在這裡明確攔一次：一旦真的撞到 has_more，寧可整個
-  // 查詢失敗（使用者會看到明確錯誤、下次重試或回報），也不要悄悄回傳不完整
-  // 的候選單清單。不在這裡動 notion.sh 本身（整個 aladdin 共用的腳本，改動
-  // 範圍與影響超出 T31）。
+  // T31 review 當時發現：notion.sh query-datasource 與這裡都沒有處理分頁
+  // （固定 page_size 100，不追 has_more/next_cursor），是『靜默丟資料』
+  // 風險。2026-08-23 已在 notion.sh 本身修好（自動追完所有分頁再合併，見
+  // scripts/notion.sh query-datasource 註解，已用真實 4232 筆資料的查詢
+  // 驗證過），has_more 現在保證恆為 false。這裡的檢查改留著當防禦性斷言
+  // （不刪掉，成本趨近於零）：萬一之後 notion.sh 的分頁邏輯有 regression，
+  // 這裡仍會 fail-loud 而不是悄悄回傳不完整清單。
   if (parsed.has_more) {
-    throw new Error('notion.sh query-datasource 回傳 has_more=true（超過單頁 100 筆），目前未實作分頁，拒絕回傳不完整的候選單清單')
+    throw new Error('notion.sh query-datasource 回傳 has_more=true（預期不會發生，notion.sh 應已內部追完分頁），拒絕回傳不完整的候選單清單')
   }
 
   // 這個 database 的 unique_id 屬性名稱是『ID』（Bug List 是『單號』）——

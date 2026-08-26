@@ -2,6 +2,7 @@ import { mkdirSync, appendFileSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { spawnDetachedProcess } from './spawn-create-mr.ts'
 import { createConcurrencyLimiter } from './concurrency-limiter.ts'
+import { markPipelineActive, clearPipelineActive } from './active-pipeline-marker.ts'
 
 const LOG_DIR = '/Users/user/aladdin/telegram-dispatcher/logs'
 const SPAWN_ERROR_LOG = join(LOG_DIR, 'spawn-errors.log')
@@ -70,15 +71,24 @@ export function spawnDemandPipeline(ticket: string, assigneeEmail: string): { ok
     const stdoutPath = join(LOG_DIR, `${base}.stdout.log`)
     const stderrPath = join(LOG_DIR, `${base}.stderr.log`)
 
+    // T26 review 修正：標記「這張需求單是 dispatcher 觸發的」，理由與作法比照
+    // spawn-create-mr.ts（見 active-pipeline-marker.ts 檔頭註解）——
+    // stale-lock-reaper.ts 只會對有這份標記的 ticket 動手。
+    markPipelineActive(ticket)
+
     const pid = spawnDetachedProcess('bash', ['-c', WRAPPER_SCRIPT, 'run-demand-pipeline', ticket, assigneeEmail], {
       cwd: '/Users/user/aladdin/telegram-dispatcher',
       stdoutPath,
       stderrPath,
-      onExit: () => concurrencyLimiter.release(),
+      onExit: () => {
+        concurrencyLimiter.release()
+        clearPipelineActive(ticket)
+      },
     })
     return { ok: true, pid }
   } catch (err) {
     concurrencyLimiter.release()
+    clearPipelineActive(ticket)
     mkdirSync(dirname(SPAWN_ERROR_LOG), { recursive: true })
     appendFileSync(SPAWN_ERROR_LOG, `${new Date().toISOString()} spawnDemandPipeline 失敗（${ticket}）: ${err}\n`)
     return { ok: false, reason: 'spawn_error' }

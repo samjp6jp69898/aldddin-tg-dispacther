@@ -72,13 +72,15 @@ async function fetchBlocksText(blockOrPageId: string, depth = 0): Promise<string
   })
   const parsed = JSON.parse(stdout)
   if (!Array.isArray(parsed.results)) return ''
-  // review 發現：跟 T31 的 queryDemandPoolTickets 同一種風險——notion.sh
+  // review 當時發現：跟 T31 的 queryDemandPoolTickets 同一種風險——notion.sh
   // fetch-blocks 固定 page_size=100，不處理 has_more/next_cursor，一個 block
-  // 底下超過 100 個子區塊會靜默漏掉。沿用 T31 的 fail-loud 慣例：寧可整個
-  // 判斷失敗（呼叫端知道要重試/人工介入），也不要用不完整的內容餵給 LLM
-  // 判斷，那樣產出的『規格不足』或『規格充足』都不可信。
+  // 底下超過 100 個子區塊會靜默漏掉。2026-08-23 已在 notion.sh 本身修好
+  // （自動追完所有分頁再合併，見 scripts/notion.sh fetch-blocks 註解），
+  // has_more 現在保證恆為 false。這裡的檢查改留著當防禦性斷言（成本趨近於
+  // 零）：萬一之後 notion.sh 的分頁邏輯有 regression，仍會 fail-loud（呼叫端
+  // 知道要重試/人工介入），不會用不完整的內容餵給 LLM 判斷。
   if (parsed.has_more) {
-    throw new Error(`notion.sh fetch-blocks（${blockOrPageId}）回傳 has_more=true，目前未實作分頁，拒絕用不完整的內容做判斷`)
+    throw new Error(`notion.sh fetch-blocks（${blockOrPageId}）回傳 has_more=true（預期不會發生，notion.sh 應已內部追完分頁），拒絕用不完整的內容做判斷`)
   }
 
   const parts: string[] = []

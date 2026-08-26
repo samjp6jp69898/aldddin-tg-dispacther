@@ -2,7 +2,8 @@ import { readFileSync, appendFileSync, mkdirSync } from 'node:fs'
 import { execFileSync } from 'node:child_process'
 import { join } from 'node:path'
 import { classifyPipelineResult, type Classification } from './classify-result.ts'
-import { getTicketNotionUrl } from '../notion-integration/candidate-tickets.ts'
+import { getTicketNotionUrl, getTicketAiAnalysisStatus } from '../notion-integration/candidate-tickets.ts'
+import { notifyOperator } from '../notify/operator.ts'
 
 const RESOLVE_REVIEWER_SH = '/Users/user/aladdin/scripts/resolve-reviewer.sh'
 const TG_NOTIFY_SH = '/Users/user/aladdin/scripts/tg-notify.sh'
@@ -32,12 +33,17 @@ const EXEC_TIMEOUT_MS = 30_000
 // （2026-08-14 使用者定案：infra_failure/cli_failure 併入補發範圍，見
 // tasks.json changelog）。
 //
-// 已知限制（review 發現，非本 task 範圍，未處理）：mr-pusher 若 push 成功但
-// glab mr create 失敗（部分成功），create-mr.md 的 Step 6 review PASSED 當下
-// 就已把 pipeline_status 定為 success，Step 7 mr-pusher 之後即使改寫 Notion
-// AI分析 為「分析失敗」也不會回頭改 Step 9 報告裡的 Pipeline status 那一行；
-// classify-result.ts 解析的正是那一行，因此這種部分成功情境目前仍會被歸類
-// 為 'success' 而不補發通知。
+// 2026-08-23 補：mr-pusher 若 push 成功但 glab mr create 全數失敗（部分成
+// 功），create-mr.md 的 Step 6 review PASSED 當下就已把 pipeline_status 定為
+// success，Step 7 mr-pusher 之後即使改寫 Notion AI分析 為「分析失敗」也不會
+// 回頭改 Step 9 報告裡的 Pipeline status 那一行；classify-result.ts 解析的
+// 正是那一行，因此這種部分成功情境會被歸類為 'success'，走不到下面
+// NEEDS_NOTIFY 那組。這裡不改 classify-result.ts／create-mr.md（後者是共用
+// 檔、屬維護協定紅區），改成在 main() 裡對 'success' 分類額外查一次 Notion
+// 目前的 AI分析 真實值：兩者不一致（回報 success、Notion 卻是分析失敗）時，
+// 直接通知 Landon（見 checkPushMismatch），不透過 NEEDS_NOTIFY／assignee 那條
+// 既有路徑——這是給維運者的基礎設施層級警示，不是給 ticket 指派人的一般
+// 補發通知。
 const NEEDS_NOTIFY = new Set<Classification>(['skipped', 'infra_failure', 'cli_failure', 'unknown_failure'])
 
 export function shouldNotify(classification: Classification): boolean {
@@ -76,6 +82,51 @@ ${stderrPath}`
 }
 
 /**
+ * classification === 'success' 時的額外一道檢查：pipeline 自己回報成功，
+ * 不代表 mr-pusher 的 git push / glab mr create 真的都成功——見上方
+ * NEEDS_NOTIFY 註解說明的已知落差。這裡直接查 Notion 目前的 AI分析 真實值，
+ * 若是「分析失敗」（mr-pusher 的既有邏輯：只有『沒有任何 MR 成功送出』才會
+ * 設這個值，見 mr-pusher.md Step 4 設定值決策矩陣），代表兩者不一致，通知
+ * Landon（維運者，不是這張 ticket 的指派人——這是基礎設施層級的異常，指派
+ * 人不一定有權限/知識排查 push/MR 失敗原因）。
+ *
+ * best-effort：查詢本身失敗（Notion API 掛掉等）只記 log，不影響呼叫端既有
+ * 的分類/通知流程。deps 可覆寫（測試用，不必真的打 Notion/Telegram API）。
+ */
+export function checkPushMismatch(
+  ticket: string,
+  classification: Classification,
+  stdoutPath: string,
+  stderrPath: string,
+  deps: { getAiAnalysisStatus?: (ticket: string) => string | null; notify?: (text: string) => boolean } = {},
+): void {
+  if (classification !== 'success') return
+
+  const getAiAnalysisStatus = deps.getAiAnalysisStatus ?? getTicketAiAnalysisStatus
+  const notify = deps.notify ?? notifyOperator
+
+  let aiStatus: string | null
+  try {
+    aiStatus = getAiAnalysisStatus(ticket)
+  } catch (err) {
+    log(`${ticket} push mismatch 檢查失敗（查詢 Notion AI分析 出錯）: ${err}`)
+    return
+  }
+  if (aiStatus !== '分析失敗') return
+
+  log(`${ticket} pipeline 回報 success 但 Notion AI分析=分析失敗，疑似 push 成功但 glab mr create 全數失敗，通知 Landon`)
+  const text = `🚨 [push 失敗警示] ${ticket}
+/create-mr 回報流程成功，但 Notion「AI分析」欄位卻是「分析失敗」——極可能是 mr-pusher 的 git push 成功、但 glab mr create 全數失敗（見 mr-pusher.md Step 4 設定值決策矩陣），請人工檢查：
+${stdoutPath}
+${stderrPath}`
+  if (notify(text)) {
+    log(`${ticket} 已通知 Landon（push mismatch）`)
+  } else {
+    log(`${ticket} 通知 Landon 失敗（push mismatch）`)
+  }
+}
+
+/**
  * T13 CLI 進入點：從 bash EXIT trap 呼叫（見 spawn-create-mr.ts），
  * argv = [ticket, exitCode, stdoutPath]。stderrPath 用命名慣例（T11 固定
  * `{base}.stdout.log` / `{base}.stderr.log` 成對）推回來，不用多帶一個參數。
@@ -100,6 +151,9 @@ function main(): void {
   const classification = classifyPipelineResult(Number(exitCodeRaw), stdoutContent)
   log(`${ticket} classification=${classification} exitCode=${exitCodeRaw}`)
 
+  const stderrPath = stdoutPath.replace(/\.stdout\.log$/, '.stderr.log')
+  checkPushMismatch(ticket, classification, stdoutPath, stderrPath)
+
   if (!shouldNotify(classification)) return
 
   const email = resolveAssigneeEmail(ticket)
@@ -108,7 +162,6 @@ function main(): void {
     return
   }
 
-  const stderrPath = stdoutPath.replace(/\.stdout\.log$/, '.stderr.log')
   const text = buildNotifyText(ticket, classification, stdoutPath, stderrPath)
 
   try {
