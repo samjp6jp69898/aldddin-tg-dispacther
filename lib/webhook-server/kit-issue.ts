@@ -1,5 +1,5 @@
 /**
- * kit-issue.ts — Telegram `/kit <id> <name> [grants=env1,env2] [rotate]` 指令。
+ * kit-issue.ts — Telegram `/kit <id> <name> [grants=env1,env2|all] [rotate]` 指令。
  *
  * 只有 TG_KIT_ADMIN_CHAT_ID 這一個 chat_id 能觸發（見 isKitAdminChat；呼叫端
  * whitelist.ts 額外做這道檢查，不是靠 Telegram 的「/」選單 scope 隱藏就夠
@@ -13,7 +13,7 @@
  * (3) 補發一則可直接轉傳給企劃的使用說明文字。
  */
 import { execFileSync } from 'node:child_process'
-import { existsSync, mkdtempSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { InputFile, type Context } from 'grammy'
@@ -29,7 +29,7 @@ export function isKitAdminChat(chatId: string): boolean {
 
 type ParsedKitCommand = { ok: true; id: string; name: string; grants?: string; rotate: boolean } | { ok: false; error: string }
 
-const USAGE = '用法：/kit <id> <name> [grants=env1,env2] [rotate]\n例：/kit angelo 信融\n例：/kit angelo 信融 grants=admin-dev,platform-dev-pk,admin-pre,admin-evi rotate'
+const USAGE = '用法：/kit <id> <name> [grants=env1,env2|all] [rotate]\n例：/kit angelo 信融\n例：/kit angelo 信融 grants=all rotate\n例：/kit angelo 信融 grants=admin-dev,platform-dev-pk,admin-pre,admin-evi rotate'
 
 /**
  * name 允許含空白（保險起見；實務上多是不含空白的中文/英文代稱）：從指令
@@ -64,28 +64,43 @@ export function parseKitCommand(text: string): ParsedKitCommand {
 }
 
 /**
- * grants key → 給企劃看的中文環境標籤。key 對應 make-starter-kit.ts 的
- * ALLOWED_GRANTS；沒對照到的 key 原樣顯示（理論上不會發生——能走到組訊息
- * 這一步表示 runKitScript 已成功，不合法的 grants 在腳本那關就被擋下了）。
+ * .mcp.json 裡的 server 別名（make-starter-kit.ts 的 GrantConfig.alias，
+ * 外加唯讀併入的 aladdin-toolsmith）→ 給企劃/工程師看的中文環境標籤。沒對照
+ * 到的別名原樣顯示（理論上不會發生，除非兩邊清單漂移）。
  */
-const GRANT_LABELS: Record<string, string> = {
-  'admin-dev': '後台管理（dev）',
-  'admin-pre': '後台管理（pre/cqa）',
-  'admin-evi': '後台管理（evi）',
-  'platform-dev-pk': '平台管理（dev × PK）',
+const ALIAS_LABELS: Record<string, string> = {
+  'aladdin-admin-dev': '後台管理（dev）',
+  'aladdin-admin-pre': '後台管理（pre/cqa）',
+  'aladdin-admin-evi': '後台管理（evi）',
+  'aladdin-platform-dev-pk': '平台管理（dev × PK）',
+  'aladdin-toolsmith': 'toolsmith（工程師）',
 }
 
-/** 與 make-starter-kit.ts 的 DEFAULT_GRANTS 對齊：--grants 未指定時腳本用的預設值。 */
-const DEFAULT_GRANT_KEYS = ['admin-dev', 'platform-dev-pk']
+/**
+ * 讀 dist/<id>/.mcp.json 實際含哪些 server 別名——用來組使用說明時，永遠反映
+ * 這次真正交付出去的內容（而不是這次 --grants 請求了什麼：既有環境「一併
+ * 帶入」時也要出現在說明裡，見 make-starter-kit.ts 對 allGrantsForId 的說明）。
+ * 讀不到（檔案不存在/格式異常）就回空陣列，呼叫端據此自行決定 fallback。
+ */
+export function readDistAliases(id: string): string[] {
+  const mcpJsonPath = join(KIT_DIST_DIR, id, '.mcp.json')
+  if (!existsSync(mcpJsonPath)) return []
+  try {
+    const parsed = JSON.parse(readFileSync(mcpJsonPath, 'utf-8'))
+    return Object.keys(parsed?.mcpServers ?? {})
+  } catch {
+    return []
+  }
+}
 
 /**
- * 組一段可以直接轉傳給企劃的使用說明（純文字；Telegram 訊息本身就能轉傳，
- * 不需要特殊格式）。內容是 kit README.md 的濃縮版——完整手冊就在 kit
+ * 組一段可以直接轉傳給企劃/工程師的使用說明（純文字；Telegram 訊息本身就能
+ * 轉傳，不需要特殊格式）。內容是 kit README.md 的濃縮版——完整手冊就在 kit
  * 資料夾裡，這裡只放對方拿到 zip 當下最需要知道的幾件事。
+ * export 給 kit-resend.ts（tg-monitor「重發 token」的 CLI）重用，避免兩份漂移。
  */
-function buildKitUsageText(name: string, grants?: string): string {
-  const keys = grants ? grants.split(',').map((g) => g.trim()).filter(Boolean) : DEFAULT_GRANT_KEYS
-  const labels = keys.map((k) => GRANT_LABELS[k] ?? k).join('、')
+export function buildKitUsageText(name: string, aliases: string[]): string {
+  const labels = aliases.map((a) => ALIAS_LABELS[a] ?? a).join('、')
   return [
     `${name} 你好，這個壓縮檔是你的 agrabah 後台 AI 助理工具包（kit）。`,
     '',
@@ -141,8 +156,10 @@ export async function handleKitCommand(ctx: Context, text: string): Promise<void
     await ctx.reply(result.stdout.trim())
     await ctx.replyWithDocument(new InputFile(zipPath, `${parsed.id}-kit.zip`))
     // zip 之後補一則給企劃的使用說明：Landon 直接把這則訊息＋zip 轉傳給
-    // 對方即可，不用每次自己重打一份「怎麼裝」。
-    await ctx.reply(buildKitUsageText(parsed.name, parsed.grants))
+    // 對方即可，不用每次自己重打一份「怎麼裝」。標籤依實際寫進 .mcp.json 的
+    // 別名反推，不是這次 --grants 請求了什麼（既有環境「一併帶入」時也要
+    // 出現在說明裡）。
+    await ctx.reply(buildKitUsageText(parsed.name, readDistAliases(parsed.id)))
   } finally {
     rmSync(workDir, { recursive: true, force: true })
   }
