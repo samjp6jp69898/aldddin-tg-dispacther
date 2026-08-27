@@ -13,7 +13,7 @@ const TG_NOTIFY_SH = '/Users/user/aladdin/scripts/tg-notify.sh'
 
 // review 發現：run-demand-pipeline.ts 內部每個外部呼叫都各自有 timeout，
 // 但整支腳本本身沒有一個外層總時限——跟 create-mr 的 WRAPPER_SCRIPT 用
-// `timeout 3600` 包住整條 pipeline、且用 bash EXIT trap 保證『不管 claude -p
+// `timeout 7200` 包住整條 pipeline、且用 bash EXIT trap 保證『不管 claude -p
 // 是正常結束還是被 timeout 殺，鎖都會釋放』不同，這裡原本只靠 TypeScript
 // try/finally，一旦這支 Bun 腳本本身被外部機制強制終止（SIGKILL 不可被
 // try/finally 攔截），鎖永遠不會釋放。已改成比照 spawn-create-mr.ts 的
@@ -22,7 +22,7 @@ const TG_NOTIFY_SH = '/Users/user/aladdin/scripts/tg-notify.sh'
 // 仍是主要路徑，正常結束時就會執行；trap 只在它沒機會執行時補上，
 // bug-lock.sh release 對已釋放的鎖是 no-op，兩邊都呼叫無害）。
 const TICKET_RE = /^ALDREQ-\d+$/
-const OUTER_TIMEOUT_SECONDS = 3600 // 跟 create-mr 的既有值一致，run-demand-pipeline.ts 內部各步驟 timeout 加總的最壞情況遠低於這個值
+const OUTER_TIMEOUT_SECONDS = 7200 // 跟 create-mr 的既有值一致，run-demand-pipeline.ts 內部各步驟 timeout 加總的最壞情況遠低於這個值
 
 const WRAPPER_SCRIPT = `
 trap '
@@ -35,12 +35,13 @@ trap '
 timeout ${OUTER_TIMEOUT_SECONDS} bun ${RUN_DEMAND_PIPELINE_TS} "$1" "$2"
 `
 
-// 使用者 2026-08-17 定案：需求 pipeline 的全域併發上限跟 Bug pipeline
-// （T26，N=5）不共用同一個計數器，用獨立的計數器與較低的上限（N=2）。理由：
-// 需求 pipeline 是全新、範圍完整性還沒被充分驗證的 pipeline（T35 回溯測試
-// 已證實跨 repo 需求有真實遺漏風險），不該讓它跟已經穩定運作、有既有信任
-// 基礎的 Bug pipeline 搶額度；上限給得比 Bug 保守，符合『新東西先保守』。
-export const DEMAND_CONCURRENCY_LIMIT = 2
+// 需求 pipeline 的全域併發上限跟 Bug pipeline（T26，N=5）不共用同一個計數器，
+// 用獨立的計數器。原本 2026-08-17 定案為保守值 N=2（理由：需求 pipeline 當時
+// 是全新、範圍完整性還沒被充分驗證的 pipeline，T35 回溯測試已證實跨 repo
+// 需求有真實遺漏風險，不該跟已穩定運作的 Bug pipeline 搶額度）。
+// 2026-08-27 使用者定案調高為 N=6：明確知情此值已超過 Bug pipeline 上限，
+// 仍要求調整，非因 T35 風險已解除。
+export const DEMAND_CONCURRENCY_LIMIT = 6
 const concurrencyLimiter = createConcurrencyLimiter(DEMAND_CONCURRENCY_LIMIT)
 
 /**
