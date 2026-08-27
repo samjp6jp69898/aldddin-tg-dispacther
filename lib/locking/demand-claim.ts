@@ -108,7 +108,7 @@ export async function handleDemandClaim(ctx: Context, techUser: TechUser, ticket
     releaseLock(ticket)
   }
 
-  const spawnResult = spawnDemandPipeline(ticket, techUser.email)
+  const spawnResult = spawnDemandPipeline(ticket, techUser.email, techUser)
   if (!spawnResult.ok) {
     // 跟 claim.ts 對 Bug pipeline 的既有處理方式一致：併發滿載/spawn 失敗都
     // 要有明確、不同的回覆，不能讓使用者以為流程已經在跑。review 發現並

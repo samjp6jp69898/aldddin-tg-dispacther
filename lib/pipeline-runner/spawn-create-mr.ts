@@ -1,8 +1,9 @@
 import { spawn } from 'node:child_process'
-import { openSync, closeSync, mkdirSync, appendFileSync } from 'node:fs'
+import { openSync, closeSync, mkdirSync, appendFileSync, writeFileSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { GLOBAL_CONCURRENCY_LIMIT, createConcurrencyLimiter } from './concurrency-limiter.ts'
 import { markPipelineActive, clearPipelineActive } from './active-pipeline-marker.ts'
+import type { TechUser } from '../user-resolution/tech-user.ts'
 
 const LOG_DIR = '/Users/user/aladdin/telegram-dispatcher/logs'
 const SPAWN_ERROR_LOG = join(LOG_DIR, 'spawn-errors.log')
@@ -221,6 +222,7 @@ timeout 3600 ${CLAUDE_BIN} -p "/create-mr:create-mr $1" --model opus --permissio
  */
 export function spawnCreateMr(
   ticket: string,
+  opts: { triggeredBy?: TechUser } = {},
 ): { ok: true; pid: number | undefined } | { ok: false; reason: 'concurrency_limit' | 'spawn_error' } {
   if (!TICKET_RE.test(ticket)) {
     throw new Error(`拒絕 spawn：ticket 格式不對（${ticket}），可能是注入嘗試`)
@@ -235,6 +237,23 @@ export function spawnCreateMr(
     const base = `${ticket}.${timestamp}`
     const stdoutPath = join(LOG_DIR, `${base}.stdout.log`)
     const stderrPath = join(LOG_DIR, `${base}.stderr.log`)
+
+    // tg-monitor「發起人」欄位讀這份 sidecar（同 base 名，見該 repo
+    // lib/ingest.ts 的 scanPipelineRuns）——記錄的是「當時點擊 Telegram 認領
+    // 這張單的人」，不是 Notion 當前指派（那個欄位事後會被改派掉，例如轉測試
+    // 給非技術人員，跟「誰觸發了這次分析」是兩件事，2026-08-27 使用者要求
+    // 分開）。best-effort：寫檔失敗不阻斷 spawn，只是這次 run 之後顯示不出
+    // 發起人。
+    if (opts.triggeredBy) {
+      try {
+        writeFileSync(
+          join(LOG_DIR, `${base}.triggered-by.json`),
+          JSON.stringify({ name: opts.triggeredBy.notion_user_name, email: opts.triggeredBy.email, at: new Date().toISOString() }),
+        )
+      } catch {
+        // best-effort，理由同上。
+      }
+    }
 
     // T26 review 修正：在真的 spawn 之前標記「這張單是 dispatcher 觸發的」
     // （見 active-pipeline-marker.ts 檔頭註解）——stale-lock-reaper.ts 只會

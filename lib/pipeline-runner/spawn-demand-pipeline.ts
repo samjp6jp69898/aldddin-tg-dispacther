@@ -1,8 +1,9 @@
-import { mkdirSync, appendFileSync } from 'node:fs'
+import { mkdirSync, appendFileSync, writeFileSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { spawnDetachedProcess } from './spawn-create-mr.ts'
 import { createConcurrencyLimiter } from './concurrency-limiter.ts'
 import { markPipelineActive, clearPipelineActive } from './active-pipeline-marker.ts'
+import type { TechUser } from '../user-resolution/tech-user.ts'
 
 const LOG_DIR = '/Users/user/aladdin/telegram-dispatcher/logs'
 const SPAWN_ERROR_LOG = join(LOG_DIR, 'spawn-errors.log')
@@ -56,7 +57,11 @@ const concurrencyLimiter = createConcurrencyLimiter(DEMAND_CONCURRENCY_LIMIT)
  * 防護會讓「脫離 demand-claim.ts 呼叫鏈直接呼叫」的情境完全沒有格式檢查，
  * 已補上，防禦深度跟 Bug pipeline 對等。
  */
-export function spawnDemandPipeline(ticket: string, assigneeEmail: string): { ok: true; pid: number | undefined } | { ok: false; reason: 'concurrency_limit' | 'spawn_error' } {
+export function spawnDemandPipeline(
+  ticket: string,
+  assigneeEmail: string,
+  triggeredBy?: TechUser,
+): { ok: true; pid: number | undefined } | { ok: false; reason: 'concurrency_limit' | 'spawn_error' } {
   if (!TICKET_RE.test(ticket)) {
     throw new Error(`拒絕 spawn：ticket 格式不對（${ticket}），可能是注入嘗試`)
   }
@@ -70,6 +75,18 @@ export function spawnDemandPipeline(ticket: string, assigneeEmail: string): { ok
     const base = `${ticket}.${timestamp}.demand-pipeline`
     const stdoutPath = join(LOG_DIR, `${base}.stdout.log`)
     const stderrPath = join(LOG_DIR, `${base}.stderr.log`)
+
+    // 比照 spawn-create-mr.ts 同名 sidecar 機制，見該檔案註解。
+    if (triggeredBy) {
+      try {
+        writeFileSync(
+          join(LOG_DIR, `${base}.triggered-by.json`),
+          JSON.stringify({ name: triggeredBy.notion_user_name, email: triggeredBy.email, at: new Date().toISOString() }),
+        )
+      } catch {
+        // best-effort，理由同 spawn-create-mr.ts。
+      }
+    }
 
     // T26 review 修正：標記「這張需求單是 dispatcher 觸發的」，理由與作法比照
     // spawn-create-mr.ts（見 active-pipeline-marker.ts 檔頭註解）——

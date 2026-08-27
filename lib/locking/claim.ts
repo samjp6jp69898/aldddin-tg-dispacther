@@ -80,7 +80,7 @@ export async function handleClaim(ctx: Context, techUser: TechUser, ticket: stri
   // 『每個分支都要有明確回覆』原則）。per-ticket 鎖已經在上面 release 掉，
   // 沒佔滿全域額度不影響其他人認領同一張單（bug-lock 只擋『幾乎同時點同一
   // 張單』那個瞬間，鎖本來就該儘早放手，見 releaseLock 註解）。
-  const result = spawnCreateMr(ticket)
+  const result = spawnCreateMr(ticket, { triggeredBy: techUser })
   if (!result.ok) {
     // review 發現：spawnCreateMr 內部 spawn 失敗（磁碟/fd 用盡等）跟「單純
     // 額度滿了」是不同情境，給不同訊息——都要有明確回覆，不能讓使用者在
