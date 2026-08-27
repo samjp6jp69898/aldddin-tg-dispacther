@@ -2,6 +2,7 @@ import { execFileSync } from 'node:child_process'
 import type { Context } from 'grammy'
 import { queryDemandPoolTickets, getDemandTicketNotionUrl } from '../notion-integration/demand-pool-tickets.ts'
 import { spawnDemandPipeline } from '../pipeline-runner/spawn-demand-pipeline.ts'
+import { describeTicketProgress, isTicketLocked } from '../pipeline-runner/ticket-progress.ts'
 import type { TechUser } from '../user-resolution/tech-user.ts'
 
 const BUG_LOCK_SH = '/Users/user/aladdin/scripts/bug-lock.sh'
@@ -69,6 +70,14 @@ function markAiAnalysisInProgress(ticket: string): void {
  */
 export async function handleDemandClaim(ctx: Context, techUser: TechUser, ticket: string): Promise<void> {
   await ctx.answerCallbackQuery()
+
+  // 同事再次點選一張已經在跑的需求單：鎖目錄存在＝run-demand-pipeline.ts
+  // 的 main() 正持有這張票的鎖（見 ticket-progress.ts 檔頭註解，跟 claim.ts
+  // 對 Bug 票的判斷同一套依據），改回覆目前進度，不要走下面的認領流程。
+  if (isTicketLocked(ticket)) {
+    await ctx.reply(describeTicketProgress(ticket))
+    return
+  }
 
   // 防禦性重驗：訊息可能是舊的，畫面上的單這期間可能已被別人處理完、或
   // Notion『技術處理人員』／『狀態』已經變了。

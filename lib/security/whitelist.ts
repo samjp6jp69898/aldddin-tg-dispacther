@@ -5,6 +5,7 @@ import { sendTicketList } from '../webhook-server/ticket-list.ts'
 import { sendDemandList } from '../webhook-server/demand-list.ts'
 import { handleClaim } from '../locking/claim.ts'
 import { handleDemandClaim } from '../locking/demand-claim.ts'
+import { sendStatusList } from '../webhook-server/status-list.ts'
 import { createReplayGuard } from './replay-guard.ts'
 import { handleKitCommand, isKitAdminChat } from '../webhook-server/kit-issue.ts'
 
@@ -16,7 +17,8 @@ import { handleKitCommand, isKitAdminChat } from '../webhook-server/kit-issue.ts
  * 掛載 bot.on('message') 與 bot.on('callback_query:data')，白名單外的 chat_id
  * 一律靜默 return，不執行任何後續 Notion/tracker 查詢或 keyboard 組裝。
  * 白名單內的 chat_id 通過後往下流動——訊息走 T30 指令式路由（/bug 直接列
- * 清單 / /req 需求池清單 / /menu 頂層選單 / /kit 核發企劃 starter kit
+ * 清單 / /req 需求池清單 / /status 列出目前正在執行中的工單（見
+ * status-list.ts） / /menu 頂層選單 / /kit 核發企劃 starter kit
  * （僅 TG_KIT_ADMIN_CHAT_ID，見 kit-issue.ts） / 其他回用法提示，見 handler
  * 內註解）；callback_query 依 callback_data 分流 menu:bug（T29，觸發 T6/T8
  * 查詢列清單）/ reqpool:noop（T9 建立、T32 接上真實需求池清單）/
@@ -58,6 +60,8 @@ export function registerHandlers(bot: Bot): void {
       //   /bug  → 直接列 Bug 候選工單（等同點頂層選單的 BUG 按鈕）
       //   /req  → 直接列需求池候選單（T31/T32，等同點頂層選單的『需求池』
       //           按鈕），行為與 reqpool:noop 一致
+      //   /status → 列出這個人名下目前真的有背景 pipeline 在跑的所有票（Bug
+      //           ＋需求單），逐張附上 stage（見 status-list.ts）
       //   /menu → 頂層選單（既有 inline keyboard 流程保留，按鈕路由不變）
       //   其他  → 回覆用法提示。維持「白名單內沒有安靜失敗的路徑」原則，
       //           所以不是靜默忽略；比對大小寫不敏感、含前後空白容忍。
@@ -70,6 +74,9 @@ export function registerHandlers(bot: Bot): void {
       } else if (text === '/req') {
         await ctx.replyWithChatAction('typing') // 跟 /bug 對稱：真的打 Notion 前先給讀取中提示
         await sendDemandList(ctx, techUser)
+      } else if (text === '/status') {
+        await ctx.replyWithChatAction('typing') // 跟 /bug、/req 對稱：真的打 Notion 前先給讀取中提示
+        await sendStatusList(ctx, techUser)
       } else if (text === '/menu') {
         await sendTopLevelMenu(ctx)
       } else if (kitAdmin && /^\/kit(\s|$)/i.test(rawText)) {
@@ -79,8 +86,8 @@ export function registerHandlers(bot: Bot): void {
         await handleKitCommand(ctx, rawText)
       } else {
         const usage = kitAdmin
-          ? '可用指令：/bug（列出可認領 Bug 工單）、/req（需求池）、/menu（選單）、/kit <id> <name>（核發企劃 kit）'
-          : '可用指令：/bug（列出可認領 Bug 工單）、/req（需求池）、/menu（選單）'
+          ? '可用指令：/bug（列出可認領 Bug 工單）、/req（需求池）、/status（查看你正在執行中的工單）、/menu（選單）、/kit <id> <name>（核發企劃 kit）'
+          : '可用指令：/bug（列出可認領 Bug 工單）、/req（需求池）、/status（查看你正在執行中的工單）、/menu（選單）'
         await ctx.reply(usage)
       }
     } catch (err) {

@@ -3,6 +3,7 @@ import type { Context } from 'grammy'
 import { queryCandidateTickets } from '../notion-integration/candidate-tickets.ts'
 import { ensureTrackerPending } from '../pipeline-runner/tracker-sync.ts'
 import { spawnCreateMr } from '../pipeline-runner/spawn-create-mr.ts'
+import { describeTicketProgress, isTicketLocked } from '../pipeline-runner/ticket-progress.ts'
 import type { TechUser } from '../user-resolution/tech-user.ts'
 
 const BUG_LOCK_SH = '/Users/user/aladdin/scripts/bug-lock.sh'
@@ -45,6 +46,15 @@ function releaseLock(ticket: string): void {
  */
 export async function handleClaim(ctx: Context, techUser: TechUser, ticket: string): Promise<void> {
   await ctx.answerCallbackQuery()
+
+  // 同事再次點選一張已經在跑的單：鎖目錄存在＝/create-mr 自己的 Step 0.1.3
+  // 正持有這張票的鎖（見 ticket-progress.ts 檔頭註解），改回覆目前進度到
+  // 哪個 stage，不要走下面的認領流程（那條路只會用「已被其他 session 認
+  // 領」這種不含任何進度細節的訊息擋下來）。
+  if (isTicketLocked(ticket)) {
+    await ctx.reply(describeTicketProgress(ticket))
+    return
+  }
 
   // 防禦性重驗：訊息可能是舊的，畫面上的單這期間可能已被別人處理完、
   // 或 Notion『當前指派』／『狀態』已經變了。

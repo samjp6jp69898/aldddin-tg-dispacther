@@ -39,6 +39,7 @@ await bot.api.setMyCommands(
   [
     { command: 'bug', description: '列出你可認領的 Bug 工單' },
     { command: 'req', description: '列出你可認領的需求單' },
+    { command: 'status', description: '查看你目前正在執行中的工單' },
     { command: 'menu', description: '顯示頂層選單' },
   ],
   { scope: { type: 'all_private_chats' } },
@@ -54,6 +55,7 @@ if (kitAdminChatId) {
     [
       { command: 'bug', description: '列出你可認領的 Bug 工單' },
       { command: 'req', description: '列出你可認領的需求單' },
+      { command: 'status', description: '查看你目前正在執行中的工單' },
       { command: 'menu', description: '顯示頂層選單' },
       { command: 'kit', description: '核發企劃 starter kit（/kit <id> <name>）' },
     ],
@@ -167,8 +169,8 @@ app.all('*', c => respondUniform401(c))
 // health-monitor.ts 註解）。用 setInterval 週期排程，不是 sleep/輪詢規避競態。
 createHealthMonitor().start()
 
-// T26：每 10 分鐘掃一次 bug-lock.sh 的鎖，回收持有超過 70 分鐘（遠高於
-// WRAPPER_SCRIPT 的 timeout 3600 上限）的逾時鎖——見 stale-lock-reaper.ts
+// T26：每 10 分鐘掃一次 bug-lock.sh 的鎖，回收持有超過 130 分鐘（遠高於
+// WRAPPER_SCRIPT 的 timeout 7200 上限）的逾時鎖——見 stale-lock-reaper.ts
 // 檔頭註解，涵蓋手動 kill -9 整組砍掉背景流程、或機器斷電重開機這兩種 EXIT
 // trap 完全沒機會執行的情境。跟上面的 tunnel 健康檢查一樣是週期性排程器。
 startStaleLockReaper()

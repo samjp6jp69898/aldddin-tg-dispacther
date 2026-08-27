@@ -87,6 +87,23 @@ describe('registerHandlers — T30 指令式訊息路由（斜線指令） + T29
     expect(['你的可認領需求單：', '目前沒有可認領需求單']).toContain(text)
   })
 
+  // /status：查這個人目前真的有背景 pipeline 在跑的所有票，刻意不 mock
+  // Notion／鎖目錄——同一個理由跟 /bug、/req 測試一致：要驗證的正是「/status
+  // 這個指令路由真的接到 sendStatusList」。不斷言具體張數／內容（會隨真實
+  // 執行中的 pipeline 數量漂移），只鎖住兩種合法回覆形狀之一。
+  test('T30：發 /status：typing 提示 → 觸發真實查詢，回覆「目前沒有」或「正在執行中的工單（N 張）」', async () => {
+    const handlers = captureHandlers()
+    const ctx = makeCtx({ chat: { id: REAL_TECH_CHAT_ID }, message: { text: '/status' } })
+    await handlers['message']!(ctx)
+
+    expect(ctx.replyWithChatAction).toHaveBeenCalledWith('typing')
+    expect(ctx.reply).toHaveBeenCalledTimes(1)
+    const [text] = ctx.reply.mock.calls[0]!
+    const isEmpty = text === '你目前沒有正在執行中的工單。'
+    const isNonEmpty = /^你目前正在執行中的工單（\d+ 張）：/.test(String(text))
+    expect(isEmpty || isNonEmpty).toBe(true)
+  })
+
   test('T30：發不帶斜線的裸文字 bug/req：不再被當成指令，回用法提示（斜線是唯一合法格式）', async () => {
     const handlers = captureHandlers()
     const ctxBug = makeCtx({ chat: { id: REAL_TECH_CHAT_ID }, message: { text: 'bug' } })
