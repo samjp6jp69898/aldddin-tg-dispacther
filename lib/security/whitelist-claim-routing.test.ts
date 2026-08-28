@@ -3,7 +3,7 @@ import { describe, expect, mock, test } from 'bun:test'
 // review 發現的測試空白：whitelist.test.ts 完全沒測到 `claim:` 前綴的路由。
 // 不能直接用真的 handleClaim（claim.ts）——它有真實副作用（bug-lock.sh
 // claim/release、tracker-sync、最重的是 spawnCreateMr 會真的 spawn 一個
-// `timeout 3600 claude -p /create-mr:create-mr <ticket>` 背景行程），對一個假 ticket
+// `timeout 7200 claude -p /create-mr:create-mr <ticket>` 背景行程），對一個假 ticket
 // 這樣測會實際觸發一次真的 pipeline 執行，不是單元測試該做的事。
 //
 // 用 mock.module 在 import whitelist.ts 之前先替換掉 claim.ts 的

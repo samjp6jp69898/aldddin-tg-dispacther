@@ -363,7 +363,7 @@ log 或任何被 git 追蹤的檔案裡（見 T15）。
 
 **2026-08-23 起大多數情況不需要手動處理了**：webhook server 內建
 `lib/pipeline-runner/stale-lock-reaper.ts`，每 10 分鐘掃一次所有鎖，持有
-超過 70 分鐘（遠高於 WRAPPER_SCRIPT 的 `timeout 3600` 上限，見該檔案檔頭
+超過 130 分鐘（遠高於 WRAPPER_SCRIPT 的 `timeout 7200` 上限，見該檔案檔頭
 註解）的鎖會被自動釋放並清理對應 worktree，Bug 工單（`FAQ-*`）額外自動重試
 一次（`ALDREQ-*` 需求單不自動重試，需人工重新認領，沿用 T36 既有的保守
 政策），每次自動回收都會 Telegram 通知維運者。這涵蓋了 T26 已知操作風險
@@ -376,10 +376,10 @@ trap 完全沒機會執行的情境——不必再手動判斷。
 用的是**同一個**鎖目錄。stale-lock-reaper 靠 `lib/pipeline-runner/
 active-pipeline-marker.ts`（dispatcher spawn 背景流程時另外寫的標記檔，跟
 `bug-lock.sh` 完全分開）分辨「這個鎖是不是我 spawn 的」——沒有標記的鎖（人工
-/批次觸發）完全不會被自動回收，就算持有超過 70 分鐘也一樣，避免打斷正在
+/批次觸發）完全不會被自動回收，就算持有超過 130 分鐘也一樣，避免打斷正在
 合法進行中的人工 review/暫停查證。
 
-以下手動排除方式保留給**逾時鎖回收還沒觸發（70 分鐘內）就想確認狀態**、或
+以下手動排除方式保留給**逾時鎖回收還沒觸發（130 分鐘內）就想確認狀態**、或
 自動回收本身失敗（見 `logs/stale-lock-reaper.log`）的情況：
 
 ```bash

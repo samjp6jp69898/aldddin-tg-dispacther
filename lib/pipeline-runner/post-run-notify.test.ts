@@ -1,5 +1,5 @@
 import { describe, expect, mock, test } from 'bun:test'
-import { checkPushMismatch, shouldNotify } from './post-run-notify.ts'
+import { checkPushMismatch, shouldNotify, parseRunningBugTickets } from './post-run-notify.ts'
 
 describe('shouldNotify — T13 補發通知範圍（2026-08-14 使用者定案，見 tasks.json changelog）', () => {
   test('create-mr 自己已通知/已留言過的三類，不重複發', () => {
@@ -8,9 +8,10 @@ describe('shouldNotify — T13 補發通知範圍（2026-08-14 使用者定案�
     expect(shouldNotify('failed')).toBe(false)
   })
 
-  test('create-mr 完全沒機會通知的四類，補發', () => {
+  test('create-mr 完全沒機會通知的五類，補發', () => {
     expect(shouldNotify('skipped')).toBe(true)
     expect(shouldNotify('unknown_failure')).toBe(true)
+    expect(shouldNotify('timeout')).toBe(true)
     expect(shouldNotify('infra_failure')).toBe(true)
     expect(shouldNotify('cli_failure')).toBe(true)
   })
@@ -57,5 +58,27 @@ describe('checkPushMismatch — 2026-08-23：pipeline 回報 success 但 Notion 
     const notify = mock((_t: string) => true)
     checkPushMismatch('FAQ-1', 'success', 'out.log', 'err.log', { getAiAnalysisStatus, notify })
     expect(notify).not.toHaveBeenCalled()
+  })
+})
+
+describe('parseRunningBugTickets — 排除自己的 wrapper（2026-08-26 aladdin-05 review 抓到的真實 bug：自動重試永遠誤判自己在跑）', () => {
+  test('excludePid 命中的那行（自己這輪的 wrapper bash，trap 執行期間仍活著）要被排除，即使 argv 命中 regex', () => {
+    const selfPid = 56046
+    const psOutput = [
+      `${selfPid} bash -c trap "true" EXIT\\012sleep 3 run-create-mr FAQ-1234 /tmp/fake.log`,
+      `70001 bash -c trap "true" EXIT\\012sleep 3 run-create-mr FAQ-5678 /tmp/other.log`,
+      `1 /sbin/launchd`,
+    ].join('\n')
+    expect(parseRunningBugTickets(psOutput, selfPid)).toEqual(['FAQ-5678'])
+  })
+
+  test('excludePid 沒有命中任何行時，正常回傳全部匹配的票（不會誤刪不相干的行）', () => {
+    const psOutput = [`70001 bash -c trap "true" EXIT\\012sleep 3 run-create-mr FAQ-5678 /tmp/other.log`].join('\n')
+    expect(parseRunningBugTickets(psOutput, 99999)).toEqual(['FAQ-5678'])
+  })
+
+  test('沒有任何 bug pipeline wrapper 時回傳空陣列', () => {
+    const psOutput = ['1 /sbin/launchd', '42 /usr/sbin/cron'].join('\n')
+    expect(parseRunningBugTickets(psOutput, 99999)).toEqual([])
   })
 })

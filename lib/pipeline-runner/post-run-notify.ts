@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import { classifyPipelineResult, type Classification } from './classify-result.ts'
 import { getTicketNotionUrl, getTicketAiAnalysisStatus } from '../notion-integration/candidate-tickets.ts'
 import { notifyOperator } from '../notify/operator.ts'
+import { spawnCreateMr } from './spawn-create-mr.ts'
 
 const RESOLVE_REVIEWER_SH = '/Users/user/aladdin/scripts/resolve-reviewer.sh'
 const TG_NOTIFY_SH = '/Users/user/aladdin/scripts/tg-notify.sh'
@@ -15,10 +16,40 @@ const POST_RUN_LOG = join(LOG_DIR, 'post-run-notify.log')
 // 該 detached bash 行程會無上界地不結束、累積在背景——加 execFileSync 的
 // timeout 讓最壞情況有限，逾時視同呼叫失敗（既有 catch 分支已處理）。
 const EXEC_TIMEOUT_MS = 30_000
+// timeout 分類（exitCode 124）的強制升級對象：Landon（tech-users.csv 的
+// 「KHH Landon Lo」列）。跟下面 resolveAssigneeEmail 抓到的「當前指派」是
+// 兩件事、互不取代——指派 tech 可能換人或查無資料，2026-08-25 使用者定案
+// 「遇到 timeout 一定要發 TG 通知到 landon」，不能讓這條路徑跟著指派解析
+// 一起 best-effort 放棄，所以獨立於下面 main() 的 email 分支之外，永遠嘗試。
+const TIMEOUT_ESCALATION_EMAIL = 'pkh_samjp6jp69898@photons.com.tw'
+const TRACKER_SH = '/Users/user/aladdin/scripts/tracker.sh'
+// 2026-08-26 使用者定案：timeout 分類不能只發通知乾等人工，要能自己重試——
+// 但「resume 模式重跑」本身也可能再度 timeout（例如這張票本來就結構性偏
+// 大，任何一輪都跑不完 120 分鐘），沒有上限會對同一張票無限燒 opus。跟
+// aladdin-05（同時在做 tg-monitor 手動重試按鈕，兩邊共用 spawnCreateMr 的
+// opts.resume 介面，見 2026-08-26 對齊訊息）講好的分工：resume 偵測/續跑本身
+// 是 create-mr.md Step 0.2 + resume-inventory.sh 的職責，這裡只負責「要不要
+// 觸發、觸發幾次」的判斷。
+const AUTO_RETRY_LIMIT = 2
+// 跟 telegram-dispatcher/lib/pipeline-runner/concurrency-limiter.ts 的
+// GLOBAL_CONCURRENCY_LIMIT 同步——這裡故意不 import 那個 in-memory 計數器：
+// 本檔是 spawn-create-mr.ts 的 bash EXIT trap 每次現叫的全新 bun 子行程，
+// import 到的計數器永遠是這個一次性 process 自己從 0 開始的獨立副本，看不到
+// 真正常駐的 webhook server process 累積了多少名額，用它判斷會允許實際併發
+// 超過上限（tg-monitor 的 /api/pipelines/retry 也踩過同一個坑，同一套修法：
+// 改用 ps 現場真實計數，不管由哪個 process 觸發都反映同一個事實）。
+const BUG_PIPELINE_CONCURRENCY_LIMIT = 5
+// 尾端可選的字面 `resume`（2026-08-26）：WRAPPER_SCRIPT 的 $3 值域固定
+// {'resume', ''}——resume 模式的 wrapper 命令列多一個尾 token，不允許它的話
+// resume run 會完全掃不到（tg-monitor lib/ingest.ts 同一條 regex 實際踩過，
+// 兩處要同步維護）。
+const RUN_CREATE_MR_PROC_RE = /^bash -c [\s\S]*\brun-create-mr\s+([A-Z]+-\d+)\s+(\S+?)(?:\s+resume)?\s*$/
 
 // T13：create-mr.md 自己的出口表已經處理過這三種——不重複發：
 //   - success / needs_qa_clarification：Step 7b.1 / 7c 已發過 TG。
-//   - failed：Step 7c 已留 Notion「分析失敗」留言，使用者本來就會去 Notion 看
+//   - failed：Step 7c 已留 Notion「分析失敗」留言（2026-08-26 起 create-mr 的
+//     7c 還會自己發 TG 通知＋附 Drive 分析文件連結——dispatcher 這裡照舊不補
+//     發，否則同一張 failed 會收到兩則）
 //     （T13 原始 description 定案，非本次新決策）。
 // 這裡的 'success' 標籤底下其實還收斂了 already_fixed / i18n_manual_handoff
 // 兩種子情況（classify-result.ts 把三者統一收斂成 'success'，見該檔案頭
@@ -44,7 +75,7 @@ const EXEC_TIMEOUT_MS = 30_000
 // 直接通知 Landon（見 checkPushMismatch），不透過 NEEDS_NOTIFY／assignee 那條
 // 既有路徑——這是給維運者的基礎設施層級警示，不是給 ticket 指派人的一般
 // 補發通知。
-const NEEDS_NOTIFY = new Set<Classification>(['skipped', 'infra_failure', 'cli_failure', 'unknown_failure'])
+const NEEDS_NOTIFY = new Set<Classification>(['skipped', 'timeout', 'infra_failure', 'cli_failure', 'unknown_failure'])
 
 export function shouldNotify(classification: Classification): boolean {
   return NEEDS_NOTIFY.has(classification)
@@ -74,7 +105,13 @@ function resolveAssigneeEmail(ticket: string): string | null {
   }
 }
 
-function buildNotifyText(ticket: string, classification: Classification, stdoutPath: string, stderrPath: string): string {
+function buildNotifyText(ticket: string, classification: Classification, stdoutPath: string, stderrPath: string, retryNote: string): string {
+  if (classification === 'timeout') {
+    return `⚠️ [需人工檢查] ${ticket}
+/create-mr 背景流程逾時（超過 spawn-create-mr.ts 設定的 120 分鐘上限）被強制中止，沒有進入正常的成功/失敗/待釐清出口。${retryNote}請人工檢查 log：
+${stdoutPath}
+${stderrPath}`
+  }
   return `⚠️ [需人工檢查] ${ticket}
 /create-mr 背景流程異常結束（分類：${classification}），沒有進入正常的成功/失敗/待釐清出口，請人工檢查 log：
 ${stdoutPath}
@@ -127,6 +164,109 @@ ${stderrPath}`
 }
 
 /**
+ * post-run-notify.log 逐行都有 `<ticket> classification=<...>` 這行（main()
+ * 每次都先 log 一行，不管要不要通知——見下方呼叫處），從尾端往回數這張票
+ * 連續幾次都是 timeout：中間只要出現過一次非 timeout（含真正的 success），
+ * 就代表上一輪的失敗鏈已經斷開，計數自然歸零，不需要額外的重置邏輯或狀態。
+ */
+function countTrailingTimeouts(ticket: string): number {
+  let content = ''
+  try {
+    content = readFileSync(POST_RUN_LOG, 'utf8')
+  } catch {
+    return 0
+  }
+  const re = new RegExp(`^\\S+Z ${ticket} classification=(\\S+) exitCode=\\S+$`)
+  const classifications: string[] = []
+  for (const line of content.split('\n')) {
+    const m = re.exec(line)
+    if (m) classifications.push(m[1]!)
+  }
+  let count = 0
+  for (let i = classifications.length - 1; i >= 0; i--) {
+    if (classifications[i] !== 'timeout') break
+    count++
+  }
+  return count
+}
+
+/**
+ * ps 現場掃描目前還活著的 bug pipeline wrapper（見 concurrency 註解）。
+ *
+ * excludePid 一定要傳這個 process 自己的 process.ppid（見呼叫端）：本檔是
+ * spawn-create-mr.ts 的 WRAPPER_SCRIPT EXIT trap 直接執行的子行程（trap body
+ * 跑在觸發 trap 的同一個 bash 裡，不是 subshell），trap 執行期間那個 wrapper
+ * bash 自己還沒結束、仍活在 ps 裡，且它的完整 argv（`bash -c <script>
+ * run-create-mr <ticket> <stdoutPath>`）本身就會命中 RUN_CREATE_MR_PROC_RE
+ * ——不排除的話，這張票「自己」永遠會被算進「目前正在跑」，讓
+ * planAutoRetry 的防禦性檢查每次都對自己誤判，自動重試永遠不會觸發（2026-08-26
+ * aladdin-05 review 實測驗證：`bash -c 'trap "true" EXIT; sleep 3' run-create-mr
+ * <ticket> <log> &` 之後 `ps` 就能看到這行，且 trap 內指令的 argv 不會蓋掉
+ * 外層 script 的位置參數，多指令 trap body 也不會被 exec 取代掉行程本身）。
+ */
+export function parseRunningBugTickets(psOutput: string, excludePid: number): string[] {
+  const tickets: string[] = []
+  for (const line of psOutput.split('\n')) {
+    const m = /^\s*(\d+)\s+(.*)$/.exec(line)
+    if (!m) continue
+    if (Number(m[1]) === excludePid) continue
+    const mm = RUN_CREATE_MR_PROC_RE.exec(m[2]!)
+    if (mm) tickets.push(mm[1]!)
+  }
+  return tickets
+}
+
+function listRunningBugTickets(): string[] {
+  try {
+    const out = execFileSync('ps', ['-axo', 'pid=,command='], { encoding: 'utf8', timeout: EXEC_TIMEOUT_MS })
+    return parseRunningBugTickets(out, process.ppid)
+  } catch {
+    return []
+  }
+}
+
+type RetryDecision = { attempted: boolean; note: string }
+
+/**
+ * timeout 分類的自動重試判斷（不含實際觸發，觸發交給呼叫端）：依序檢查
+ * 「這張票連續 timeout 是否已達上限」→「這張票此刻是否仍在跑（不該發生，
+ * 防禦用）」→「全域 bug pipeline 併發是否已滿」。任一條件擋下就不重試，只
+ * 回傳給人看的說明文字，不做任何有副作用的動作（tracker.sh set / spawn 由
+ * main() 在拿到 attempted=true 之後才執行，讓「決定」與「動作」分開，方便
+ * 各自獨立記 log 追蹤）。
+ */
+function planAutoRetry(ticket: string): RetryDecision {
+  const trailingTimeouts = countTrailingTimeouts(ticket)
+  if (trailingTimeouts > AUTO_RETRY_LIMIT) {
+    return { attempted: false, note: `已連續 timeout ${trailingTimeouts} 次（上限 ${AUTO_RETRY_LIMIT}），不再自動重試，` }
+  }
+  const runningTickets = listRunningBugTickets()
+  if (runningTickets.includes(ticket)) {
+    return { attempted: false, note: '偵測到這張票目前仍有背景流程在跑（不應該發生，可能是併發衝突），跳過自動重試，' }
+  }
+  if (runningTickets.length >= BUG_PIPELINE_CONCURRENCY_LIMIT) {
+    return { attempted: false, note: `目前背景 pipeline 併發已達上限（${BUG_PIPELINE_CONCURRENCY_LIMIT}），暫不自動重試，` }
+  }
+  return { attempted: true, note: `已觸發第 ${trailingTimeouts} 次自動重試（resume 模式，上限 ${AUTO_RETRY_LIMIT} 次）——` }
+}
+
+/** 真正執行重試：claim 前置（tracker 設回 rerun）+ resume 模式 spawn。任何一步失敗都記 log、不拋例外。 */
+function executeAutoRetry(ticket: string): void {
+  try {
+    execFileSync('bash', [TRACKER_SH, 'set', ticket, 'rerun'], { encoding: 'utf8', timeout: EXEC_TIMEOUT_MS })
+  } catch (err) {
+    log(`${ticket} 自動重試中止：tracker.sh set rerun 失敗: ${err}`)
+    return
+  }
+  const spawned = spawnCreateMr(ticket, { resume: true })
+  if (spawned.ok) {
+    log(`${ticket} 自動重試已 spawn（resume 模式，pid ${spawned.pid}）`)
+  } else {
+    log(`${ticket} 自動重試 spawn 失敗: ${spawned.reason}`)
+  }
+}
+
+/**
  * T13 CLI 進入點：從 bash EXIT trap 呼叫（見 spawn-create-mr.ts），
  * argv = [ticket, exitCode, stdoutPath]。stderrPath 用命名慣例（T11 固定
  * `{base}.stdout.log` / `{base}.stderr.log` 成對）推回來，不用多帶一個參數。
@@ -156,19 +296,58 @@ function main(): void {
 
   if (!shouldNotify(classification)) return
 
-  const email = resolveAssigneeEmail(ticket)
-  if (!email) {
-    log(`${ticket} 需要補發通知但找不到 tech assignee email（Notion 當前指派可能已變更或非 tech），略過`)
-    return
+  // 自動重試判斷＋執行也獨立包 try/catch、排在 Landon 升級通知**之前**——
+  // 跟下面 Landon 那塊同一個理由：不能讓這裡任何一步的例外（ps／tracker.sh／
+  // spawnCreateMr 都可能拋）連坐擋掉「timeout 一定通知到 Landon」的保證。
+  // retryNote 預設空字串，即使這整塊失敗，下面的通知文字仍然完整可讀，只是
+  // 少一句重試狀態說明，不影響「有沒有發出通知」這個更重要的保證。
+  let retryNote = ''
+  if (classification === 'timeout') {
+    try {
+      const decision = planAutoRetry(ticket)
+      retryNote = decision.note
+      if (decision.attempted) executeAutoRetry(ticket)
+    } catch (err) {
+      log(`${ticket} 自動重試判斷/執行例外: ${err}`)
+    }
   }
 
-  const text = buildNotifyText(ticket, classification, stdoutPath, stderrPath)
+  const text = buildNotifyText(ticket, classification, stdoutPath, stderrPath, retryNote)
 
+  // timeout 分類的強制升級：故意排在 assignee 解析**之前**、獨立成自己的
+  // try/catch。review 2026-08-25 發現：resolveAssigneeEmail() 呼叫的
+  // getTicketNotionUrl()（candidate-tickets.ts）本身沒有 try/catch 也沒有
+  // exec timeout，Notion API 逾時/5xx/回傳格式跑掉都會讓例外一路往上炸穿
+  // main()——而 timeout 分類本來就常伴隨環境/網路異常，這正是這條路徑最容易
+  // 斷的時候。若原本寫法（assignee 解析在前、Landon 升級在後）遇到這個例外，
+  // Landon 會什麼通知都收不到，直接違背「timeout 一定要通知到 Landon」這個
+  // 保證。改成 Landon 這塊完全不依賴下面 assignee 解析是否成功/是否拋例外。
+  if (classification === 'timeout') {
+    try {
+      execFileSync('bash', [TG_NOTIFY_SH, '--email', TIMEOUT_ESCALATION_EMAIL, '--text', text], { encoding: 'utf8', timeout: EXEC_TIMEOUT_MS })
+      log(`${ticket} timeout 升級通知已發給 Landon（${TIMEOUT_ESCALATION_EMAIL}）`)
+    } catch (err) {
+      log(`${ticket} timeout 升級通知（Landon）tg-notify.sh 呼叫失敗: ${err}`)
+    }
+  }
+
+  // assignee 解析＋通知整段包一層 try/catch（不只是 resolveAssigneeEmail 內部
+  // 那個只護到 execFileSync 的 try——getTicketNotionUrl 這段例外會從
+  // resolveAssigneeEmail 直接穿出來，見上面的說明），確保就算這裡意外拋例外，
+  // 也不會影響上面已經送出的 Landon 升級通知（本來就已經送完了），且能把
+  // 例外記進 log 而不是讓整個 process 帶著非 0 exit code 消失不留痕跡。
   try {
-    execFileSync('bash', [TG_NOTIFY_SH, '--email', email, '--text', text], { encoding: 'utf8', timeout: EXEC_TIMEOUT_MS })
-    log(`${ticket} 已補發通知給 ${email}`)
+    const email = resolveAssigneeEmail(ticket)
+    if (!email) {
+      log(`${ticket} 需要補發通知但找不到 tech assignee email（Notion 當前指派可能已變更或非 tech），略過`)
+    } else if (classification !== 'timeout' || email !== TIMEOUT_ESCALATION_EMAIL) {
+      // classification==='timeout' 且 email 剛好等於 Landon 時，上面已經發過
+      // 同一份文字給同一個人，這裡跳過避免重複發送。
+      execFileSync('bash', [TG_NOTIFY_SH, '--email', email, '--text', text], { encoding: 'utf8', timeout: EXEC_TIMEOUT_MS })
+      log(`${ticket} 已補發通知給 ${email}`)
+    }
   } catch (err) {
-    log(`${ticket} tg-notify.sh 呼叫失敗: ${err}`)
+    log(`${ticket} assignee 通知失敗（含解析階段例外）: ${err}`)
   }
 }
 

@@ -5,8 +5,8 @@ import { join } from 'node:path'
 import { findStaleLocks, reapStaleLocks } from './stale-lock-reaper.ts'
 
 const NOW = Date.parse('2026-08-23T12:00:00Z')
-const FRESH_TIME = '2026-08-23T11:55:00Z' // 5 分鐘前，遠低於 70 分鐘門檻
-const STALE_TIME = '2026-08-23T10:00:00Z' // 2 小時前，超過門檻
+const FRESH_TIME = '2026-08-23T11:55:00Z' // 5 分鐘前，遠低於 130 分鐘門檻
+const STALE_TIME = '2026-08-23T09:00:00Z' // 3 小時前，超過門檻
 
 /** 建一個假的 bug-lock.sh LOCK_DIR：每個 ticket 一個目錄，內含 info 檔（內容
  * 不影響判斷，2026-08-23 起 staleness 改看 active-pipeline 標記，不看這裡的
@@ -46,7 +46,7 @@ describe('findStaleLocks', () => {
     expect(findStaleLocks({ lockDir, markerDir, now: NOW })).toEqual([])
   })
 
-  test('鎖持有時間超過 70 分鐘門檻（依 marker 時間）→ 判定逾時，含正確 ageMs', () => {
+  test('鎖持有時間超過 130 分鐘門檻（依 marker 時間）→ 判定逾時，含正確 ageMs', () => {
     const lockDir = makeLockDir(['FAQ-2'])
     const markerDir = makeMarkerDir({ 'FAQ-2': STALE_TIME })
     const result = findStaleLocks({ lockDir, markerDir, now: NOW })
@@ -55,8 +55,8 @@ describe('findStaleLocks', () => {
     expect(result[0]!.ageMs).toBe(NOW - Date.parse(STALE_TIME))
   })
 
-  test('恰好卡在門檻邊界（70 分鐘整）→ 算逾時（>= 不是 >）', () => {
-    const boundaryTime = new Date(NOW - 70 * 60 * 1000).toISOString()
+  test('恰好卡在門檻邊界（130 分鐘整）→ 算逾時（>= 不是 >）', () => {
+    const boundaryTime = new Date(NOW - 130 * 60 * 1000).toISOString()
     const lockDir = makeLockDir(['FAQ-3'])
     const markerDir = makeMarkerDir({ 'FAQ-3': boundaryTime })
     expect(findStaleLocks({ lockDir, markerDir, now: NOW })).toHaveLength(1)

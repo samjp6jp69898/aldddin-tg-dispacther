@@ -55,14 +55,14 @@ const EXEC_TIMEOUT_MS = 30_000
 // 不嘗試用 pid 判斷 process 是否還活著：無論是鎖檔案的 pid 還是我們自己
 // spawn 的 pid，都只是短命子行程/detached 行程的 pid，直接檢查存活與否沒有
 // 意義。時間門檻本身就是結構性保證：即使 EXIT trap 完全沒機會執行（手動
-// kill -9 整組砍掉、機器斷電重開機這兩種已知情境），`timeout 3600` 這個
-// 指令本身仍會對它自己的直接子行程（claude）在 3600 秒時送
+// kill -9 整組砍掉、機器斷電重開機這兩種已知情境），`timeout 7200` 這個
+// 指令本身仍會對它自己的直接子行程（claude）在 7200 秒時送
 // SIGTERM/SIGKILL，不受父行程（bash wrapper）是否存活影響——所以只要是
-// dispatcher 自己 spawn 的 pipeline，真正的行程最晚在 spawn 之後 3600 秒
-// 左右就會結束。70 分鐘（4200 秒）在此之上留了超過 10 分鐘 margin，足以
+// dispatcher 自己 spawn 的 pipeline，真正的行程最晚在 spawn 之後 7200 秒
+// 左右就會結束。130 分鐘（7800 秒）在此之上留了 10 分鐘 margin，足以
 // 涵蓋兩種收尾方式（正常結束、被 timeout 強制結束），不會誤殺一個貨真價實
 // 還在跑的 pipeline。
-const STALE_THRESHOLD_MS = 70 * 60 * 1000
+const STALE_THRESHOLD_MS = 130 * 60 * 1000
 
 // 只有 Bug pipeline（FAQ-*）自動重試：這條 pipeline 穩定、有多輪真實 E2E
 // 驗證（見 tasks.json T21/T22），重試風險可控。需求 pipeline（ALDREQ-*）刻意
@@ -230,7 +230,7 @@ export function reapStaleLocks(
 
 /**
  * 週期排程（硬規則明文允許的合法用途：週期性排程器，不是拿 sleep/輪詢規避
- * 競態）。10 分鐘一次，遠低於 70 分鐘的門檻，逾時鎖最慢在門檻後 10 分鐘內
+ * 競態）。10 分鐘一次，遠低於 130 分鐘的門檻，逾時鎖最慢在門檻後 10 分鐘內
  * 會被抓到並回收。
  */
 export function startStaleLockReaper(intervalMs = 10 * 60 * 1000): ReturnType<typeof setInterval> {

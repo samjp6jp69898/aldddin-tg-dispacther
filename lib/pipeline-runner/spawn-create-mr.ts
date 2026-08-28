@@ -172,8 +172,21 @@ trap '
 ' EXIT
 unset CLAUDE_EFFORT
 { echo "diag PATH=$PATH"; echo "diag which claude: $(which -a claude 2>&1 | tr '\\n' ' ')"; echo "diag version: $(${CLAUDE_BIN} --version 2>&1)"; } >&2
-timeout 3600 ${CLAUDE_BIN} -p "/create-mr:create-mr $1" --model opus --permission-mode bypassPermissions --output-format json
+timeout 7200 ${CLAUDE_BIN} -p "/create-mr:create-mr $1 $3" --model opus --permission-mode bypassPermissions --output-format stream-json --verbose
 `
+// --output-format 於 2026-08-26 由 json 改為 stream-json（+ -p 模式必帶的
+// --verbose）：舊格式整包 JSON 在行程結束那一刻才 flush，執行中 stdout 永遠
+// 0 bytes（tg-monitor 的 Agent 流程/log 進度整段空白），被 timeout 砍掉的
+// run 更是**連事後都一無所有**（無從 debug，實際踩過 FAQ-4743 timeout 全空）。
+// stream-json 逐行 JSONL 即時落盤，事件物件結構與舊格式陣列元素相同，最後
+// 一行仍是 type=result。下游解析（classify-result.ts、tg-monitor ingest）
+// 均已改為「先試整檔 JSON（相容歷史 log），失敗再逐行 JSONL」雙格式支援。
+// $3 = resume 模式參數：spawnCreateMr 只會傳字面 'resume' 或空字串（TS 端寫死，
+// 不接受任意字串，杜絕注入面）。空字串時 prompt 尾端多一個空白，無害。
+// ⚠ 這些位置參數是 ps 命令列掃描契約的一部分：tg-monitor lib/ingest.ts 與
+// 本目錄 post-run-notify.ts 都用 `run-create-mr <ticket> <stdout> [resume]` 的
+// 尾端樣式辨識 wrapper 行程——要再加新的位置參數，兩處 regex 必須同步放行
+// （2026-08-26 加 resume 時漏了，resume run 被監控面板誤判成已結束，實際踩過）。
 
 /**
  * T11：CLAIMED 後 fire-and-forget 觸發 /create-mr 背景流程。
@@ -222,7 +235,7 @@ timeout 3600 ${CLAUDE_BIN} -p "/create-mr:create-mr $1" --model opus --permissio
  */
 export function spawnCreateMr(
   ticket: string,
-  opts: { triggeredBy?: TechUser } = {},
+  opts: { resume?: boolean; triggeredBy?: TechUser } = {},
 ): { ok: true; pid: number | undefined } | { ok: false; reason: 'concurrency_limit' | 'spawn_error' } {
   if (!TICKET_RE.test(ticket)) {
     throw new Error(`拒絕 spawn：ticket 格式不對（${ticket}），可能是注入嘗試`)
@@ -260,7 +273,9 @@ export function spawnCreateMr(
     // 對有這份標記的 ticket 動手，避免誤殺人工/批次跑的 pipeline 持有的鎖。
     markPipelineActive(ticket)
 
-    const pid = spawnDetachedProcess('bash', ['-c', WRAPPER_SCRIPT, 'run-create-mr', ticket, stdoutPath], {
+    // 第三個位置參數（$3）固定只有兩個可能值：'resume' 或 ''——見 WRAPPER_SCRIPT
+    // 尾註解，不把呼叫端任意字串放進 prompt。
+    const pid = spawnDetachedProcess('bash', ['-c', WRAPPER_SCRIPT, 'run-create-mr', ticket, stdoutPath, opts.resume ? 'resume' : ''], {
       cwd: '/Users/user/aladdin',
       stdoutPath,
       stderrPath,
@@ -287,4 +302,29 @@ export function spawnCreateMr(
     appendFileSync(SPAWN_ERROR_LOG, `${new Date().toISOString()} spawnCreateMr 失敗（${ticket}）: ${err}\n`)
     return { ok: false, reason: 'spawn_error' }
   }
+}
+
+/**
+ * CLI 進入點（`bun spawn-create-mr.ts <ticket>`）：給非本 repo 的外部呼叫端
+ * （2026-08-25 起：tg-monitor 的 /api/pipelines/retry）用行程邊界呼叫本模組，
+ * 不要用跨 repo 相對路徑 import——那樣會把呼叫端耦合到這個模組的內部型別、
+ * 傳遞依賴（concurrency-limiter.ts 等）與模組級 singleton 狀態（見上面
+ * `concurrencyLimiter` 的檔頭註解：這個計數器故意 in-memory、只代表「這個
+ * process 自己記得的名額」，被 tg-monitor 那種獨立 process import 進去只會
+ * 得到一份從 0 開始、永遠不知道真正 webhook server 佔用了多少名額的假副本），
+ * 而且兩個 repo 各自獨立的 git 生命週期下，import 端完全無法在自己的 CI/
+ * 測試裡發現這裡簽名或路徑跑掉——用 CLI 呼叫，介面就是「進程 + argv + exit
+ * code」，天然不會有這些問題。並發上限請呼叫端自己用 ps 現場計數把關（tg-monitor
+ * 的 listRunningPipelineProcs() 就是這樣做的），不要依賴這裡的 in-memory
+ * 限流當作真正上限。
+ */
+if (import.meta.main) {
+  const ticket = process.argv[2] ?? ''
+  // `--resume`（2026-08-26）：tg-monitor 重試按鈕帶入，讓 /create-mr 走 Step 0.2
+  // 續跑盤點（從上一輪最後完成的階段接續）。只認這個字面 flag，其餘一律當
+  // 沒帶（不把任意 argv 轉發進 claude prompt）。
+  const resume = process.argv.includes('--resume')
+  const result = spawnCreateMr(ticket, { resume })
+  console.log(JSON.stringify(result))
+  process.exit(result.ok ? 0 : 1)
 }

@@ -9,17 +9,17 @@ export const ACTIVE_MARKER_DIR = '/Users/user/aladdin/telegram-dispatcher/logs/a
  * 目錄——人工在終端機互動跑 `/create-mr`、`/create-mrs` 批次、back-testing
  * pipeline 都會呼叫同一支 `bug-lock.sh claim`，鎖檔（`info`）完全沒有欄位
  * 記錄「這個鎖是不是 dispatcher 觸發的」。若 stale-lock-reaper 對這些鎖也
- * 套用 70 分鐘門檻，會誤殺正在被人工/其他 pipeline 合法使用的鎖——review
- * 迴圈被打回重做、人工暫停查證等情境跑超過 70 分鐘是真實可能發生的
- * （pipeline 本身文件寫「單張 20–40 分鐘」，70 分鐘不是安全餘裕），只有
- * dispatcher 自己 spawn 的流程才有 `timeout 3600` 這個結構性上限（見
+ * 套用 130 分鐘門檻，會誤殺正在被人工/其他 pipeline 合法使用的鎖——review
+ * 迴圈被打回重做、人工暫停查證等情境跑超過 130 分鐘是真實可能發生的
+ * （pipeline 本身文件寫「單張 20–40 分鐘」，130 分鐘不是安全餘裕），只有
+ * dispatcher 自己 spawn 的流程才有 `timeout 7200` 這個結構性上限（見
  * spawn-create-mr.ts 的 WRAPPER_SCRIPT）。
  *
  * 解法：dispatcher 自己 spawn 背景流程時（spawnCreateMr／
  * spawnDemandPipeline）額外寫一份「這張單是我 spawn 的、幾點 spawn 的」標記
  * 檔，跟 bug-lock.sh 完全分開、不共用同一份狀態，不需要修改 bug-lock.sh 或
  * create-mr.md（那是維護協定紅區的共用檔案）。stale-lock-reaper 只對「有這
- * 份標記」的 ticket 套用 70 分鐘門檻，且用標記自己記的 spawn 時間（比
+ * 份標記」的 ticket 套用 130 分鐘門檻，且用標記自己記的 spawn 時間（比
  * bug-lock.sh 的 `time=` 更早、更保守——create-mr 內部 Step 0.1.3 的
  * re-claim 一定發生在 dispatcher spawn 之後）當基準；沒有標記的鎖完全不碰，
  * 留給人工用既有的 `bug-lock.sh release` 手動處理（見 README.md「工單鎖卡

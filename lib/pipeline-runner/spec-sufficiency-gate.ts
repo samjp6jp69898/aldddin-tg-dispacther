@@ -20,7 +20,7 @@ const MAX_BLOCK_DEPTH = 3
 // 上限。claude -p 原本是零工具的單輪分類任務，2 分鐘遠超正常耗時；2026-08-21
 // 改成會呼叫 Read/Grep/Glob 探索 codebase（見 askClaude 註解），拉長到 5
 // 分鐘給工具呼叫輪次留空間，仍遠低於 spawn-create-mr.ts 給整條 create-mr
-// pipeline 的 3600 秒（性質不同：那是允許多輪工具呼叫＋改檔的完整 pipeline，
+// pipeline 的 7200 秒（性質不同：那是允許多輪工具呼叫＋改檔的完整 pipeline，
 // 這裡只是唯讀探索後的一次性文字分類）。
 const NOTION_EXEC_TIMEOUT_MS = 30_000
 const CLAUDE_EXEC_TIMEOUT_MS = 300_000

@@ -16,8 +16,11 @@ function fakeStdout(opts: { subtype?: string; is_error?: boolean; result: string
 }
 
 describe('classifyPipelineResult — 七種分類（T12 acceptance criteria）', () => {
-  test('infra_failure：exit code 非 0（含 124 = timeout 逾時被殺）', () => {
-    expect(classifyPipelineResult(124, '')).toBe('infra_failure')
+  test('timeout：exit code 124（GNU timeout 逾時被殺）', () => {
+    expect(classifyPipelineResult(124, '')).toBe('timeout')
+  })
+
+  test('infra_failure：exit code 非 0 且非 124', () => {
     expect(classifyPipelineResult(1, 'bash: claude: command not found')).toBe('infra_failure')
   })
 

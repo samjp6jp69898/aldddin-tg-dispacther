@@ -1,10 +1,13 @@
-// 解析 T11 產生的 stdout log 檔（timeout 3600 claude -p "/create-mr:create-mr
-// {ticket}" --output-format json 的**純 stdout**——T11 把 stdout/stderr 分開寫成兩個
-// 檔案，stdout 保證是單一乾淨的 JSON 陣列，不會混進 stderr 雜訊），依
-// headless-pipeline 調查的判斷規則分類，供 T13 決定是否補發通知。
+// 解析 T11 產生的 stdout log 檔（timeout 7200 claude -p "/create-mr:create-mr
+// {ticket}" 的**純 stdout**——T11 把 stdout/stderr 分開寫成兩個檔案，不會混進
+// stderr 雜訊），依 headless-pipeline 調查的判斷規則分類，供 T13 決定是否補發
+// 通知。格式：2026-08-26 前是 --output-format json 的單一 JSON 陣列（結束才
+// flush）；2026-08-26 起改 --output-format stream-json 的 JSONL（逐行即時落盤，
+// timeout 被砍也保得住已輸出部分）。extractResultEvent 雙格式都支援。
 //
 // 判斷順序（見 tasks.json T12 description）：
-//   1. 外層 exit code 非 0（尤其 124 = timeout 逾時被殺）→ infra_failure
+//   1. 外層 exit code 非 0：124（GNU timeout 逾時被殺）獨立分類成 timeout；
+//      其餘非 0 值 → infra_failure
 //   2. claude -p 的 JSON 輸出中 is_error/subtype 顯示 CLI 層級失敗 → cli_failure
 //   3. jq -r .result 解開後判斷：create-mr.md Step 9 完成報告固定有一行
 //      「- Pipeline status: {pipeline_status}」，用錨定 regex 抓這一行的值
@@ -34,6 +37,7 @@ export type Classification =
   | 'failed'
   // dispatcher 自己合成的分類，create-mr 完全沒機會回報這幾種——代表 CLI
   // 這層本身就有問題（跑不完、跑完但沒吐出可辨識的合法結果）。
+  | 'timeout' // exitCode === 124：GNU timeout 把 claude -p 中途砍掉
   | 'infra_failure'
   | 'cli_failure'
   | 'unknown_failure'
@@ -53,7 +57,21 @@ function extractResultEvent(stdoutContent: string): ResultEvent | null {
   try {
     events = JSON.parse(stdoutContent)
   } catch {
-    return null // stdout 不是合法 JSON（例如空字串、process 中途被砍斷輸出）
+    // 2026-08-26 起 WRAPPER_SCRIPT 改用 --output-format stream-json：stdout 是
+    // JSONL（每行一個 event 物件，最後一行 type=result），整檔 JSON.parse 必
+    // 失敗——改逐行解析，容忍被 timeout 砍斷時最後一行不完整（單行 parse
+    // 失敗就跳過該行，不是整檔放棄）。上面的整檔 parse 保留給歷史 log
+    // （舊格式單一 JSON 陣列）繼續可分類。空字串/整段非 JSON → 空陣列 →
+    // 下面 find 不到 result event → 照舊回 null（cli_failure 路徑不變）。
+    const lineEvents: unknown[] = []
+    for (const line of stdoutContent.split('\n')) {
+      if (!line.trim()) continue
+      try {
+        lineEvents.push(JSON.parse(line))
+      } catch {}
+    }
+    if (!lineEvents.length) return null
+    events = lineEvents
   }
 
   if (!Array.isArray(events)) return null
@@ -62,7 +80,8 @@ function extractResultEvent(stdoutContent: string): ResultEvent | null {
 }
 
 export function classifyPipelineResult(exitCode: number, stdoutContent: string): Classification {
-  if (exitCode !== 0) return 'infra_failure' // 含 124：timeout 逾時被殺
+  if (exitCode === 124) return 'timeout' // GNU timeout 逾時把 claude -p 中途砍掉，stdout 通常是空的（來不及 flush）
+  if (exitCode !== 0) return 'infra_failure'
 
   const resultEvent = extractResultEvent(stdoutContent)
   if (!resultEvent) return 'cli_failure' // 拿不到合法的 JSON 結果，視為 CLI 層級失敗
