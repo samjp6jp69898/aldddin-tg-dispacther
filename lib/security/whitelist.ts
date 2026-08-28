@@ -8,6 +8,8 @@ import { handleDemandClaim } from '../locking/demand-claim.ts'
 import { sendStatusList } from '../webhook-server/status-list.ts'
 import { createReplayGuard } from './replay-guard.ts'
 import { handleKitCommand, isKitAdminChat } from '../webhook-server/kit-issue.ts'
+import { logUnknownSender } from '../webhook-server/unknown-sender-log.ts'
+import { triggerTgAutoSync } from '../webhook-server/trigger-auto-sync.ts'
 
 // grammy 的 secretToken（見 lib/webhook-server/bot.ts / server.ts）只驗證請求
 // 真的來自 Telegram，不驗證是不是授權使用者；chat_id 白名單要在這一層自己做
@@ -47,7 +49,20 @@ export function registerHandlers(bot: Bot): void {
   bot.on('message', async ctx => {
     const chatId = String(ctx.chat.id)
     const techUser = resolveTechUserByChatId(chatId)
-    if (techUser === null) return // 白名單外：靜默 return，不做重放判斷
+    if (techUser === null) {
+      // 對外行為不變（仍是靜默 return，不回覆、不做重放判斷）；只在本機留一筆
+      // chat_id/first_name/username 供 tg-chatid-sync 事後對映回 tech-users.csv
+      // ——getUpdates 跟本服務的 webhook 互斥打不通，這是目前唯一能持續發現
+      // 「誰 DM 過本 bot」的管道，見 unknown-sender-log.ts 檔頭註解。
+      //
+      // isNew（這個 chat_id 第一次出現）才 fire-and-forget 觸發
+      // tg-auto-sync.sh：同一人在被人工確認前重複發訊息，不該每則都重跑一次
+      // 整套比對流程（見 trigger-auto-sync.ts）。
+      if (logUnknownSender(ctx.chat)) {
+        triggerTgAutoSync()
+      }
+      return
+    }
 
     const updateId = ctx.update.update_id
     if (replayGuard.isDuplicate(updateId)) return // T27：重放的 update，直接忽略
