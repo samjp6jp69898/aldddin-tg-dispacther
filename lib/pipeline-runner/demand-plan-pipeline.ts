@@ -102,7 +102,7 @@ async function createLightweightWorktrees(ticket: string, repos: string[]): Prom
 }
 
 /** 唯讀自由文字 agent 呼叫（draft/review/synthesize 共用）：固定工具白名單＋bypassPermissions（headless 無人核准）＋清 CLAUDE_EFFORT。 */
-async function runFreeformAgent(prompt: string, cwd: string): Promise<string> {
+async function runFreeformAgent(prompt: string, cwd: string, trace: { ticket: string; stage: string }): Promise<string> {
   const env = { ...process.env }
   delete env.CLAUDE_EFFORT
 
@@ -111,6 +111,7 @@ async function runFreeformAgent(prompt: string, cwd: string): Promise<string> {
     maxBuffer: 20 * 1024 * 1024,
     timeout: AGENT_TIMEOUT_MS,
     env,
+    trace,
   })
 
   const events = JSON.parse(stdout)
@@ -130,6 +131,7 @@ async function classifyPlanResult(ticket: string, planContent: string): Promise<
     maxBuffer: 10 * 1024 * 1024,
     timeout: CLASSIFY_TIMEOUT_MS,
     env,
+    trace: { ticket, stage: 'classify' },
   })
 
   const events = JSON.parse(stdout)
@@ -216,20 +218,20 @@ export async function runDemandPlanPipeline(ticket: string, specText: string, co
   try {
     log(`${ticket} plan pipeline：draft 階段開始（2 個 agent 平行，目標 repo=${repos.join(', ')}）`)
     const draftTexts = await Promise.all(
-      [0, 1].map(i => runFreeformAgent(buildDraftPrompt(ticket, specText, comments, repos, worktreeRoot), worktreeRoot)),
+      [0, 1].map(i => runFreeformAgent(buildDraftPrompt(ticket, specText, comments, repos, worktreeRoot), worktreeRoot, { ticket, stage: `draft-${String.fromCharCode(65 + i)}` })),
     )
     const drafts = draftTexts.map((text, i) => ({ label: `Draft ${String.fromCharCode(65 + i)}`, text }))
     log(`${ticket} plan pipeline：draft 階段完成`)
 
     log(`${ticket} plan pipeline：review 階段開始（3 個角度平行）`)
     const reviewTexts = await Promise.all(
-      REVIEW_LENSES.map(({ lens }) => runFreeformAgent(buildReviewPrompt(lens, ticket, specText, drafts), worktreeRoot)),
+      REVIEW_LENSES.map(({ lens }) => runFreeformAgent(buildReviewPrompt(lens, ticket, specText, drafts), worktreeRoot, { ticket, stage: `review-${lens}` })),
     )
     const reviews = REVIEW_LENSES.map(({ label }, i) => ({ label, text: reviewTexts[i]! }))
     log(`${ticket} plan pipeline：review 階段完成`)
 
     log(`${ticket} plan pipeline：synthesize 階段開始`)
-    const planContent = await runFreeformAgent(buildSynthesizePrompt(ticket, specText, drafts, reviews), worktreeRoot)
+    const planContent = await runFreeformAgent(buildSynthesizePrompt(ticket, specText, drafts, reviews), worktreeRoot, { ticket, stage: 'synthesize' })
     log(`${ticket} plan pipeline：synthesize 階段完成`)
 
     const planPath = join(PLAN_DIR, `${ticket}-plan.md`)

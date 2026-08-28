@@ -55,6 +55,7 @@ ${comments.length > 0 ? comments.join('\n') : '（沒有留言）'}
     maxBuffer: 10 * 1024 * 1024,
     timeout: CLAUDE_EXEC_TIMEOUT_MS,
     env,
+    trace: { ticket, stage: 'repo-scope' },
   })
 
   const events = JSON.parse(stdout)

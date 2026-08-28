@@ -186,7 +186,7 @@ ${comments.length > 0 ? comments.join('\n') : '（沒有留言）'}
  * 跟著鬆動。--permission-mode bypassPermissions 重新加回來（工具非空，
  * headless 環境沒人能回應權限對話框，理由同最上面移除它之前的舊版）。
  */
-async function askClaude(prompt: string): Promise<{ sufficient: boolean; missing?: string }> {
+async function askClaude(prompt: string, ticket: string): Promise<{ sufficient: boolean; missing?: string }> {
   const env = { ...process.env }
   delete env.CLAUDE_EFFORT
 
@@ -198,6 +198,7 @@ async function askClaude(prompt: string): Promise<{ sufficient: boolean; missing
       maxBuffer: 10 * 1024 * 1024,
       timeout: CLAUDE_EXEC_TIMEOUT_MS,
       env,
+      trace: { ticket, stage: 'spec-gate' },
     },
   )
 
@@ -255,7 +256,7 @@ export async function fetchDemandTicketContent(ticket: string): Promise<{ bodyTe
  */
 export async function checkSpecSufficiencyFromContent(ticket: string, bodyText: string, comments: string[]): Promise<SpecSufficiencyResult> {
   const prompt = buildPrompt(ticket, bodyText, comments)
-  return await askClaude(prompt)
+  return await askClaude(prompt, ticket)
 }
 
 /**
