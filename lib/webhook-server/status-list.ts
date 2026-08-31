@@ -2,6 +2,7 @@ import type { Context } from 'grammy'
 import { queryCandidateTickets } from '../notion-integration/candidate-tickets.ts'
 import { queryDemandTicketsInAnalysis } from '../notion-integration/demand-pool-tickets.ts'
 import { describeTicketProgress, isTicketLocked } from '../pipeline-runner/ticket-progress.ts'
+import { getRemoteEntry, describeRemoteProgress } from '../cluster/cluster-head.ts'
 import type { TechUser } from '../user-resolution/tech-user.ts'
 
 /**
@@ -22,13 +23,22 @@ export async function sendStatusList(ctx: Context, techUser: TechUser): Promise<
     queryDemandTicketsInAnalysis(techUser.notion_user_id),
   ])
 
-  const running = [...bugCandidates, ...demandInAnalysis].filter(ticket => isTicketLocked(ticket))
+  // 多機派工：本機鎖目錄只看得到本機在跑的單，派去 worker 的單要靠 head 的
+  // 派工登記表補上（cluster 停用時登記表恆空，行為同單機）。兩個集合天然
+  // 互斥（一張單不會同時本機執行又派在遠端）。
+  const candidates = [...bugCandidates, ...demandInAnalysis]
+  const localRunning = candidates.filter(ticket => isTicketLocked(ticket))
+  const remoteRunning = candidates.filter(ticket => !localRunning.includes(ticket) && getRemoteEntry(ticket) !== null)
 
-  if (running.length === 0) {
+  if (localRunning.length + remoteRunning.length === 0) {
     await ctx.reply('你目前沒有正在執行中的工單。')
     return
   }
 
-  const text = running.map(ticket => describeTicketProgress(ticket)).join('\n\n')
-  await ctx.reply(`你目前正在執行中的工單（${running.length} 張）：\n\n${text}`)
+  const localTexts = localRunning.map(ticket => describeTicketProgress(ticket))
+  const remoteTexts = await Promise.all(
+    remoteRunning.map(ticket => describeRemoteProgress(getRemoteEntry(ticket)!)),
+  )
+  const text = [...localTexts, ...remoteTexts].join('\n\n')
+  await ctx.reply(`你目前正在執行中的工單（${localRunning.length + remoteRunning.length} 張）：\n\n${text}`)
 }

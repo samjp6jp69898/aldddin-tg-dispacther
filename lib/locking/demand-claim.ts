@@ -1,7 +1,8 @@
 import { execFileSync } from 'node:child_process'
 import type { Context } from 'grammy'
 import { queryDemandPoolTickets, getDemandTicketNotionUrl } from '../notion-integration/demand-pool-tickets.ts'
-import { submitDemandPipeline, resetAiAnalysisForReclaim } from '../pipeline-runner/spawn-demand-pipeline.ts'
+import { resetAiAnalysisForReclaim } from '../pipeline-runner/spawn-demand-pipeline.ts'
+import { dispatchDemand, getRemoteEntry, describeRemoteProgress } from '../cluster/cluster-head.ts'
 import { DEMAND_CONCURRENCY_LIMIT } from '../pipeline-runner/concurrency-limiter.ts'
 import { describeTicketProgress, isTicketLocked } from '../pipeline-runner/ticket-progress.ts'
 import type { TechUser } from '../user-resolution/tech-user.ts'
@@ -80,6 +81,14 @@ export async function handleDemandClaim(ctx: Context, techUser: TechUser, ticket
     return
   }
 
+  // 多機派工：這張單已派在某台 worker 上執行（本機鎖目錄看不到，理由見
+  // claim.ts 同分支註解）。cluster 停用時登記表恆空，不會進來。
+  const remoteEntry = getRemoteEntry(ticket)
+  if (remoteEntry) {
+    await ctx.reply(await describeRemoteProgress(remoteEntry))
+    return
+  }
+
   // 防禦性重驗：訊息可能是舊的，畫面上的單這期間可能已被別人處理完、或
   // Notion『技術處理人員』／『狀態』已經變了。
   const stillCandidate = (await queryDemandPoolTickets(techUser.notion_user_id)).includes(ticket)
@@ -112,7 +121,9 @@ export async function handleDemandClaim(ctx: Context, techUser: TechUser, ticket
   // 2026-08-28（使用者定案）：併發額滿改排入 FIFO 佇列，不再要求「稍後重新
   // 認領」——排隊中的單輪到時由 pipeline-queue.ts 自動 spawn 並 TG 通知，
   // Notion AI分析 維持上面剛標記的「分析中」，語意一致。
-  const spawnResult = submitDemandPipeline(ticket, techUser.email, techUser)
+  // 多機派工：dispatchDemand 內部依名額決定本機 spawn 或派給 worker；
+  // cluster 停用/無 worker 時完全等同原本的 submitDemandPipeline。
+  const spawnResult = await dispatchDemand(ticket, techUser.email, techUser)
   if (!spawnResult.ok) {
     // spawn 本身失敗：明確回覆，不能讓使用者以為流程已經在跑。鎖已在上面
     // release 過；但 AI分析 已被標成「分析中」，不改回可認領值（需要重跑）
@@ -128,6 +139,14 @@ export async function handleDemandClaim(ctx: Context, techUser: TechUser, ticket
     return
   }
 
+  if (spawnResult.status === 'remote_started') {
+    await ctx.reply(`已認領 ${ticket}，Notion AI分析已標記「分析中」，已派工至另一台機器執行，完成後會再通知你。產出仍需人工複核，不是自動完成。`)
+    return
+  }
+  if (spawnResult.status === 'already_running_remote') {
+    await ctx.reply(`${ticket} 已在另一台機器執行中，不需要重複認領，完成後會自動通知。`)
+    return
+  }
   if (spawnResult.status === 'already_running') {
     // 連點視窗防護，理由見 claim.ts 同分支註解。AI分析=分析中 與實況一致
     // （確實有一條流程在跑，它的 finalize 會自行更新），不需要改回。

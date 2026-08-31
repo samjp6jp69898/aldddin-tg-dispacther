@@ -207,6 +207,99 @@ launchd job**，只是「切換 tunnel connector」這一步本身不再需要�
 在跑就判定成功）：`curl /health`、`getWebhookInfo` 確認網址與 `last_error_message`
 正常、再用真實白名單 Telegram 帳號發 `/menu` 走一次完整流程確認收得到回覆。
 
+## 多機擴容（head / worker 派工，2026-08-31 新增）
+
+單機吞吐不夠時，可以把其他同網段的 Mac 加進來當 **worker**：目前跑
+server.ts + tunnel + hosted MCP 的這台是 **head**（唯一入口——Telegram
+webhook、Notion 查詢、認領判斷、派工決策都在它身上；tunnel 與 MCP 完全
+不用動，也只該有一份）。head 自己也能跑 pipeline，worker 只是多出來的
+執行容量。
+
+**預設關閉**：`.env` 沒有 `CLUSTER_SHARED_SECRET` 時，所有 cluster 程式碼
+是 no-op，行為與純單機完全相同。要啟用才需要做下面的事。
+
+### 資料流
+
+```
+Telegram → head（webhook、白名單、Notion 重驗、per-ticket 鎖）
+             ├─ 本機名額較多 → 本機 spawn（跟單機一模一樣）
+             └─ 某台 worker 名額較多 → POST worker:8801 /jobs
+                    worker 用同一套 submitCreateMr/submitDemandPipeline
+                    在自己機器 spawn（鎖、佇列、stale-lock 回收、
+                    TG 通知、Notion 回寫全部沿用單機機制，跑在 worker 上）
+                    → pipeline 結束 → worker POST head /cluster/job-done
+```
+
+- 派工選擇：認領當下即時打各 worker `/capacity?ticket=<單號>` 比剩餘名額
+  （順路問這張單在該機有無活動），取名額最多者，**平手本機優先**；只嘗試
+  最佳一台（把最壞耗時鎖在 grammy webhook 的 10 秒預算內），失敗或全滿就
+  進 head 本機的既有 FIFO 佇列。
+- 重複防護：head 維護「派到哪台」登記表（`logs/cluster-dispatched.json`），
+  跟本機鎖/佇列 running 集合互補；worker 端以「本機活動三合一」判定
+  （in-memory queue ∪ `/tmp/bug-analysis-locks` 鎖目錄 ∪ ps 掃 wrapper
+  行程，見 `lib/cluster/local-activity.ts`）——timeout 自動重試、
+  stale-lock-reaper 重跑、人工終端這些 **out-of-band run** 也看得到，
+  接單前撞到就回 already_running 讓 head 回填登記，絕不起第二條。
+- 回報遺失自癒：worker 的 job-done 打不到 head、或 head 在交涉中重啟時，
+  head 的 remote sweeper（每 10 分鐘）會向 worker 查證該單實況。原則是
+  **寧可暫時卡住、絕不製造雙跑**：查證確認「已無任何活動」才清登記；
+  worker **失聯不清登記**（登記在就擋得住重複認領），只告警一次等恢復，
+  26 小時絕對上限才強制清除；需求單清除時依情境處理 Notion AI分析
+  （見 `lib/cluster/remote-sweeper.ts` 檔頭）。
+- 認證：所有 head↔worker 請求帶 `x-cluster-token`（常數時間比較）；head 的
+  `/cluster/*` 額外擋掉帶 `CF-Connecting-IP` 的請求——經 tunnel 從公網進來
+  的一律 401，這組路由只在 LAN 上存在。
+
+### head 啟用步驟
+
+1. `.env` 加 `CLUSTER_SHARED_SECRET=$(openssl rand -hex 32)`（≥32 字元，
+   太短會被視同未設定）。
+2. 重啟 server：`launchctl kickstart -k gui/$(id -u)/com.aladdin.tg-dispatch-server`。
+   啟動 log 出現 `cluster: head 模式啟用` 即生效。
+
+### worker 部署步驟（新機）
+
+前提跟「在另一台機器部署」一節相同：帳號叫 `user`、整個 aladdin 生態系
+放在一模一樣的 `/Users/user/aladdin`（**約定同路徑**，不做路徑參數化）。
+worker **不需要** cloudflared/tunnel/webhook——那些是 head 專屬。
+
+1. `bash telegram-dispatcher/deploy/bootstrap-worker.sh`：冪等引導腳本，
+   能自動做的（symlink 重建、bun install、目錄、plist 複製）自動做，需要
+   人工的（repo clone、.env 安全複製、claude 登入、glab auth）印成待辦
+   清單。重跑到 0 待辦為止。
+2. `.env` 補四個 worker 變數（值的說明見 `launchd/run-worker-agent.sh`
+   檔頭）：`CLUSTER_SHARED_SECRET`（與 head 同值）、`CLUSTER_HEAD_URL`、
+   `CLUSTER_WORKER_NAME`、`CLUSTER_WORKER_URL`。head/worker 都建議在
+   路由器上做 DHCP 固定 IP。
+3. `bash telegram-dispatcher/deploy/doctor-worker.sh`：唯讀體檢（工具鏈、
+   repo 遠端連通、symlink、.env、head 連通性、電源設定），**全綠才上線**。
+4. `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.aladdin.tg-worker-agent.plist`。
+   worker agent 啟動時會自動向 head 登記（其後每 30 分鐘冪等重送），不用
+   手動改 head 的任何檔案。**worker 退役**：先 `launchctl bootout` 該機的
+   worker agent，再刪 head 上 `logs/cluster-workers.json` 對應行並
+   **重啟 head server**（名冊在 head 記憶體有快取，只改檔案不重啟不生效；
+   不重啟也無害——派工探測打不通會自動跳過，只是多一次 2.5 秒的失敗探測）。
+5. 驗收：對 bot 認領一張測試單，確認 head log 出現派工紀錄、worker 上
+   pipeline 真的跑起來、結束後 TG 通知照常送達。
+
+### 已知限制（v1，刻意的取捨）
+
+- **Claude 帳號額度是共享的**：多台機器若共用同一個 Claude 訂閱/帳號，
+  rate limit 與用量池不會因為加機器而變大——擴容解的是單機 CPU/記憶體
+  瓶頸；若瓶頸在帳號額度，要搭配各機獨立帳號或 API billing 才有意義。
+- head 本機 FIFO 佇列裡的單只會在**本機**名額釋放時遞補，不會在 worker
+  釋放名額時撿去遠端跑（佇列只在全 cluster 滿員時才累積，暫不值得多一層
+  跨機遞補的複雜度）。
+- tg-monitor 只看得到自己機器上的 pipeline；派去 worker 的單要去 worker
+  的 logs/ 看。tg-monitor 的重試按鈕也只影響本機，且看不到遠端登記表——
+  避免對「派在別台跑的單」按重試。
+- `bug_analysis_tracker.md` 每台機器各一份，會分岔——既有的
+  `/sync-bug-tracker` skill 就是為多機補正而生，維持原本的事後同步策略。
+- worker 機同樣要插電、關閉「插電時允許進入睡眠」（doctor 會檢查），睡著
+  等於這台從派工池消失（head 探測不到會自動跳過，不會壞流程，只是少一台）。
+- worker agent 的 8801 只該存在於受信任的 LAN；不要在路由器上對它做任何
+  port forwarding。
+
 ## Telegram 端使用方式（技術人員視角）
 
 前提：使用者的 `tg_chat_id` 必須已登記在
@@ -259,6 +352,7 @@ launchd job**，只是「切換 tunnel connector」這一步本身不再需要�
 | `TG_WEBHOOK_PATH` | 隨機 hex 字串，webhook 路徑的一部分（見 T14），不是固定的 `/webhook` |
 | `TG_WEBHOOK_SECRET` | grammy `secretToken`，Telegram 呼叫 webhook 時會帶在 header 裡驗證 |
 | `PORT` | 選填，webhook server 監聽的本機 port，預設 `8787`；改動時記得 `launchd/run-tunnel.sh` 裡的 `PORT` 也要同步改，兩者必須一致 |
+| `CLUSTER_SHARED_SECRET` | 選填（多機派工用，≥32 字元）。設定後 head 啟用 cluster 模式；worker 機另需 `CLUSTER_HEAD_URL`/`CLUSTER_WORKER_NAME`/`CLUSTER_WORKER_URL`，見「多機擴容」一節與 `launchd/run-worker-agent.sh` 檔頭 |
 
 這幾個變數只透過 `process.env` 在啟動時讀（wrapper script 用
 `grep '^KEY=' .env` 手法匯出，比照 `cron/bug-report-run.sh`），不會出現在

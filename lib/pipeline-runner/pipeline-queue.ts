@@ -69,6 +69,17 @@ export type PipelineQueue<P> = {
    * 排隊單搶來 spawn）。回傳 { started, requeued, skipped } 供啟動 log。 */
   recoverFromDisk: () => { started: number; requeued: number; skipped: number }
   size: () => number
+  /** 這張單目前在本 process 的狀態：running（已 spawn、還沒收到 onExit）、
+   * queued（在佇列中等名額）、null（本 process 不知道這張單）。給多機派工
+   * （lib/cluster/）在決定要不要往 worker 丟之前先問本機——絕不能把一張
+   * 本機已在跑/在排的單再派去別台（見 dispatch.ts 的重複防護註解）。 */
+  has: (ticket: string) => 'running' | 'queued' | null
+  /** 本 process 經由這個佇列 spawn、還在跑的背景流程數（running 集合大小），
+   * 供 /capacity 回報與派工選擇（lib/cluster/）計算剩餘名額。 */
+  runningCount: () => number
+  /** running 集合的快照（worker-agent 的本機活動盤點要跟鎖目錄/ps 掃描做
+   * 聯集，需要集合本身而不只數量，見 lib/cluster/local-activity.ts）。 */
+  runningTickets: () => string[]
 }
 
 export function createPipelineQueue<P>(cfg: {
@@ -97,6 +108,10 @@ export function createPipelineQueue<P>(cfg: {
   /** 排隊中的單輪到但 spawn 失敗時呼叫（通知發起人需重新認領）；佇列會跳過
    * 這張、繼續遞補下一張，不會讓一張壞單卡死整條佇列。 */
   onDequeueFailed?: (entry: QueueEntry<P>) => void
+  /** 任一背景流程真的結束（onExit 事件）時呼叫一次，時點在名額釋放與遞補
+   * （drain）之後——遞補優先，事件通知（worker 回報 head 完成，見
+   * lib/cluster/）是旁路。跟其他 hook 一樣經 safeHook 包住，例外不外洩。 */
+  onExited?: (ticket: string) => void
 }): PipelineQueue<P> {
   const queue: QueueEntry<P>[] = []
   // 本 process 經由這個佇列 spawn、還沒收到 onExit 的 ticket 集合——見
@@ -129,6 +144,7 @@ export function createPipelineQueue<P>(cfg: {
       running.delete(ticket)
       cfg.limiter.release()
       drain()
+      safeHook('onExited', () => cfg.onExited?.(ticket))
     }
   }
 
@@ -255,5 +271,12 @@ export function createPipelineQueue<P>(cfg: {
     return { started, requeued: queue.length, skipped }
   }
 
-  return { submit, recoverFromDisk, size: () => queue.length }
+  return {
+    submit,
+    recoverFromDisk,
+    size: () => queue.length,
+    has: (ticket: string) => (running.has(ticket) ? 'running' : queue.some(e => e.ticket === ticket) ? 'queued' : null),
+    runningCount: () => running.size,
+    runningTickets: () => [...running],
+  }
 }

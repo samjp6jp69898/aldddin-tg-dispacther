@@ -320,3 +320,83 @@ describe('makeQueueSkipReason（spawn-create-mr.ts）— 鎖重驗與 24 小時�
     rmSync(lockDir, { recursive: true, force: true })
   })
 })
+
+describe('createPipelineQueue — 多機派工新增介面（has / runningCount / onExited）', () => {
+  // 這組介面給 lib/cluster/ 用（派工前的重複防護、/capacity 回報、worker
+  // 完成回報），見 pipeline-queue.ts 對應註解。harness 未接 onExited，這裡
+  // 直接建自己的 queue。
+  function makeClusterHarness(limit: number) {
+    const dir = mkdtempSync(join(tmpdir(), 'pipeline-queue-cluster-test-'))
+    const exits: { ticket: string; onExit: () => void }[] = []
+    const exited: string[] = []
+    const queue = createPipelineQueue<{ tag: string }>({
+      limiter: createConcurrencyLimiter(limit),
+      stateFile: join(dir, 'queue.json'),
+      ticketRe: /^FAQ-\d+$/,
+      spawnNow: (entry, onExit) => {
+        exits.push({ ticket: entry.ticket, onExit })
+        return { ok: true, pid: 1 }
+      },
+      onExited: ticket => exited.push(ticket),
+    })
+    const finish = (ticket: string) => {
+      const idx = exits.findIndex(e => e.ticket === ticket)
+      expect(idx).toBeGreaterThan(-1)
+      exits.splice(idx, 1)[0]!.onExit()
+    }
+    return { queue, exited, finish, cleanup: () => rmSync(dir, { recursive: true, force: true }) }
+  }
+
+  test('has：執行中回 running、排隊中回 queued、無此單回 null；runningCount 跟著增減', () => {
+    const h = makeClusterHarness(1)
+    h.queue.submit('FAQ-1', null, { tag: 'a' })
+    h.queue.submit('FAQ-2', null, { tag: 'b' })
+    expect(h.queue.has('FAQ-1')).toBe('running')
+    expect(h.queue.has('FAQ-2')).toBe('queued')
+    expect(h.queue.has('FAQ-999')).toBe(null)
+    expect(h.queue.runningCount()).toBe(1)
+    h.finish('FAQ-1') // FAQ-2 遞補
+    expect(h.queue.has('FAQ-1')).toBe(null)
+    expect(h.queue.has('FAQ-2')).toBe('running')
+    expect(h.queue.runningCount()).toBe(1)
+    h.finish('FAQ-2')
+    expect(h.queue.runningCount()).toBe(0)
+    h.cleanup()
+  })
+
+  test('onExited：每條流程結束都恰好通知一次，且在遞補（drain）之後才觸發', () => {
+    const h = makeClusterHarness(1)
+    h.queue.submit('FAQ-1', null, { tag: 'a' })
+    h.queue.submit('FAQ-2', null, { tag: 'b' })
+    expect(h.exited).toEqual([])
+    h.finish('FAQ-1')
+    // onExited 觸發當下 FAQ-2 已遞補為 running（drain 先於 onExited）
+    expect(h.exited).toEqual(['FAQ-1'])
+    expect(h.queue.has('FAQ-2')).toBe('running')
+    h.finish('FAQ-2')
+    expect(h.exited).toEqual(['FAQ-1', 'FAQ-2'])
+    h.cleanup()
+  })
+
+  test('onExited hook 丟例外不破壞佇列運作（safeHook 防線）', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pipeline-queue-cluster-test-'))
+    const exits: (() => void)[] = []
+    const queue = createPipelineQueue<null>({
+      limiter: createConcurrencyLimiter(1),
+      stateFile: join(dir, 'queue.json'),
+      ticketRe: /^FAQ-\d+$/,
+      spawnNow: (_entry, onExit) => {
+        exits.push(onExit)
+        return { ok: true, pid: 1 }
+      },
+      onExited: () => {
+        throw new Error('boom')
+      },
+    })
+    queue.submit('FAQ-1', null, null)
+    queue.submit('FAQ-2', null, null)
+    expect(() => exits.shift()!()).not.toThrow()
+    expect(queue.has('FAQ-2')).toBe('running') // 遞補不受 hook 例外影響
+    rmSync(dir, { recursive: true, force: true })
+  })
+})

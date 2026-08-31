@@ -14,6 +14,7 @@ import { registerProxyRoutes } from './lib/webhook-server/mcp-proxy.ts'
 import { startStaleLockReaper } from './lib/pipeline-runner/stale-lock-reaper.ts'
 import { recoverBugQueue } from './lib/pipeline-runner/spawn-create-mr.ts'
 import { recoverDemandQueue } from './lib/pipeline-runner/spawn-demand-pipeline.ts'
+import { registerClusterRoutes, initClusterHead } from './lib/cluster/cluster-head.ts'
 
 registerHandlers(bot)
 
@@ -174,6 +175,11 @@ app.post(
 // catch-all 的 401 吃掉。
 registerProxyRoutes(app)
 
+// 多機派工（2026-08-31）：head 的 /cluster/* 路由（worker 登記 + job-done
+// 回報），CLUSTER_SHARED_SECRET 未設定時整個函式是 no-op、一條路由都不掛。
+// 註冊位置同 proxy 的硬約束：必須在 catch-all 之前，否則被 401 吃掉。
+registerClusterRoutes(app)
+
 // 任何沒命中上面路由的請求（含猜錯 webhook 路徑）一律回跟「secret_token 錯誤」
 // 一模一樣的回應：401 + 空 body。回應內容與送出時點的定義都在
 // lib/security/uniform-401.ts（那裡也記著為什麼「拒絕也要先把 request body
@@ -191,6 +197,11 @@ createHealthMonitor().start()
 // 檔頭註解，涵蓋手動 kill -9 整組砍掉背景流程、或機器斷電重開機這兩種 EXIT
 // trap 完全沒機會執行的情境。跟上面的 tunnel 健康檢查一樣是週期性排程器。
 startStaleLockReaper()
+
+// 多機派工（2026-08-31）：撿回重啟前的遠端派工登記 + 啟動 remote sweeper
+// （job-done 回報遺失/worker 失聯時的事後校正，見 cluster-head.ts 檔頭）。
+// CLUSTER_SHARED_SECRET 未設定時是 no-op。
+initClusterHead()
 
 // 2026-08-28：排隊機制的重啟恢復——把上一個 server process 結束前還在排隊的
 // 單（logs/pipeline-queue.*.json）撿回來：有名額直接 spawn、沒有就依原順序

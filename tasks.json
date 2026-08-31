@@ -2,7 +2,7 @@
   "project": "telegram-dispatcher",
   "description": "常駐 Bun+Hono+grammy webhook server，經 ngrok 固定 domain 接收 Telegram，白名單驗證後依 chat_id 反查 tech-users.csv、查 Notion（狀態為唯一判準）列出可認領 bug 工單，使用者按下後原子鎖 claim，於獨立隔離 worktree 內 fire-and-forget 觸發 /create-mr headless pipeline，背景流程結束後自行釋放鎖、清理 worktree（保留分支）並通知，支援多人真正同時使用。",
   "created_at": "2026-08-14",
-  "updated_at": "2026-08-18",
+  "updated_at": "2026-08-31",
   "changelog": [
     {
       "date": "2026-08-14",
@@ -131,6 +131,14 @@
     {
       "date": "2026-08-28",
       "note": "排隊機制（使用者定案）：Bug（N=5）/ 需求（N=6）pipeline 併發額滿時不再回「請稍後再試」直接拒絕，改為 FIFO 排隊——新增 lib/pipeline-runner/pipeline-queue.ts（通用佇列：submit 時有名額直接 spawn、額滿入列並回順位；任一背景流程 onExit 事件驅動遞補，無 sleep/輪詢；同票去重；每次變動原子性寫快照到 logs/pipeline-queue.{bug,demand}.json；server.ts 啟動時 recoverFromDisk 撿回重啟前還在排隊的單）。spawnCreateMr/spawnDemandPipeline 改名 submitCreateMr/submitDemandPipeline（回傳 started/queued/already_queued/spawn_error），claim.ts/demand-claim.ts 的 TG 回覆改為告知排隊順位與前方張數，輪到時由 tg-notify.sh 自動通知發起人。concurrency_limit reason 已移除（CLI 短命行程 limiter 從 0 起算，永遠 started/spawn_error，tg-monitor retry 路徑不受影響）。DEMAND_CONCURRENCY_LIMIT 搬進 concurrency-limiter.ts 集中，並新增該檔 CLI 進入點輸出 {bug,demand} 一行 JSON——tg-monitor 啟動時經行程邊界讀真實常數（先前該 repo 複製數字寫死、demand 上限已漂移成 2），overview 併發顯示與 /api/pipelines 均新增排隊中清單。單元測試 lib/pipeline-runner/pipeline-queue.test.ts 覆蓋 FIFO/去重/遞補/spawn 失敗跳過/持久化/恢復。\n\n三輪對抗性審查（opus，同一 agent 連續複核）＋呼叫端完整性審查（sonnet）＋tg-monitor 端審查（sonnet）後定稿，審查發現並已修正：A（高）出列/恢復與 submit 檢查之間的 TOCTOU——排隊把 spawn 延後數小時，期間別的入口（人工/批次/monitor CLI）跑起同一張單時，延遲 spawn 的重複 run 會在 Step 0.1 早退後由 EXIT trap 誤放存活 run 的鎖並清掉其 worktree；修法＝pipeline-queue 增 skipReason/onSkipped，出列與恢復時逐張重驗 isTicketLocked＋24 小時排隊時效（MAX_QUEUE_WAIT_MS），skip 不佔名額、通知發起人。B（中）onExit 內同步 drain 遞補同票時，後執行的 clearPipelineActive 會誤刪新 run 剛寫的 active 標記（脫離 stale-lock-reaper 保護）；修法＝clear 移到 onExit 之前。C：recoverFromDisk 補 ticketRe 過濾（快照檔可被竄改，不得讓任意字串進 bash 位置參數/claude prompt）。D：spawnDetachedProcess 的 exit/error listener 提前到 spawn() 後第一件事、closeSync 包 try/catch，消除「listener 未掛先 throw → 名額超賣 1」窗口。E：需求單 AI分析=分析中 後被 skip/啟動失敗會卡死（/req filter 只認 待分析/需要重跑）；修法＝SkipReason 帶 code（locked 絕不動 Notion；expired 與啟動失敗走 resetAiAnalysisForReclaim 把 AI分析 改回「需要重跑」，demand-claim 的 submit 當下 spawn 失敗路徑同套收尾）。另：persist 只在 recoverFromDisk 後啟用（CLI 短命行程結構上不可能覆蓋 server 共用快照）、queue 的通知 hooks 全部 safeHook 包裹（hook 例外不得炸掉 child exit handler 所在的常駐 server）。"
+    },
+    {
+      "date": "2026-08-31",
+      "note": "T37 多機派工（使用者定案）：現機當 head、其他同網段 Mac 當 worker（約定同路徑 /Users/user/aladdin，零路徑參數化）。新增 lib/cluster/（auth/registry/dispatch/sweeper，CLUSTER_SHARED_SECRET 未設定時整套 no-op、單機行為不變）、worker-agent.ts（/health /capacity /jobs 接單 + pipeline onExited 事件驅動 job-done 回報）、deploy/bootstrap-worker.sh + doctor-worker.sh（新機引導/體檢）、launchd worker plist。claim/demand-claim/status-list 接上 dispatchBug/dispatchDemand 與遠端進度；README 新增「多機擴容」一節（含 Claude 帳號額度共享的現實限制與 v1 取捨）。"
+    },
+    {
+      "date": "2026-08-31",
+      "note": "T37 review 輪：品質 review（sonnet）PASSED；對抗 review（opus）FAILED（C-1 out-of-band run 失明雙跑、C-2 sweeper 誤導重新認領+需求單卡死、M-1 dispatching 重啟丟棄、M-2 超 grammy 10s 預算、M-3 missCounts 洩漏、M-4 job-done 不驗身分）→ 全數修正：新增 local-activity.ts（本機活動三合一：queue∪鎖∪ps，真實 ps 實測）與 remote-sweeper.ts（DI 可測；失聯不清登記原則），worker 接單/回報/名額全改三合一判定，dispatch 單一候選+ticket 探測回填，job-done 驗身分。"
     }
   ],
   "architecture_summary": "Telegram → ngrok 固定 domain (unrefreshing-trudy-subsequently.ngrok-free.dev) → 本機常駐 Bun+Hono+grammy webhook server（獨立 TG_DISPATCH_BOT_TOKEN，走 grammy 官方 'hono' adapter + secretToken 驗證）→ chat_id 白名單（tech-users.csv）→ 反查 notion_user_id → 用 people.contains filter 正向查該人在 Notion Bug List 的候選單並以 Notion『狀態』欄位（仍有問題/待處理）為唯一可認領判準（僅走 scripts/notion.sh；不再拿 tracker.sh row 的 pending/rerun 狀態做二次篩選——這是使用者明確定案，見 changelog）→ inline keyboard 呈現（Bug 工單 + 需求池 UI 佔位，後者按下固定回「開發中」不接查詢）→ 使用者按下工單 → 同步 bug-lock.sh claim（mkdir 原子鎖，單一 syscall 無 TOCTOU，per-ticket 鎖仍保留，防兩人重複認領同一張單）→ 成功才回「已開始」，先幫這張單同步一行到 tracker.md（純技術性，滿足 /create-mr 內部 Step 0 既有的 tracker 存在性檢查，dispatcher 自己完全不讀這個狀態），再檢查全域併發上限（T26，in-memory 計數器，N=5，超過時明確回覆已達上限而非安靜忽略）、通過才 fire-and-forget 背景 spawn `claude -p \"/create-mr:create-mr {ticket}\" --permission-mode bypassPermissions`（指令名稱帶 create-mr: 命名空間前綴——.claude/commands/create-mr/create-mr.md 是巢狀資料夾結構，Claude Code 會註冊成 create-mr:create-mr，純 /create-mr 會得到 Unknown command，T26 實測期間發現並修正；cwd=某個為此次觸發全新建立、完全獨立的 worktree，所有涉及 repo 含 rajah 一律真隔離不走 symlink，stdio 明確導向檔案，外包 timeout，避免 pipe buffer deadlock 與無限期卡死）→ webhook handler 立即返回，不維護 job 狀態、不輪詢 → 背景 process 用 trap 保證無論成功/失敗/中斷都執行 bug-lock.sh release、刪除該次 worktree（保留 git 分支），並解析 claude -p 輸出分類結果，只在 create-mr 自己不會通知的情境（未知失敗、Step 0.1/0.5 早退 SKIPPED）用 tg-notify.sh 補發通知，避免重複騷擾。Notion 狀態/留言寫回全由 create-mr pipeline 既有 agent 負責，dispatcher 不碰。上線（launchd 常駐 + ngrok tunnel + 對 Telegram 註冊 webhook）是唯一需要使用者最終確認的步驟，且必須排在所有程式模組完成、安全檢查通過、且做過一次真實 dry-run 之後。",
@@ -159,7 +167,8 @@
     "persistence",
     "security",
     "docs",
-    "demand-pipeline"
+    "demand-pipeline",
+    "cluster"
   ],
   "tasks": [
     {
@@ -817,6 +826,20 @@
       ],
       "risk_notes": "**給下一個 session 的背景說明（不是待辦，T36 已 done，純粹避免重新猜一次已經走過的路）**：這個 task 的 description 曾經三次改版，只有最終這版（跟 changelog 最後幾筆對照）是真的在跑的程式碼。前兩版分別是「implementer agent 直接改 code、留在 working tree」與「本機啟動 agrabah/abu 全服務驗證」，兩份對應的程式碼檔案（`demand-implementer-prompt.ts` 等）已在第三版改版時刪除，若在舊 commit 歷史看到不要誤以為是目前行為。\n\n已知的真實限制（記錄不是阻斷）：(1) `run-demand-pipeline.ts` 完整 CLI 路徑（含 repo-scope-gate 判斷）沒有在單一次真實執行裡走到『判定單一 repo → 進 plan pipeline → plan 分支 finalize』這一條完整鏈路——因為 ALDREQ-746 這張真實測試單，repo-scope-gate 對它的判斷本身就在『abu』與『agrabah, abu』之間真實不穩定（兩者都有實測命中，且『agrabah, abu』其實才是更準確的答案，两次深入調查都真的在 agrabah 找到需要改的地方）；plan pipeline 本身（draft/review/synthesize/classify）與 finalize()（Drive/Notion/Telegram）兩段分別用直接呼叫的方式各自完整驗證過，串接邏輯是同一份程式碼、同一次改動，只是沒有巧合到用同一次執行首尾銜接。(2) 沒有做真實併發壓測（見 acceptance_criteria 第三條）。這兩點如果之後要補，直接找一張規格清楚、repo-scope-gate 會穩定判成單一 repo 的新單即可，不需要重新設計。",
       "suggested_agent": "已完成，無後續建議"
+    },
+    {
+      "id": "T37",
+      "module": "cluster",
+      "title": "多機派工（head/worker cluster）：SSH 同路徑約定 + worker HTTP agent + 派工登記表",
+      "status": "done",
+      "depends_on": [
+        "T26",
+        "T36"
+      ],
+      "description": "使用者定案（2026-08-31）：擴容方式為現機當 head（webhook/tunnel/MCP/派工決策唯一入口，自己也能 spawn），其他同網段 Mac 當 worker（輕量 HTTP agent 接單 + 主動回報完成），worker 採「約定同路徑」策略（帳號 user、/Users/user/aladdin 完整生態系），不做路徑參數化，head 本地檔案零改動。新增 lib/cluster/：cluster-env（CLUSTER_SHARED_SECRET 未設定＝整套機制 no-op，單機行為 100% 不變）、cluster-auth（x-cluster-token 常數時間比較 + uniform 401；head 端 rejectTunnel 用 CF-Connecting-IP 把 /cluster/* 對公網封死）、worker-registry（logs/cluster-workers.json，worker 啟動登記 + 每 30 分鐘冪等重送）、dispatch-registry（logs/cluster-dispatched.json，「派到哪台」登記表＝多機版 isTicketLocked；markDispatching 同步佔位封併發認領視窗）、dispatch（純邏輯依賴注入：本機/遠端名額比較取最多者、平手本機優先、佇列有單視同滿、遠端全失敗退回本機 FIFO；postJob 逾時＝結果不明時保守當已接單絕不改派，交 sweeper 校正）、worker-client（fetch + AbortSignal.timeout）、cluster-head（production 接線 + /cluster/register、/cluster/job-done 路由 + remote sweeper 每 10 分鐘：15 分鐘冷啟動寬限、連續 3 次失聯清登記並通知、26 小時絕對上限）。新增 worker-agent.ts（Hono 0.0.0.0:8801：/health 無認證最小資訊、/capacity、POST /jobs（額滿 409、bug 先 ensureTrackerPending 再 submitCreateMr）、GET /jobs/:ticket 回鎖/佇列/進度；pipeline-queue 新增 onExited 事件驅動 job-done 回報）。claim.ts/demand-claim.ts 換用 dispatchBug/dispatchDemand 並補 remote_started/already_running_remote 分支與遠端進度查詢；status-list 合併遠端執行中的單。deploy/bootstrap-worker.sh（冪等引導，人工步驟印待辦）+ deploy/doctor-worker.sh（唯讀體檢，全綠才上線）+ launchd/run-worker-agent.sh + com.aladdin.tg-worker-agent.plist；run-server.sh 增匯出 CLUSTER_SHARED_SECRET。\n\n2026-08-31 對抗性 review（opus，FAILED：2 critical/4 major）後的結構性修正：C-1（out-of-band run 失明→雙跑+互清鎖）→ worker 端改「本機活動三合一」真相來源（lib/cluster/local-activity.ts：queue ∪ 鎖目錄 ∪ ps 掃 wrapper，比照 post-run-notify 的行程指紋，已對真實 ps 輸出實測），/capacity、接單、/jobs/:ticket、job-done 回報全走它；job-done 前偵測到本機仍有該單活動（如 timeout 自動重試）即跳過回報；head 派工探測改 /capacity?ticket= 一次問名額+活動，發現活動就地回填登記回 already_running_remote。C-2/M-1（sweeper 誤導重新認領+需求單卡死+dispatching 重啟丟棄）→ 抽出 lib/cluster/remote-sweeper.ts（DI 可測）：失聯**不清登記**只告警一次、26h 上限才強制清、dispatching 條目 recover 保留並向全 worker 求證、需求單各清除路徑依「能否排除仍在跑/已完成」決定是否 resetAiAnalysisForReclaim、使用者訊息除安全情境外不再出現「請重新認領」。M-2（超出 grammy 10 秒預算）→ capacity 2.5s、postJob 30s→6s、只試最佳一台。M-3 → missCounts 隨 job-done noteCleared + 每輪修剪孤兒 + sweep 重疊防護旗標。M-4 → job-done 驗 worker 名稱格式與登記身分（僅登記的執行機能清自己的登記，仍冪等）。另修 deploy 腳本 bash 3.2 對 `$var` 後接全形字元誤併變數名的 bug（doctor 首跑實測抓到）。",
+      "acceptance_criteria": "bun test 全綠（新增 cluster-auth/worker-registry/dispatch-registry/dispatch 測試 + pipeline-queue has/runningCount/onExited 測試；whitelist-kit-routing 既有 1 failure 為 main 上已存在的環境相依問題，與本 task 無關，已用 main worktree 重跑同檔驗證）；worker-agent 實機煙霧測試通過（/health 無認證、/capacity 帶 token、錯 token 401 空 body、非法 ticket 400、未知路徑 401 空 body、head 失聯時登記失敗不崩潰）；head /cluster/* 煙霧測試通過（register 冪等、bad url 400、帶 CF-Connecting-IP 即使 token 正確也 401、job-done 冪等、無 token 401）；未設 CLUSTER_SHARED_SECRET 時 registerClusterRoutes/initClusterHead 為 no-op、dispatchBug/dispatchDemand 等同原 submit（測試 no-workers 分支驗證）。 Review 輪後：bun test 308 pass/1 fail（僅既有 kit 失敗）；新增 local-activity（含真實 ps 實測）與 remote-sweeper 測試共 12 case；dispatch/dispatch-registry 測試同步更新（單一候選、healing、dispatching 保留）。",
+      "risk_notes": "（1）Claude 帳號額度是帳號層級共享：多台共用同一訂閱時擴容只解單機資源瓶頸，不放大帳號吞吐——啟用前先確認瓶頸在哪，必要時各機獨立帳號/API billing。（2）v1 取捨：head 本機 FIFO 佇列不會在 worker 釋放名額時跨機遞補（佇列只在全 cluster 滿員時累積）；tg-monitor 只見本機 pipeline 且重試按鈕看不到遠端登記表——避免對派在別台的單按重試；tracker.md 每台一份維持 /sync-bug-tracker 事後補正策略。（3）postJob 逾時保守當已接單：極端情況（worker 收到但 spawn 前崩潰）該單會佔登記表最多 ~25 分鐘（15 分寬限 + 下輪 sweep）才恢復可認領，屬已接受取捨。（4）worker 整機重開：detached pipeline 與 /tmp 鎖一起消失，sweeper 清登記後通知維運者人工判讀（無法與「回報遺失但已正常完成」區分）。（5）worker 8801 僅限受信任 LAN，嚴禁 port forwarding；/health 比照 head 慣例無認證且只回 uptime。（6）CLI 路徑（tg-monitor retry、人工終端）依然只有本機視野，跨機重複防護只在 head 的 Telegram 入口生效。（7）殘餘風險（對抗性 review 已知悉、接受）：正在跑某單的 worker 恰好在認領探測當下失聯、且登記表恰好已被清（三重疊加）時仍可能雙跑，靠 sweeper 保守策略與維運告警兜底；sweeper 內 notifyOperator/resetAiAnalysisForReclaim 為同步 execFileSync（與 stale-lock-reaper 同一取捨）；/cluster/* 公網封鎖依賴 cloudflared 注入 CF-Connecting-IP，換 tunnel 需重新評估（啟動 log 有明示）；registry 名冊無程式面撤銷 API，worker 退役需人工刪檔+重啟 head（README 已載明步驟）。",
+      "suggested_agent": "無（本 task 由 Claude Code 主 session 直接完成，2026-08-31）"
     }
   ]
 }

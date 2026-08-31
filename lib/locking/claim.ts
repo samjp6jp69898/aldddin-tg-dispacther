@@ -2,8 +2,8 @@ import { execFileSync } from 'node:child_process'
 import type { Context } from 'grammy'
 import { queryCandidateTickets } from '../notion-integration/candidate-tickets.ts'
 import { ensureTrackerPending } from '../pipeline-runner/tracker-sync.ts'
-import { submitCreateMr } from '../pipeline-runner/spawn-create-mr.ts'
 import { GLOBAL_CONCURRENCY_LIMIT } from '../pipeline-runner/concurrency-limiter.ts'
+import { dispatchBug, getRemoteEntry, describeRemoteProgress } from '../cluster/cluster-head.ts'
 import { describeTicketProgress, isTicketLocked } from '../pipeline-runner/ticket-progress.ts'
 import type { TechUser } from '../user-resolution/tech-user.ts'
 
@@ -57,6 +57,15 @@ export async function handleClaim(ctx: Context, techUser: TechUser, ticket: stri
     return
   }
 
+  // 多機派工：這張單已派在某台 worker 上執行——本機鎖目錄看不到（鎖跟著
+  // 執行機走），要靠 head 的派工登記表判斷（見 cluster-head.ts）。單機部署
+  // （cluster 停用）時登記表恆空，這個分支永遠不會進來。
+  const remoteEntry = getRemoteEntry(ticket)
+  if (remoteEntry) {
+    await ctx.reply(await describeRemoteProgress(remoteEntry))
+    return
+  }
+
   // 防禦性重驗：訊息可能是舊的，畫面上的單這期間可能已被別人處理完、
   // 或 Notion『當前指派』／『狀態』已經變了。
   const stillCandidate = (await queryCandidateTickets(techUser.notion_user_id)).includes(ticket)
@@ -81,7 +90,9 @@ export async function handleClaim(ctx: Context, techUser: TechUser, ticket: stri
   // 矛盾的靜默失敗（違反 T10 的『每個分支都要有明確回覆』原則）。per-ticket
   // 鎖已經在上面 release 掉；排隊中的單不持有鎖，靠佇列的同票去重擋重複排隊
   // （見 pipeline-queue.ts 檔頭註解）。
-  const result = submitCreateMr(ticket, { triggeredBy: techUser })
+  // 多機派工：dispatchBug 內部依名額決定本機 spawn 或派給 worker；cluster
+  // 停用/無 worker 時完全等同原本的 submitCreateMr（見 cluster-head.ts）。
+  const result = await dispatchBug(ticket, techUser)
   if (!result.ok) {
     // spawn 本身失敗（磁碟/fd 用盡等）：明確回覆，不能讓使用者在例外未接住
     // 的舊版行為下完全收不到任何訊息。per-ticket 鎖已經 release，可以重新
@@ -90,6 +101,14 @@ export async function handleClaim(ctx: Context, techUser: TechUser, ticket: stri
     return
   }
 
+  if (result.status === 'remote_started') {
+    await ctx.reply(`已開始處理 ${ticket}（派工至另一台機器執行，完成後會自動通知你）`)
+    return
+  }
+  if (result.status === 'already_running_remote') {
+    await ctx.reply(`${ticket} 已在另一台機器執行中，不需要重複認領，完成後會自動通知。`)
+    return
+  }
   if (result.status === 'already_running') {
     // 連點兩次落在「已 spawn、claude 冷啟動尚未拿鎖」的視窗（2026-08-28
     // FAQ-4768 實測踩到）：isTicketLocked 看不到、佇列去重也掃不到，由佇列的

@@ -369,7 +369,42 @@ const bugQueue = createPipelineQueue<BugPayload>({
     notifyQueueEvent(entry.triggeredBy, `▶️ ${entry.ticket} 排隊結束，背景流程已自動開始處理，完成後會再通知你。`),
   onDequeueFailed: entry =>
     notifyQueueEvent(entry.triggeredBy, `⚠️ ${entry.ticket} 輪到執行時背景流程啟動失敗，請重新認領一次或聯絡維運人員檢查 spawn-errors.log。`),
+  onExited: ticket => {
+    for (const cb of bugExitListeners) {
+      try {
+        cb(ticket)
+      } catch (err) {
+        console.error(`spawn-create-mr: exit listener 失敗（${ticket}）: ${err}`)
+      }
+    }
+  },
 })
+
+// 多機派工（lib/cluster/）用的旁路出口。三者都只讀本 process 的 in-memory
+// 狀態，跟 limiter/queue 同壽命，不新增任何檔案狀態。
+const bugExitListeners: Array<(ticket: string) => void> = []
+
+/** 註冊「任一 Bug 背景流程真的結束」的旁聽 callback（worker-agent.ts 用來
+ * 回報 head 完成事件）。呼叫時點在名額釋放與遞補之後，見 pipeline-queue.ts
+ * 的 onExited 註解。 */
+export function registerBugPipelineExitListener(cb: (ticket: string) => void): void {
+  bugExitListeners.push(cb)
+}
+
+/** 本 process 的 Bug pipeline 名額實況（/capacity 回報與派工選擇用）。 */
+export function getBugQueueStats(): { limit: number; running: number; queued: number } {
+  return { limit: GLOBAL_CONCURRENCY_LIMIT, running: bugQueue.runningCount(), queued: bugQueue.size() }
+}
+
+/** 這張 Bug 單在本 process 是否執行中/排隊中（多機派工的重複防護用）。 */
+export function hasBugTicketActive(ticket: string): 'running' | 'queued' | null {
+  return bugQueue.has(ticket)
+}
+
+/** running 集合快照（見 pipeline-queue.ts runningTickets 註解）。 */
+export function getBugRunningTickets(): string[] {
+  return bugQueue.runningTickets()
+}
 
 /** 提交一張 Bug 單：有名額直接 spawn（started）、額滿排入 FIFO 佇列（queued，
  * 回覆順位讓認領人知道要等幾張）、已在排隊中則回 already_queued 不重複排。 */

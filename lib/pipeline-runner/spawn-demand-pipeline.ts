@@ -171,7 +171,35 @@ const demandQueue = createPipelineQueue<DemandPayload>({
   onDequeueStarted: entry =>
     notifyQueueEvent(entry.triggeredBy, `▶️ ${entry.ticket} 排隊結束，需求 pipeline 已自動開始評估規格與範圍，完成後會再通知你。`),
   onDequeueFailed: entry => releaseTicketAndNotify(entry, `輪到執行時背景流程啟動失敗（詳見 spawn-errors.log）`),
+  onExited: ticket => {
+    for (const cb of demandExitListeners) {
+      try {
+        cb(ticket)
+      } catch (err) {
+        console.error(`spawn-demand-pipeline: exit listener 失敗（${ticket}）: ${err}`)
+      }
+    }
+  },
 })
+
+// 多機派工（lib/cluster/）用的旁路出口，介面說明比照 spawn-create-mr.ts。
+const demandExitListeners: Array<(ticket: string) => void> = []
+
+export function registerDemandPipelineExitListener(cb: (ticket: string) => void): void {
+  demandExitListeners.push(cb)
+}
+
+export function getDemandQueueStats(): { limit: number; running: number; queued: number } {
+  return { limit: DEMAND_CONCURRENCY_LIMIT, running: demandQueue.runningCount(), queued: demandQueue.size() }
+}
+
+export function hasDemandTicketActive(ticket: string): 'running' | 'queued' | null {
+  return demandQueue.has(ticket)
+}
+
+export function getDemandRunningTickets(): string[] {
+  return demandQueue.runningTickets()
+}
 
 /** 提交一張需求單：有名額直接 spawn、額滿排入 FIFO 佇列（回覆順位）、已在
  * 排隊中則回 already_queued。介面說明比照 submitCreateMr。 */
