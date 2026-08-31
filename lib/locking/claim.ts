@@ -2,7 +2,8 @@ import { execFileSync } from 'node:child_process'
 import type { Context } from 'grammy'
 import { queryCandidateTickets } from '../notion-integration/candidate-tickets.ts'
 import { ensureTrackerPending } from '../pipeline-runner/tracker-sync.ts'
-import { spawnCreateMr } from '../pipeline-runner/spawn-create-mr.ts'
+import { submitCreateMr } from '../pipeline-runner/spawn-create-mr.ts'
+import { GLOBAL_CONCURRENCY_LIMIT } from '../pipeline-runner/concurrency-limiter.ts'
 import { describeTicketProgress, isTicketLocked } from '../pipeline-runner/ticket-progress.ts'
 import type { TechUser } from '../user-resolution/tech-user.ts'
 
@@ -74,24 +75,39 @@ export async function handleClaim(ctx: Context, techUser: TechUser, ticket: stri
   // 把鎖的擁有權交給即將 spawn 的 /create-mr 自己的 Step 0.1.3（見 releaseLock 註解）。
   releaseLock(ticket)
 
-  // T26：先真的 spawn（內部會先檢查全域併發上限），確定有沒有名額，再決定
-  // 要回覆「已開始處理」還是「已達上限」——順序很重要：如果先回「已開始
-  // 處理」才發現額度不夠，會變成回覆內容自相矛盾的靜默失敗（違反 T10 的
-  // 『每個分支都要有明確回覆』原則）。per-ticket 鎖已經在上面 release 掉，
-  // 沒佔滿全域額度不影響其他人認領同一張單（bug-lock 只擋『幾乎同時點同一
-  // 張單』那個瞬間，鎖本來就該儘早放手，見 releaseLock 註解）。
-  const result = spawnCreateMr(ticket, { triggeredBy: techUser })
+  // T26：先真的 submit（有名額直接 spawn，額滿排入 FIFO 佇列——2026-08-28
+  // 使用者定案，不再「達上限請稍後再試」），看實際結果再決定回什麼訊息——
+  // 順序很重要：如果先回「已開始處理」才發現額度不夠，會變成回覆內容自相
+  // 矛盾的靜默失敗（違反 T10 的『每個分支都要有明確回覆』原則）。per-ticket
+  // 鎖已經在上面 release 掉；排隊中的單不持有鎖，靠佇列的同票去重擋重複排隊
+  // （見 pipeline-queue.ts 檔頭註解）。
+  const result = submitCreateMr(ticket, { triggeredBy: techUser })
   if (!result.ok) {
-    // review 發現：spawnCreateMr 內部 spawn 失敗（磁碟/fd 用盡等）跟「單純
-    // 額度滿了」是不同情境，給不同訊息——都要有明確回覆，不能讓使用者在
-    // 例外未接住的舊版行為下完全收不到任何訊息（見 spawnCreateMr 的
-    // spawn_error 分支註解）。per-ticket 鎖已經 release，兩種情況都可以
-    // 重新嘗試認領。
-    const text =
-      result.reason === 'concurrency_limit'
-        ? `${ticket} 目前無法啟動：背景流程已達全域併發上限，請稍後再試。`
-        : `${ticket} 目前無法啟動：背景流程啟動失敗，請稍後再試或聯絡維運人員檢查 spawn-errors.log。`
-    await ctx.reply(text)
+    // spawn 本身失敗（磁碟/fd 用盡等）：明確回覆，不能讓使用者在例外未接住
+    // 的舊版行為下完全收不到任何訊息。per-ticket 鎖已經 release，可以重新
+    // 嘗試認領。
+    await ctx.reply(`${ticket} 目前無法啟動：背景流程啟動失敗，請稍後再試或聯絡維運人員檢查 spawn-errors.log。`)
+    return
+  }
+
+  if (result.status === 'already_running') {
+    // 連點兩次落在「已 spawn、claude 冷啟動尚未拿鎖」的視窗（2026-08-28
+    // FAQ-4768 實測踩到）：isTicketLocked 看不到、佇列去重也掃不到，由佇列的
+    // running 集合擋下——絕不能再 spawn 第二條（它早退時的 EXIT trap 會誤放
+    // 第一條的鎖並清 worktree）。
+    await ctx.reply(`${ticket} 已在執行中（背景流程剛啟動），不需要重複認領，完成後會自動通知。`)
+    return
+  }
+  if (result.status === 'queued') {
+    await ctx.reply(
+      `${ticket} 已排入等待佇列：背景併發已滿（${GLOBAL_CONCURRENCY_LIMIT} 張執行中），你目前排第 ${result.position} 順位` +
+        (result.ahead > 0 ? `（前面還有 ${result.ahead} 張在排隊）` : `（你是下一張）`) +
+        `。輪到時會自動開始並發 TG 通知你，不需要重新認領。`,
+    )
+    return
+  }
+  if (result.status === 'already_queued') {
+    await ctx.reply(`${ticket} 已在等待佇列中（第 ${result.position} 順位，前面還有 ${result.ahead} 張），輪到時會自動開始，不需要重複認領。`)
     return
   }
 

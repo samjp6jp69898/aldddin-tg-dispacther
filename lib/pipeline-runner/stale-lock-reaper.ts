@@ -2,7 +2,7 @@ import { readdirSync, readFileSync, existsSync, mkdirSync, appendFileSync, write
 import { execFileSync } from 'node:child_process'
 import { join } from 'node:path'
 import { cleanupWorktreesForTicket } from './cleanup-worktree.ts'
-import { spawnCreateMr } from './spawn-create-mr.ts'
+import { submitCreateMr } from './spawn-create-mr.ts'
 import { notifyOperator } from '../notify/operator.ts'
 import { getPipelineActiveSince, clearPipelineActive, ACTIVE_MARKER_DIR } from './active-pipeline-marker.ts'
 
@@ -164,7 +164,10 @@ export function reapStaleLocks(
   const release = deps.release ?? releaseLock
   const cleanup = deps.cleanup ?? ((ticket: string) => cleanupWorktreesForTicket(ticket))
   const clearMarker = deps.clearMarker ?? ((ticket: string) => clearPipelineActive(ticket, opts.markerDir ?? ACTIVE_MARKER_DIR))
-  const retry = deps.retry ?? ((ticket: string) => spawnCreateMr(ticket))
+  // 2026-08-28 起 submitCreateMr 額滿改排隊：result.ok=true 也可能是 queued
+  // （排入佇列、輪到自動跑）——對這裡的語意仍算「重試已成功交付」，照舊計入
+  // 重試額度。
+  const retry = deps.retry ?? ((ticket: string) => submitCreateMr(ticket))
   const notify = deps.notify ?? notifyOperator
   const getRetryState = deps.readRetryState ?? readRetryState
   const setRetryState = deps.writeRetryState ?? writeRetryState
@@ -183,8 +186,8 @@ export function reapStaleLocks(
       log(`${ticket} 清理 worktree 時發生例外（不阻斷後續通知）: ${err}`)
     }
     // 標記先清掉（代表 dispatcher 不再認為自己對這張單的舊 pipeline 負責）；
-    // 如果下面真的自動重試，retry() 內部的 spawnCreateMr 會立刻用新的
-    // spawn 時間重新標記，兩者不衝突。
+    // 如果下面真的自動重試，retry() 內部的 submitCreateMr 會在 spawn 時用
+    // 新的 spawn 時間重新標記，兩者不衝突。
     try {
       clearMarker(ticket)
     } catch (err) {

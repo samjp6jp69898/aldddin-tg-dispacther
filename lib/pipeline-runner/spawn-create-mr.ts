@@ -1,8 +1,10 @@
-import { spawn } from 'node:child_process'
+import { spawn, execFile } from 'node:child_process'
 import { openSync, closeSync, mkdirSync, appendFileSync, writeFileSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { GLOBAL_CONCURRENCY_LIMIT, createConcurrencyLimiter } from './concurrency-limiter.ts'
+import { createPipelineQueue, type QueueEntry, type QueueTriggeredBy, type SkipReason, type SubmitResult } from './pipeline-queue.ts'
 import { markPipelineActive, clearPipelineActive } from './active-pipeline-marker.ts'
+import { isTicketLocked } from './ticket-progress.ts'
 import type { TechUser } from '../user-resolution/tech-user.ts'
 
 const LOG_DIR = '/Users/user/aladdin/telegram-dispatcher/logs'
@@ -10,9 +12,20 @@ const SPAWN_ERROR_LOG = join(LOG_DIR, 'spawn-errors.log')
 const TICKET_RE = /^FAQ-\d+$/
 
 // T26：全 process 共用同一份額度，這個檔案是唯一消費者（見
-// concurrency-limiter.ts 檔頭註解）——tryAcquire 用在下面 spawnCreateMr，
-// release 用在背景 process 的 exit/error handler。
+// concurrency-limiter.ts 檔頭註解）。2026-08-28 起額度交給 pipeline-queue.ts
+// 統一管理（tryAcquire 在 submit/drain、release 在背景 process 的 exit/error
+// handler），額滿改排隊而非拒絕。
 const concurrencyLimiter = createConcurrencyLimiter(GLOBAL_CONCURRENCY_LIMIT)
+
+const TG_NOTIFY_SH = '/Users/user/aladdin/scripts/tg-notify.sh'
+
+/** 排隊的單輪到（或啟動失敗）時通知當初認領的人。fire-and-forget：
+ * tg-notify.sh 本身永遠 exit 0、失敗只印一行，不阻斷遞補流程。CLI 觸發
+ * （無 triggeredBy）沒有通知對象，跳過。 */
+export function notifyQueueEvent(triggeredBy: QueueTriggeredBy, text: string): void {
+  if (!triggeredBy?.email) return
+  execFile('bash', [TG_NOTIFY_SH, '--email', triggeredBy.email, '--text', text], () => {})
+}
 
 /**
  * 起一個完全脫離目前行程生命週期的背景 process：stdout/stderr 明確導向獨立
@@ -62,16 +75,16 @@ export function spawnDetachedProcess(
     env: opts.env ? { ...process.env, ...opts.env } : undefined,
   })
 
-  // fd 已經 dup2 進子行程、子行程有自己的獨立複本——parent 這邊用不到了，
-  // 不關閉的話這兩個 fd 會在長駐的 webhook server 裡一路累積到撞 ulimit -n。
-  closeSync(outFd)
-  closeSync(errFd)
-
   // 'error'（spawn 本身失敗，例如指令不存在）跟 'exit'（process 真的跑過、
   // 結束）理論上互斥，但 Node 對 spawn 失敗時是否還會補發 'exit' 這件事沒有
   // 跨版本/跨平台的穩定保證——用 guard 確保 onExit 不管哪個事件觸發都只算
   // 一次，避免『spawn 失敗卻被兩個 event 各釋放一次名額』這種計數器多釋放
   // 的邊界情況。
+  //
+  // 對抗性 review（2026-08-28）：listener 必須是 spawn() 之後的第一件事——
+  // 若在掛 listener 之前（例如下面的 closeSync）丟例外，子行程已在跑但
+  // onExit 永遠不會被呼叫，呼叫端 catch 又會歸還名額，實際併發變成
+  // LIMIT+1。event 由 event loop 派發，同一個同步區塊內掛上必然來得及。
   let onExitCalled = false
   function callOnExitOnce(): void {
     if (onExitCalled) return
@@ -85,6 +98,17 @@ export function spawnDetachedProcess(
     callOnExitOnce()
   })
   child.on('exit', () => callOnExitOnce())
+
+  // fd 已經 dup2 進子行程、子行程有自己的獨立複本——parent 這邊用不到了，
+  // 不關閉的話這兩個 fd 會在長駐的 webhook server 裡一路累積到撞 ulimit -n。
+  // try/catch：listener 已掛上，這之後任何 throw 都會讓呼叫端 catch 再釋放
+  // 一次名額（與 onExit 的釋放重複＝超賣），所以 close 失敗只記 log 不拋出。
+  try {
+    closeSync(outFd)
+    closeSync(errFd)
+  } catch (err) {
+    console.error(`spawnDetachedProcess: closeSync 失敗（不影響子行程）: ${err}`)
+  }
 
   child.unref()
   return child.pid
@@ -233,18 +257,13 @@ timeout 7200 ${CLAUDE_BIN} -p "/create-mr:create-mr $1 $3" --model opus --permis
  * 的 'error' handler 同一個 log 檔，同一種『記錄但不讓呼叫端連坐』的慣例），
  * 回傳一個獨立的 reason 讓 claim.ts 能回覆使用者明確的失敗訊息。
  */
-export function spawnCreateMr(
-  ticket: string,
-  opts: { resume?: boolean; triggeredBy?: TechUser } = {},
-): { ok: true; pid: number | undefined } | { ok: false; reason: 'concurrency_limit' | 'spawn_error' } {
-  if (!TICKET_RE.test(ticket)) {
-    throw new Error(`拒絕 spawn：ticket 格式不對（${ticket}），可能是注入嘗試`)
-  }
+// 2026-08-28（使用者定案）：額滿改排隊。spawnCreateMrNow 是「真正起背景流程」
+// 的部分（不含額度檢查），額度與 FIFO 佇列交給 bugQueue 統一管理——排隊、
+// 遞補、重啟恢復的完整語意見 pipeline-queue.ts 檔頭註解。
+type BugPayload = { resume: boolean }
 
-  if (!concurrencyLimiter.tryAcquire()) {
-    return { ok: false, reason: 'concurrency_limit' }
-  }
-
+function spawnCreateMrNow(entry: QueueEntry<BugPayload>, onExit: () => void): { ok: true; pid: number | undefined } | { ok: false } {
+  const { ticket } = entry
   try {
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-')
     const base = `${ticket}.${timestamp}`
@@ -257,11 +276,11 @@ export function spawnCreateMr(
     // 給非技術人員，跟「誰觸發了這次分析」是兩件事，2026-08-27 使用者要求
     // 分開）。best-effort：寫檔失敗不阻斷 spawn，只是這次 run 之後顯示不出
     // 發起人。
-    if (opts.triggeredBy) {
+    if (entry.triggeredBy) {
       try {
         writeFileSync(
           join(LOG_DIR, `${base}.triggered-by.json`),
-          JSON.stringify({ name: opts.triggeredBy.notion_user_name, email: opts.triggeredBy.email, at: new Date().toISOString() }),
+          JSON.stringify({ name: entry.triggeredBy.name, email: entry.triggeredBy.email, at: new Date().toISOString() }),
         )
       } catch {
         // best-effort，理由同上。
@@ -275,7 +294,7 @@ export function spawnCreateMr(
 
     // 第三個位置參數（$3）固定只有兩個可能值：'resume' 或 ''——見 WRAPPER_SCRIPT
     // 尾註解，不把呼叫端任意字串放進 prompt。
-    const pid = spawnDetachedProcess('bash', ['-c', WRAPPER_SCRIPT, 'run-create-mr', ticket, stdoutPath, opts.resume ? 'resume' : ''], {
+    const pid = spawnDetachedProcess('bash', ['-c', WRAPPER_SCRIPT, 'run-create-mr', ticket, stdoutPath, entry.payload.resume ? 'resume' : ''], {
       cwd: '/Users/user/aladdin',
       stdoutPath,
       stderrPath,
@@ -285,23 +304,89 @@ export function spawnCreateMr(
       // /create-mrs 不會設這個環境變數，行為不受影響。
       env: { DISPATCHER_TRIGGERED: '1' },
       // T26：不管背景流程最後是成功、失敗、被 timeout 殺、還是中途 crash，
-      // 只要真的結束就釋放名額——見 spawnDetachedProcess 的 'exit'/'error'
-      // handler，兩者都保證只呼叫一次。正常結束時一併清掉 active-pipeline
-      // 標記（被 kill -9/斷電打斷、onExit 沒機會執行時標記會殘留，這是
+      // 只要真的結束就釋放名額（onExit 由 bugQueue 傳入：release + 遞補下一張
+      // 排隊的單）——見 spawnDetachedProcess 的 'exit'/'error' handler，兩者
+      // 都保證只呼叫一次。正常結束時一併清掉 active-pipeline 標記（被
+      // kill -9/斷電打斷、onExit 沒機會執行時標記會殘留，這是
       // stale-lock-reaper 需要偵測的訊號，不是缺陷，見該檔案註解）。
+      // 順序硬約束（對抗性 review 2026-08-28）：clearPipelineActive 必須在
+      // onExit() **之前**——onExit 內的 drain 是同步的，若隊頭恰是同一張
+      // ticket，遞補的新 run 會先 markPipelineActive，後執行的 clear 會把
+      // 新標記誤刪，讓新 run 脫離 stale-lock-reaper 保護。
       onExit: () => {
-        concurrencyLimiter.release()
         clearPipelineActive(ticket)
+        onExit()
       },
     })
     return { ok: true, pid }
   } catch (err) {
-    concurrencyLimiter.release()
     clearPipelineActive(ticket)
     mkdirSync(dirname(SPAWN_ERROR_LOG), { recursive: true })
     appendFileSync(SPAWN_ERROR_LOG, `${new Date().toISOString()} spawnCreateMr 失敗（${ticket}）: ${err}\n`)
-    return { ok: false, reason: 'spawn_error' }
+    return { ok: false }
   }
+}
+
+// 出列/恢復時的前提重驗（對抗性 review 2026-08-28 發現的 TOCTOU：submit
+// 當下 claim.ts 檢查過 isTicketLocked，但排隊可能把 spawn 延後數小時，期間
+// 別的入口——人工終端機、/create-mrs 批次、tg-monitor CLI——可能已把同一張
+// 單跑起來；不重驗就 spawn 的重複 run 在 Step 0.1 早退後，EXIT trap 會
+// release 存活 run 的鎖並清掉它的 worktree）。時效上限：排隊超過 24 小時的
+// 單，工單狀態多半已變（被人工處理/改派），不再自動 spawn，通知發起人
+// 重新認領。兩者都是出列當下的一次性檢查，不是輪詢。
+export const MAX_QUEUE_WAIT_MS = 24 * 3600 * 1000
+
+// code 語意（onSkipped 據此決定收尾動作，見 SkipReason 型別註解）：
+// - locked：別的流程正在跑這張單——它會自行回報結果與收尾狀態，這裡**絕不能**
+//   動工單狀態（否則會蓋掉存活 run 正在維護的狀態），只通知發起人不用重複認領。
+// - expired：排隊逾時、沒有任何流程在跑——需求側要把 Notion AI分析 改回
+//   「需要重跑」讓單子回到可認領池（見 spawn-demand-pipeline.ts 的 onSkipped）。
+export function makeQueueSkipReason<P>(opts: { lockDir?: string } = {}): (entry: QueueEntry<P>) => SkipReason | null {
+  return entry => {
+    if (isTicketLocked(entry.ticket, opts)) return { code: 'locked', text: '偵測到已有另一個流程正在處理這張單（鎖存在），不重複觸發' }
+    const enqueuedMs = Date.parse(entry.enqueuedAt)
+    if (Number.isFinite(enqueuedMs) && Date.now() - enqueuedMs > MAX_QUEUE_WAIT_MS) return { code: 'expired', text: '排隊已超過 24 小時，工單狀態可能已變更' }
+    return null
+  }
+}
+
+const bugQueue = createPipelineQueue<BugPayload>({
+  limiter: concurrencyLimiter,
+  stateFile: join(LOG_DIR, 'pipeline-queue.bug.json'),
+  ticketRe: TICKET_RE,
+  spawnNow: spawnCreateMrNow,
+  skipReason: makeQueueSkipReason<BugPayload>(),
+  // Bug 單被 skip 沒有死路問題：tracker 仍是 pending、Notion 指派未動，隨時
+  // 可重新認領（locked 情況則根本不需要重新認領，執行中的流程會自行回報）。
+  onSkipped: (entry, reason) =>
+    notifyQueueEvent(
+      entry.triggeredBy,
+      reason.code === 'locked'
+        ? `ℹ️ ${entry.ticket} 已從等待佇列移除：${reason.text}。該流程會自行回報結果，不需要重新認領。`
+        : `ℹ️ ${entry.ticket} 已從等待佇列移除：${reason.text}。若仍需要分析，請重新認領一次。`,
+    ),
+  onDequeueStarted: entry =>
+    notifyQueueEvent(entry.triggeredBy, `▶️ ${entry.ticket} 排隊結束，背景流程已自動開始處理，完成後會再通知你。`),
+  onDequeueFailed: entry =>
+    notifyQueueEvent(entry.triggeredBy, `⚠️ ${entry.ticket} 輪到執行時背景流程啟動失敗，請重新認領一次或聯絡維運人員檢查 spawn-errors.log。`),
+})
+
+/** 提交一張 Bug 單：有名額直接 spawn（started）、額滿排入 FIFO 佇列（queued，
+ * 回覆順位讓認領人知道要等幾張）、已在排隊中則回 already_queued 不重複排。 */
+export function submitCreateMr(ticket: string, opts: { resume?: boolean; triggeredBy?: TechUser } = {}): SubmitResult {
+  if (!TICKET_RE.test(ticket)) {
+    throw new Error(`拒絕 spawn：ticket 格式不對（${ticket}），可能是注入嘗試`)
+  }
+  const triggeredBy: QueueTriggeredBy = opts.triggeredBy
+    ? { name: opts.triggeredBy.notion_user_name, email: opts.triggeredBy.email }
+    : null
+  return bugQueue.submit(ticket, triggeredBy, { resume: !!opts.resume })
+}
+
+/** 只給 server.ts 啟動時呼叫一次（CLI 短命行程絕不能呼叫，見 pipeline-queue.ts
+ * recoverFromDisk 註解）。 */
+export function recoverBugQueue(): { started: number; requeued: number; skipped: number } {
+  return bugQueue.recoverFromDisk()
 }
 
 /**
@@ -323,8 +408,13 @@ if (import.meta.main) {
   // `--resume`（2026-08-26）：tg-monitor 重試按鈕帶入，讓 /create-mr 走 Step 0.2
   // 續跑盤點（從上一輪最後完成的階段接續）。只認這個字面 flag，其餘一律當
   // 沒帶（不把任意 argv 轉發進 claude prompt）。
+  //
+  // 排隊機制（2026-08-28）對這條 CLI 路徑無感：CLI 是短命行程，limiter 從 0
+  // 起算，submit 永遠拿得到名額、只會走 started / spawn_error 兩種結果，絕不
+  // 會把單留在一個馬上就要結束的 process 的 in-memory 佇列裡。真正的併發上限
+  // 由呼叫端（tg-monitor）自己用 ps 現場計數把關，跟以前一樣。
   const resume = process.argv.includes('--resume')
-  const result = spawnCreateMr(ticket, { resume })
+  const result = submitCreateMr(ticket, { resume })
   console.log(JSON.stringify(result))
   process.exit(result.ok ? 0 : 1)
 }

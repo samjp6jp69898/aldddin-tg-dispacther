@@ -8,6 +8,7 @@ import { handleDemandClaim } from '../locking/demand-claim.ts'
 import { sendStatusList } from '../webhook-server/status-list.ts'
 import { createReplayGuard } from './replay-guard.ts'
 import { handleKitCommand, isKitAdminChat } from '../webhook-server/kit-issue.ts'
+import { handleBugReportCommand, isBugReportAdminChat } from '../webhook-server/bug-report-command.ts'
 import { logUnknownSender } from '../webhook-server/unknown-sender-log.ts'
 import { triggerTgAutoSync } from '../webhook-server/trigger-auto-sync.ts'
 
@@ -21,8 +22,9 @@ import { triggerTgAutoSync } from '../webhook-server/trigger-auto-sync.ts'
  * 白名單內的 chat_id 通過後往下流動——訊息走 T30 指令式路由（/bug 直接列
  * 清單 / /req 需求池清單 / /status 列出目前正在執行中的工單（見
  * status-list.ts） / /menu 頂層選單 / /kit 核發企劃 starter kit
- * （僅 TG_KIT_ADMIN_CHAT_ID，見 kit-issue.ts） / 其他回用法提示，見 handler
- * 內註解）；callback_query 依 callback_data 分流 menu:bug（T29，觸發 T6/T8
+ * （僅 TG_KIT_ADMIN_CHAT_ID，見 kit-issue.ts） / /bugreport 推送 Bug 指派人員
+ * 統計 CSV（僅 TG_BUG_REPORT_ADMIN_CHAT_ID，見 bug-report-command.ts） /
+ * 其他回用法提示，見 handler 內註解）；callback_query 依 callback_data 分流 menu:bug（T29，觸發 T6/T8
  * 查詢列清單）/ reqpool:noop（T9 建立、T32 接上真實需求池清單）/
  * claim:{ticket}（T10）/ demand-claim:{ticket}（T33，上鎖＋更新 Notion
  * AI分析，不觸發任何自動化 pipeline）。
@@ -83,6 +85,7 @@ export function registerHandlers(bot: Bot): void {
       const rawText = (ctx.message?.text ?? '').trim()
       const text = rawText.toLowerCase()
       const kitAdmin = isKitAdminChat(chatId)
+      const bugReportAdmin = isBugReportAdminChat(chatId)
       if (text === '/bug') {
         await ctx.replyWithChatAction('typing') // 跟 menu:bug 按鈕同款：真的打 Notion 前先給讀取中提示
         await sendTicketList(ctx, techUser)
@@ -99,11 +102,17 @@ export function registerHandlers(bot: Bot): void {
         // 技術打 /kit 會直接落到最下面的 else，回一般用法提示，不洩漏這個
         // 指令存在（見 kit-issue.ts 檔頭註解）。
         await handleKitCommand(ctx, rawText)
+      } else if (bugReportAdmin && text === '/bugreport') {
+        // 只有 TG_BUG_REPORT_ADMIN_CHAT_ID 這個 chat_id 走得到這裡；同一套
+        // 「其他人落到最下面的 else，不洩漏指令存在」原則，見
+        // bug-report-command.ts 檔頭註解。
+        await ctx.replyWithChatAction('upload_document')
+        await handleBugReportCommand(ctx)
       } else {
-        const usage = kitAdmin
-          ? '可用指令：/bug（列出可認領 Bug 工單）、/req（需求池）、/status（查看你正在執行中的工單）、/menu（選單）、/kit <id> <name>（核發企劃 kit）'
-          : '可用指令：/bug（列出可認領 Bug 工單）、/req（需求池）、/status（查看你正在執行中的工單）、/menu（選單）'
-        await ctx.reply(usage)
+        const commands = ['/bug（列出可認領 Bug 工單）', '/req（需求池）', '/status（查看你正在執行中的工單）', '/menu（選單）']
+        if (kitAdmin) commands.push('/kit <id> <name>（核發企劃 kit）')
+        if (bugReportAdmin) commands.push('/bugreport（Bug 指派人員統計報表）')
+        await ctx.reply(`可用指令：${commands.join('、')}`)
       }
     } catch (err) {
       replayGuard.forget(updateId)

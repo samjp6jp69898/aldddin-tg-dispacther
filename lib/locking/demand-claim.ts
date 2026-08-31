@@ -1,7 +1,8 @@
 import { execFileSync } from 'node:child_process'
 import type { Context } from 'grammy'
 import { queryDemandPoolTickets, getDemandTicketNotionUrl } from '../notion-integration/demand-pool-tickets.ts'
-import { spawnDemandPipeline } from '../pipeline-runner/spawn-demand-pipeline.ts'
+import { submitDemandPipeline, resetAiAnalysisForReclaim } from '../pipeline-runner/spawn-demand-pipeline.ts'
+import { DEMAND_CONCURRENCY_LIMIT } from '../pipeline-runner/concurrency-limiter.ts'
 import { describeTicketProgress, isTicketLocked } from '../pipeline-runner/ticket-progress.ts'
 import type { TechUser } from '../user-resolution/tech-user.ts'
 
@@ -108,21 +109,41 @@ export async function handleDemandClaim(ctx: Context, techUser: TechUser, ticket
     releaseLock(ticket)
   }
 
-  const spawnResult = spawnDemandPipeline(ticket, techUser.email, techUser)
+  // 2026-08-28（使用者定案）：併發額滿改排入 FIFO 佇列，不再要求「稍後重新
+  // 認領」——排隊中的單輪到時由 pipeline-queue.ts 自動 spawn 並 TG 通知，
+  // Notion AI分析 維持上面剛標記的「分析中」，語意一致。
+  const spawnResult = submitDemandPipeline(ticket, techUser.email, techUser)
   if (!spawnResult.ok) {
-    // 跟 claim.ts 對 Bug pipeline 的既有處理方式一致：併發滿載/spawn 失敗都
-    // 要有明確、不同的回覆，不能讓使用者以為流程已經在跑。review 發現並
-    // 修正一個真實文案矛盾：這裡的計數器（concurrency-limiter.ts）純粹是
-    // in-memory 計數，沒有任何排隊/自動重試機制，tryAcquire 失敗當下這張
-    // 單就不會有背景流程被觸發——舊版文案卻寫「不用重新認領」，等於告訴
-    // 使用者系統會自動處理，但實際上永遠不會，除非使用者自己重新觸發。
-    // 鎖已在上面 release 過，Notion『狀態』欄位（claim 判準）也未被這裡
-    // 動過，可以直接重新認領觸發一次新的 spawn 嘗試。
-    const text =
-      spawnResult.reason === 'concurrency_limit'
-        ? `${ticket} 已認領（Notion AI分析已標記「分析中」），但需求 pipeline 目前已達全域併發上限，這次不會自動重跑，請稍後重新認領一次。`
-        : `${ticket} 已認領（Notion AI分析已標記「分析中」），但背景流程啟動失敗，請聯絡維運人員檢查 spawn-errors.log；問題排除後可重新認領一次。`
-    await ctx.reply(text)
+    // spawn 本身失敗：明確回覆，不能讓使用者以為流程已經在跑。鎖已在上面
+    // release 過；但 AI分析 已被標成「分析中」，不改回可認領值（需要重跑）
+    // 的話這張單會從 /req 候選清單消失、「重新認領」在結構上做不到（對抗性
+    // review 2026-08-28 round 3 N1——與佇列側 expired/啟動失敗的收尾規則
+    // 同一套，共用 resetAiAnalysisForReclaim）。
+    const reset = resetAiAnalysisForReclaim(ticket)
+    await ctx.reply(
+      reset
+        ? `${ticket} 背景流程啟動失敗，Notion AI分析 已改回「需要重跑」，可直接重新認領一次；若持續失敗請聯絡維運人員檢查 spawn-errors.log。`
+        : `${ticket} 背景流程啟動失敗，且 Notion AI分析 改回「需要重跑」也失敗（目前停在「分析中」）——請人工到 Notion 把 AI分析 改成「需要重跑」後重新認領，或聯絡維運人員檢查 spawn-errors.log。`,
+    )
+    return
+  }
+
+  if (spawnResult.status === 'already_running') {
+    // 連點視窗防護，理由見 claim.ts 同分支註解。AI分析=分析中 與實況一致
+    // （確實有一條流程在跑，它的 finalize 會自行更新），不需要改回。
+    await ctx.reply(`${ticket} 已在執行中（背景流程剛啟動），不需要重複認領，完成後會自動通知。`)
+    return
+  }
+  if (spawnResult.status === 'queued') {
+    await ctx.reply(
+      `已認領 ${ticket}（Notion AI分析已標記「分析中」），但需求 pipeline 併發已滿（${DEMAND_CONCURRENCY_LIMIT} 張執行中），已排入等待佇列第 ${spawnResult.position} 順位` +
+        (spawnResult.ahead > 0 ? `（前面還有 ${spawnResult.ahead} 張在排隊）` : `（你是下一張）`) +
+        `。輪到時會自動開始並發 TG 通知你，不需要重新認領。`,
+    )
+    return
+  }
+  if (spawnResult.status === 'already_queued') {
+    await ctx.reply(`${ticket} 已在等待佇列中（第 ${spawnResult.position} 順位，前面還有 ${spawnResult.ahead} 張），輪到時會自動開始，不需要重複認領。`)
     return
   }
 

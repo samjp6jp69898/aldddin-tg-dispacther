@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import { classifyPipelineResult, type Classification } from './classify-result.ts'
 import { getTicketNotionUrl, getTicketAiAnalysisStatus } from '../notion-integration/candidate-tickets.ts'
 import { notifyOperator } from '../notify/operator.ts'
-import { spawnCreateMr } from './spawn-create-mr.ts'
+import { submitCreateMr } from './spawn-create-mr.ts'
 
 const RESOLVE_REVIEWER_SH = '/Users/user/aladdin/scripts/resolve-reviewer.sh'
 const TG_NOTIFY_SH = '/Users/user/aladdin/scripts/tg-notify.sh'
@@ -258,9 +258,12 @@ function executeAutoRetry(ticket: string): void {
     log(`${ticket} 自動重試中止：tracker.sh set rerun 失敗: ${err}`)
     return
   }
-  const spawned = spawnCreateMr(ticket, { resume: true })
+  // 本檔是一次性 CLI 子行程（見檔頭註解）：submitCreateMr 的 in-memory 佇列
+  // 在這個 process 裡永遠是空的、limiter 從 0 起算，實際只會走 started /
+  // spawn_error 兩種結果——排隊語意只存在於常駐的 webhook server process。
+  const spawned = submitCreateMr(ticket, { resume: true })
   if (spawned.ok) {
-    log(`${ticket} 自動重試已 spawn（resume 模式，pid ${spawned.pid}）`)
+    log(`${ticket} 自動重試已 spawn（resume 模式，${spawned.status === 'started' ? `pid ${spawned.pid}` : `status=${spawned.status}`}）`)
   } else {
     log(`${ticket} 自動重試 spawn 失敗: ${spawned.reason}`)
   }

@@ -12,6 +12,8 @@ import { respondUniform401 } from './lib/security/uniform-401.ts'
 import { createHealthMonitor } from './lib/webhook-server/health-monitor.ts'
 import { registerProxyRoutes } from './lib/webhook-server/mcp-proxy.ts'
 import { startStaleLockReaper } from './lib/pipeline-runner/stale-lock-reaper.ts'
+import { recoverBugQueue } from './lib/pipeline-runner/spawn-create-mr.ts'
+import { recoverDemandQueue } from './lib/pipeline-runner/spawn-demand-pipeline.ts'
 
 registerHandlers(bot)
 
@@ -45,21 +47,36 @@ await bot.api.setMyCommands(
   { scope: { type: 'all_private_chats' } },
 )
 
-// /kit 只給 TG_KIT_ADMIN_CHAT_ID 這一個 chat 看得到「/」選單裡的 autocomplete
+// /kit、/bugreport 都只給各自的管理員 chat 看得到「/」選單裡的 autocomplete
 // （chat 專屬 scope 優先序高於上面的 all_private_chats，其他人的選單不受
-// 影響）。這只影響 UI 提示，實際授權判斷在 whitelist.ts 的 isKitAdminChat——
-// 就算這裡沒設定，非授權者手動打 /kit 也一樣被擋掉，見 kit-issue.ts 檔頭註解。
-const kitAdminChatId = process.env.TG_KIT_ADMIN_CHAT_ID
-if (kitAdminChatId) {
+// 影響）。這只影響 UI 提示，實際授權判斷在 whitelist.ts 的 isKitAdminChat／
+// isBugReportAdminChat——就算這裡沒設定，非授權者手動打指令也一樣被擋掉，
+// 見 kit-issue.ts／bug-report-command.ts 檔頭註解。
+//
+// setMyCommands 對同一個 chat scope 是覆寫式 API：若兩個管理員 chat_id 剛好
+// 相同（同一個人身兼兩種管理員），分開各呼叫一次會讓後呼叫的覆蓋掉前一次，
+// 導致該人選單只看得到最後設定的那個指令。這裡先依 chat_id 分組合併 extra
+// 指令，每個 chat_id 只呼叫一次 setMyCommands，兩種管理員身分同或不同 chat_id
+// 都正確。
+const perChatExtraCommands = new Map<string, { command: string; description: string }[]>()
+const addPerChatCommand = (chatId: string | undefined, command: { command: string; description: string }) => {
+  if (!chatId) return
+  const existing = perChatExtraCommands.get(chatId) ?? []
+  existing.push(command)
+  perChatExtraCommands.set(chatId, existing)
+}
+addPerChatCommand(process.env.TG_KIT_ADMIN_CHAT_ID, { command: 'kit', description: '核發企劃 starter kit（/kit <id> <name>）' })
+addPerChatCommand(process.env.TG_BUG_REPORT_ADMIN_CHAT_ID, { command: 'bugreport', description: '推送 Bug 指派人員統計報表' })
+for (const [chatId, extraCommands] of perChatExtraCommands) {
   await bot.api.setMyCommands(
     [
       { command: 'bug', description: '列出你可認領的 Bug 工單' },
       { command: 'req', description: '列出你可認領的需求單' },
       { command: 'status', description: '查看你目前正在執行中的工單' },
       { command: 'menu', description: '顯示頂層選單' },
-      { command: 'kit', description: '核發企劃 starter kit（/kit <id> <name>）' },
+      ...extraCommands,
     ],
-    { scope: { type: 'chat', chat_id: Number(kitAdminChatId) } },
+    { scope: { type: 'chat', chat_id: Number(chatId) } },
   )
 }
 
@@ -174,6 +191,20 @@ createHealthMonitor().start()
 // 檔頭註解，涵蓋手動 kill -9 整組砍掉背景流程、或機器斷電重開機這兩種 EXIT
 // trap 完全沒機會執行的情境。跟上面的 tunnel 健康檢查一樣是週期性排程器。
 startStaleLockReaper()
+
+// 2026-08-28：排隊機制的重啟恢復——把上一個 server process 結束前還在排隊的
+// 單（logs/pipeline-queue.*.json）撿回來：有名額直接 spawn、沒有就依原順序
+// 繼續排。只在這裡呼叫一次（CLI 短命行程絕不能呼叫，見 pipeline-queue.ts
+// recoverFromDisk 註解）。注意既有 trade-off：重啟後計數器歸零、重啟前的舊
+// 背景流程不在計數內（見 concurrency-limiter.ts 檔頭），恢復當下可能短暫超出
+// 名額上限，屬已接受的取捨。
+const bugRecovered = recoverBugQueue()
+const demandRecovered = recoverDemandQueue()
+if (bugRecovered.started + bugRecovered.requeued + bugRecovered.skipped + demandRecovered.started + demandRecovered.requeued + demandRecovered.skipped > 0) {
+  console.error(
+    `telegram-dispatcher: 排隊恢復 bug(started=${bugRecovered.started}, requeued=${bugRecovered.requeued}, skipped=${bugRecovered.skipped}) demand(started=${demandRecovered.started}, requeued=${demandRecovered.requeued}, skipped=${demandRecovered.skipped})`,
+  )
+}
 
 const port = Number(process.env.PORT ?? 8787)
 

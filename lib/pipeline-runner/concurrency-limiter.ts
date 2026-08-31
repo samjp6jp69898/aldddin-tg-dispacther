@@ -13,6 +13,13 @@
 // 不是可以自行推測的細節）。
 export const GLOBAL_CONCURRENCY_LIMIT = 5
 
+// 需求 pipeline 的全域併發上限，跟 Bug pipeline 不共用計數器（各自獨立的
+// limiter 實例，見 spawn-demand-pipeline.ts）。原本 2026-08-17 定案為保守值
+// N=2；2026-08-27 使用者定案調高為 N=6（明確知情此值已超過 Bug pipeline
+// 上限，仍要求調整）。2026-08-28 從 spawn-demand-pipeline.ts 搬到這裡：讓
+// 兩個上限常數同檔，供下方 CLI 進入點一次輸出給 tg-monitor 讀取。
+export const DEMAND_CONCURRENCY_LIMIT = 6
+
 export type ConcurrencyLimiter = {
   /** 嘗試佔用一個名額；額度足夠回 true 並佔用，額度用盡回 false（不佔用）。 */
   tryAcquire: () => boolean
@@ -44,3 +51,11 @@ export function createConcurrencyLimiter(limit: number): ConcurrencyLimiter {
 // 有一個消費者（lib/pipeline-runner/spawn-create-mr.ts），比照 rate-limit.ts／
 // health-monitor.ts 的既有慣例（工廠函式留在 lib，實例化交給唯一的呼叫端），
 // singleton 本身就近放在 spawn-create-mr.ts 頂端。
+
+// CLI 進入點（`bun concurrency-limiter.ts`）：把兩個上限常數以一行 JSON 輸出，
+// 給 tg-monitor 在啟動時經行程邊界讀取（該 repo 刻意不 import 本 repo 的模組，
+// 見 tg-monitor/server.ts 檔頭註解；2026-08-28 前它是把數字複製過去寫死，
+// demand 上限調成 6 之後那份複製品還停在 2——這正是複製常數會漂移的實例）。
+if (import.meta.main) {
+  console.log(JSON.stringify({ bug: GLOBAL_CONCURRENCY_LIMIT, demand: DEMAND_CONCURRENCY_LIMIT }))
+}

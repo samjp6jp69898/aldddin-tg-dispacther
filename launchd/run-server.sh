@@ -17,7 +17,10 @@ TG_WEBHOOK_SECRET=$(grep '^TG_WEBHOOK_SECRET=' "$ENV_FILE" | cut -d= -f2- | tr -
 # /kit 指令授權（見 lib/webhook-server/kit-issue.ts）——不是必要變數，缺了只是
 # /kit 功能關閉（isKitAdminChat 恆回傳 false），不擋伺服器啟動。
 TG_KIT_ADMIN_CHAT_ID=$(grep '^TG_KIT_ADMIN_CHAT_ID=' "$ENV_FILE" | cut -d= -f2- | tr -d '\r\n')
-export TG_DISPATCH_BOT_TOKEN TG_WEBHOOK_PATH TG_WEBHOOK_SECRET TG_KIT_ADMIN_CHAT_ID
+# /bugreport 指令授權（見 lib/webhook-server/bug-report-command.ts）——同上，
+# 不是必要變數，缺了只是 /bugreport 功能關閉，不擋伺服器啟動。
+TG_BUG_REPORT_ADMIN_CHAT_ID=$(grep '^TG_BUG_REPORT_ADMIN_CHAT_ID=' "$ENV_FILE" | cut -d= -f2- | tr -d '\r\n')
+export TG_DISPATCH_BOT_TOKEN TG_WEBHOOK_PATH TG_WEBHOOK_SECRET TG_KIT_ADMIN_CHAT_ID TG_BUG_REPORT_ADMIN_CHAT_ID
 # 跟 launchd/run-tunnel.sh 的 ngrok 目標 port 保持同一個明確值，不依賴
 # server.ts 自己的預設值（8787）——兩支獨立 wrapper 各自隱含同一個預設，
 # 未來任一邊改動容易悄悄漂移，這裡明講掉。
