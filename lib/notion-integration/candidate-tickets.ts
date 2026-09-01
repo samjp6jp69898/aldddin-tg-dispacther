@@ -18,18 +18,27 @@ const EXEC_TIMEOUT_MS = 30_000
 // 不再拿 tracker.sh row 的 pending/rerun 狀態做二次篩選）。
 const WANTED_STATUSES = ['仍有問題', '待處理']
 
+// 比照 demand-pool-tickets.ts 的 WANTED_AI_ANALYSIS：只有『待分析』（人工已
+// 標記可分析）與『需要重跑』（分析過但要求重來一次）才算候選，其餘值（含
+// 空值、待規劃/待釐清/分析中/分析成功/分析失敗/不需分析）一律不出現在候選
+// 清單。這裡是 select 型（Bug List 的『狀態』也是 select 型，跟需求池的
+// status 型不同，不要混用 { status: { equals } } 語法）。
+const WANTED_AI_ANALYSIS = ['待分析', '需要重跑']
+
 function buildFilter(notionUserId: string): object {
   return {
     and: [
       { property: '當前指派', people: { contains: notionUserId } },
       { or: WANTED_STATUSES.map(status => ({ property: '狀態', select: { equals: status } })) },
+      { or: WANTED_AI_ANALYSIS.map(value => ({ property: 'AI分析', select: { equals: value } })) },
     ],
   }
 }
 
 /**
  * 輸入 notion_user_id，透過 scripts/notion.sh query-datasource 帶
- * people:{contains:<id>} filter 查該人正向候選單（狀態=仍有問題/待處理），
+ * people:{contains:<id>} filter 查該人正向候選單（狀態=仍有問題/待處理 且
+ * AI分析=待分析/需要重跑，見上方 WANTED_STATUSES／WANTED_AI_ANALYSIS 註解），
  * 回傳單號集合（如 ["FAQ-4616"]）。全程只呼叫 scripts/notion.sh，禁止自己
  * fetch Notion API 或讀 NOTION_TOKEN。
  *
