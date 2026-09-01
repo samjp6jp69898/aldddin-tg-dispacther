@@ -42,6 +42,23 @@ function loadRows(): Record<string, string>[] {
 export function resolveTechUserByChatId(chatId: string): TechUser | null {
   const row = loadRows().find(r => r.tg_chat_id === chatId && chatId !== '')
   if (!row) return null
+  return toTechUser(row)
+}
+
+/**
+ * 輸入 email，反查 tech-users.csv 的 email 欄位（大小寫不敏感）。給
+ * spawn-create-mr.ts CLI 的 `--triggered-by-email` 用：非 Telegram 觸發的重跑
+ * 也能把「發起人」回填成原認領人。找不到回傳 null，不丟例外。
+ */
+export function resolveTechUserByEmail(email: string): TechUser | null {
+  const needle = email.trim().toLowerCase()
+  if (needle === '') return null
+  const row = loadRows().find(r => (r.email ?? '').trim().toLowerCase() === needle)
+  if (!row) return null
+  return toTechUser(row)
+}
+
+function toTechUser(row: Record<string, string>): TechUser {
   return {
     notion_user_id: row.notion_user_id ?? '',
     notion_user_name: row.notion_user_name ?? '',
