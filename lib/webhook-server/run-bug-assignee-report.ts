@@ -12,13 +12,15 @@
  */
 import { execFileSync } from 'node:child_process'
 
-const REPORT_SCRIPT = '/Users/user/aladdin/obsidian/skills/notion-bug-assignee-report/bug-assignee-report.ts'
+const REPORT_SCRIPT = '/Users/user/aladdin/aladdin_ai/skills/notion-bug-assignee-report/bug-assignee-report.ts'
 
 export type RunResult = { success: true } | { success: false; stderr: string }
 
 export function runBugAssigneeReportScript(outBase: string): RunResult {
   try {
-    execFileSync('bun', [REPORT_SCRIPT, '--out', outBase], { stdio: ['ignore', 'ignore', 'pipe'] })
+    // --no-push：這裡的呼叫端（bug-report-send.ts）自己會把三份 CSV 送出去，
+    // 若不加這個旗標，leaf 腳本內建的 Telegram 推播（固定推給 Landon）會跟這裡重複推播一次。
+    execFileSync('bun', [REPORT_SCRIPT, '--out', outBase, '--no-push'], { stdio: ['ignore', 'ignore', 'pipe'] })
     return { success: true }
   } catch (err) {
     const stderr = err instanceof Error && 'stderr' in err ? String((err as { stderr?: Buffer }).stderr ?? '').slice(0, 1000) : String(err)
