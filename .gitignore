@@ -1,6 +1,9 @@
 node_modules/
 .env
 .env.*
+# 2026-08-31：新增 repo-local .env（原本讀根目錄 .env），.env.example 是無值範本，
+# 要能進 git 給其他機器/人參考該填哪些欄位。
+!.env.example
 *.log
 
 # T15：token 讀取衛生檢查發現，只擋 dotenv 格式（.env*）跟 *.log 對「非

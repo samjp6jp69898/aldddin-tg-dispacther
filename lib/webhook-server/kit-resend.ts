@@ -31,10 +31,11 @@ import { runKitScript } from '/Users/user/aladdin/obsidian/mcps/aladdin-kit-admi
 import { buildKitUsageText, readDistAliases } from './kit-issue.ts'
 
 const KIT_DIST_DIR = '/Users/user/aladdin/obsidian/mcps/aladdin-ai-assistant-kit/dist'
-const TG_NOTIFY_SCRIPT = '/Users/user/aladdin/obsidian/scripts/tg-notify.sh'
-const ROOT_ENV_FILE = '/Users/user/aladdin/.env'
+// 2026-08-31：obsidian/scripts/ 已被拆分掉、tg-notify.sh 實際搬到 aladdin_ai/scripts/。
+const TG_NOTIFY_SCRIPT = '/Users/user/aladdin/aladdin_ai/scripts/tg-notify.sh'
+const ROOT_ENV_FILE = '/Users/user/aladdin/telegram-dispatcher/.env'
 
-/** 只從根目錄 .env 讀 TG_KIT_ADMIN_CHAT_ID（比照 tg-notify.sh 對 token 的手法），不寫死。 */
+/** 從 telegram-dispatcher/.env 讀 TG_KIT_ADMIN_CHAT_ID（2026-08-31 前是根目錄 .env；比照 tg-notify.sh 對 token 的手法），不寫死。 */
 function readKitAdminChatId(): string {
   const line = readFileSync(ROOT_ENV_FILE, 'utf8').split('\n').find(l => l.startsWith('TG_KIT_ADMIN_CHAT_ID='))
   const v = line ? line.slice('TG_KIT_ADMIN_CHAT_ID='.length).trim() : ''

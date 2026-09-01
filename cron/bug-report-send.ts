@@ -21,7 +21,7 @@ import { generateAndSendBugAssigneeReport } from '../lib/webhook-server/bug-repo
 const botToken = process.env.TG_DISPATCH_BOT_TOKEN
 const chatId = process.env.TG_BUG_REPORT_ADMIN_CHAT_ID
 if (!botToken || !chatId) {
-  console.error('TG_DISPATCH_BOT_TOKEN / TG_BUG_REPORT_ADMIN_CHAT_ID is required (export them from /Users/user/aladdin/.env before running)')
+  console.error('TG_DISPATCH_BOT_TOKEN / TG_BUG_REPORT_ADMIN_CHAT_ID is required (export them from telegram-dispatcher/.env before running)')
   process.exit(1)
 }
 

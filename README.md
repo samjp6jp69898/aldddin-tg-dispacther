@@ -156,7 +156,7 @@ aladdin/obsidian 生態系（`obsidian/commands/create-mr/references/tech-users.
    完整說明見 `mcps/_hosted-rollout/DEPLOY-TO-NEW-MACHINE.md` §4.1。網域
    `mcp.aladdin-assistant.cc` 是自有網域（Cloudflare Registrar 註冊），不像
    ngrok reserved domain 那樣綁在帳號的免費方案配額上。
-4. **根目錄 `.env`**（`/Users/user/aladdin/.env`）：至少要有下面「需要的
+4. **`telegram-dispatcher/.env`**（`/Users/user/aladdin/telegram-dispatcher/.env`）：至少要有下面「需要的
    環境變數」章節列的四個 `TG_*`/`PORT` 變數；`/create-mr` pipeline 本身還
    需要 aladdin 主線既有的其他環境變數（Notion token 等），隨 aladdin 主線
    走，不在本文件重複列。
@@ -344,7 +344,7 @@ worker **不需要** cloudflared/tunnel/webhook——那些是 head 專屬。
    發 Telegram 通知，成功產出的情況下通知會附工作目錄路徑，**產出的內容
    不會自動 commit/push，必須人工複核**（T36）。
 
-## 需要的環境變數（都放在根目錄 `/Users/user/aladdin/.env`）
+## 需要的環境變數（都放在 `/Users/user/aladdin/telegram-dispatcher/.env`）
 
 | 變數 | 說明 |
 |---|---|
@@ -502,7 +502,7 @@ bash /Users/user/aladdin/scripts/bug-lock.sh cleanup
 設定，安全隨時可查）：
 
 ```bash
-BOT_TOKEN=$(grep '^TG_DISPATCH_BOT_TOKEN=' /Users/user/aladdin/.env | cut -d= -f2- | tr -d '\r\n')
+BOT_TOKEN=$(grep '^TG_DISPATCH_BOT_TOKEN=' /Users/user/aladdin/telegram-dispatcher/.env | cut -d= -f2- | tr -d '\r\n')
 curl -s "https://api.telegram.org/bot${BOT_TOKEN}/getWebhookInfo"
 ```
 
@@ -519,7 +519,7 @@ route dns` 建立 DNS route，不會因為 tunnel 重啟而變），所以正常
    ```bash
    bun -e "console.log(require('crypto').randomBytes(32).toString('base64url'))"
    ```
-2. **更新 `.env`**：把 `/Users/user/aladdin/.env` 裡 `TG_WEBHOOK_SECRET=` 那一行
+2. **更新 `.env`**：把 `/Users/user/aladdin/telegram-dispatcher/.env` 裡 `TG_WEBHOOK_SECRET=` 那一行
    換成新值（新舊值只差在這一行，不要動到 `TG_WEBHOOK_PATH`——路徑要不要
    一起換是另一個決定，通常只有懷疑 secret 外洩時只需要換 secret；如果連
    路徑本身都懷疑外洩了，`TG_WEBHOOK_PATH` 也要用同樣方式重新產生一個純
@@ -535,7 +535,7 @@ route dns` 建立 DNS route，不會因為 tunnel 重啟而變），所以正常
    拒絕（401）。比照其他 wrapper script 的手法從 `.env` 現讀現用，不要把值
    貼在指令歷史裡：
    ```bash
-   ENV_FILE=/Users/user/aladdin/.env
+   ENV_FILE=/Users/user/aladdin/telegram-dispatcher/.env
    BOT_TOKEN=$(grep '^TG_DISPATCH_BOT_TOKEN=' "$ENV_FILE" | cut -d= -f2- | tr -d '\r\n')
    WEBHOOK_PATH=$(grep '^TG_WEBHOOK_PATH=' "$ENV_FILE" | cut -d= -f2- | tr -d '\r\n')
    WEBHOOK_SECRET=$(grep '^TG_WEBHOOK_SECRET=' "$ENV_FILE" | cut -d= -f2- | tr -d '\r\n')

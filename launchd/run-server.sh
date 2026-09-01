@@ -1,14 +1,14 @@
 #!/bin/zsh
 # launchd wrapper：啟動 telegram-dispatcher webhook server（bun run server.ts）。
-# 比照 cron/bug-report-run.sh 的手法：用 grep '^KEY=' 從根目錄 .env 逐一匯出，
-# 不用 dotenv、不自己解析整份 .env、token 不出現在這支腳本或 plist 明文裡。
+# 用 grep '^KEY=' 從 telegram-dispatcher 自己的 .env 逐一匯出（2026-08-31 前是根
+# 目錄 .env），不用 dotenv、不自己解析整份 .env、token 不出現在這支腳本或 plist 明文裡。
 #
 # T18：只負責把這支腳本寫好，不執行 launchctl load，不讓服務真的上線
 # （見 tasks.json T18 acceptance_criteria）。
 set -u
 ALADDIN="/Users/user/aladdin"
-ENV_FILE="$ALADDIN/.env"
 DISPATCHER_DIR="$ALADDIN/telegram-dispatcher"
+ENV_FILE="$DISPATCHER_DIR/.env"
 BUN="/Users/user/.bun/bin/bun"
 
 TG_DISPATCH_BOT_TOKEN=$(grep '^TG_DISPATCH_BOT_TOKEN=' "$ENV_FILE" | cut -d= -f2- | tr -d '\r\n')

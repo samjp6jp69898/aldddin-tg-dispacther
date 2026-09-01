@@ -11,7 +11,7 @@
 #     路徑，見 telegram-dispatcher/README.md「路徑是寫死的」一節——worker
 #     採「約定同路徑」策略，不做路徑參數化）
 #   - obsidian/ 與各子專案 repo 需自行 clone（需要各自的 git 憑證）
-#   - /Users/user/aladdin/.env 需從 head 安全複製（AirDrop/scp/USB）
+#   - telegram-dispatcher/.env（2026-08-31 前為根目錄 .env） 需從 head 安全複製（AirDrop/scp/USB）
 #
 # 跑完後執行 deploy/doctor-worker.sh 驗收，全綠才把 worker 加入派工池。
 set -u

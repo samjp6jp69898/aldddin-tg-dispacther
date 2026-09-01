@@ -6,7 +6,8 @@ set -u
 
 ALADDIN="/Users/user/aladdin"
 DISPATCHER="$ALADDIN/telegram-dispatcher"
-ENV_FILE="$ALADDIN/.env"
+ENV_FILE="$DISPATCHER/.env"
+ALADDIN_AI_ENV_FILE="$ALADDIN/aladdin_ai/.env.local"
 BUN="/Users/user/.bun/bin/bun"
 CLAUDE_BIN="/Users/user/.local/bin/claude"
 FAIL=0
@@ -58,15 +59,23 @@ for sh in bug-lock.sh tracker.sh notion.sh tg-notify.sh setup-worktree.sh; do
   [ -f "$ALADDIN/scripts/$sh" ] && ok "scripts/$sh" || bad "scripts/$sh 缺失"
 done
 
-echo "== .env =="
+echo "== .env（telegram-dispatcher/.env）=="
 if [ -f "$ENV_FILE" ]; then
-  for KEY in CLUSTER_SHARED_SECRET CLUSTER_HEAD_URL CLUSTER_WORKER_NAME CLUSTER_WORKER_URL TG_DISPATCH_BOT_TOKEN ALD_NOTION_TOKEN; do
+  for KEY in CLUSTER_SHARED_SECRET CLUSTER_HEAD_URL CLUSTER_WORKER_NAME CLUSTER_WORKER_URL TG_DISPATCH_BOT_TOKEN; do
     [ -n "$(envval "$KEY")" ] && ok "$KEY 已設定" || bad "$KEY 缺失/空值"
   done
   SECRET="$(envval CLUSTER_SHARED_SECRET)"
   [ "${#SECRET}" -ge 32 ] && ok "CLUSTER_SHARED_SECRET 長度足夠" || bad "CLUSTER_SHARED_SECRET 長度 <32，worker-agent 會拒絕啟動"
 else
   bad "$ENV_FILE 不存在"
+fi
+
+echo "== .env（aladdin_ai/.env.local，pipeline 用）=="
+if [ -f "$ALADDIN_AI_ENV_FILE" ]; then
+  ALD_NOTION_TOKEN=$(grep -m1 '^ALD_NOTION_TOKEN=' "$ALADDIN_AI_ENV_FILE" | cut -d= -f2- | tr -d '\r\n')
+  [ -n "$ALD_NOTION_TOKEN" ] && ok "ALD_NOTION_TOKEN 已設定" || bad "ALD_NOTION_TOKEN 缺失/空值"
+else
+  bad "$ALADDIN_AI_ENV_FILE 不存在"
 fi
 
 echo "== head 連通性 =="

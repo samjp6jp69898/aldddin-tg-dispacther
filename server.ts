@@ -109,12 +109,12 @@ app.get('/health', c => c.json({ status: 'ok', uptime_seconds: Math.floor(proces
 
 // T14：webhook 路徑本身也是一道防線（secret_token 防「來源真偽」，路徑防
 // 「被 fuzz 出來」），路徑跟 secret 都只從 process.env 讀（值來自
-// /Users/user/aladdin/.env，比照 bot.ts 對 TG_DISPATCH_BOT_TOKEN 的手法——
+// telegram-dispatcher/.env（2026-08-31 前為根目錄 .env），比照 bot.ts 對 TG_DISPATCH_BOT_TOKEN 的手法——
 // 啟動 wrapper script 匯出，不自己解析 .env、不印出值、不寫死）。
 const webhookPath = process.env.TG_WEBHOOK_PATH
 const webhookSecret = process.env.TG_WEBHOOK_SECRET
 if (!webhookPath || !webhookSecret) {
-  throw new Error('TG_WEBHOOK_PATH / TG_WEBHOOK_SECRET is required (export them from /Users/user/aladdin/.env before starting)')
+  throw new Error('TG_WEBHOOK_PATH / TG_WEBHOOK_SECRET is required (export them from telegram-dispatcher/.env before starting)')
 }
 // review 發現：Hono 路由把開頭 `:` 當成路徑參數、單獨 `*` 當成萬用字元，這種
 // 值會讓任何猜測都命中 webhook 路由，直接讓「秘密路徑」變成公開路由。目前
