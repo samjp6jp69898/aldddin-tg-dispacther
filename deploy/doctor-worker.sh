@@ -97,6 +97,14 @@ else
 fi
 [ -f "$HOME/Library/LaunchAgents/com.aladdin.tg-worker-agent.plist" ] && ok "launchd plist 已就位" || bad "plist 未複製到 ~/Library/LaunchAgents/"
 
+echo "== Remote Login（head 用 deploy/sync-workers.sh ssh 進來派送程式碼更新）=="
+if nc -z -G 2 127.0.0.1 22 >/dev/null 2>&1; then
+  ok "sshd 在 22 port 監聽（系統設定 → 共享 → 遠端登入 已開）"
+  [ -s "$HOME/.ssh/authorized_keys" ] && ok "~/.ssh/authorized_keys 有內容（head 公鑰應在其中，從 head 執行 ssh-copy-id user@本機IP）" || bad "~/.ssh/authorized_keys 空/缺失：head 無法免密 ssh 進來（從 head 執行 ssh-copy-id user@本機IP）"
+else
+  bad "22 port 未監聽：系統設定 → 一般 → 共享 → 開「遠端登入」並允許 user，否則 head 的 sync-workers.sh 連不進來"
+fi
+
 echo "== 電源 =="
 if command -v pmset >/dev/null 2>&1; then
   SLEEP_SETTING=$(pmset -g custom 2>/dev/null | awk '/AC Power/{f=1} f && /^[[:space:]]*sleep/{print $2; exit}')

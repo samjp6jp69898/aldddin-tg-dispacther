@@ -282,6 +282,37 @@ worker **不需要** cloudflared/tunnel/webhook——那些是 head 專屬。
 5. 驗收：對 bot 認領一張測試單，確認 head log 出現派工紀錄、worker 上
    pipeline 真的跑起來、結束後 TG 通知照常送達。
 
+### head → worker 程式碼派送（`deploy/sync-workers.sh`，2026-09-01 新增）
+
+`aladdin_ai`（commands/agents/skills/scripts）與 `telegram-dispatcher` 改了之後，
+worker 不會自己更新——之前得逐台登入 `git pull`。現在在 head 上跑一支即可：
+
+```bash
+# 1. 人先 push（腳本不代推；head 本機 main 領先 origin/main 會直接拒跑）
+# 2. 派送到名冊裡全部 worker
+bash telegram-dispatcher/deploy/sync-workers.sh              # 全部
+bash telegram-dispatcher/deploy/sync-workers.sh --worker landon2   # 只一台（名稱或 IP）
+bash telegram-dispatcher/deploy/sync-workers.sh --dry-run    # 只看會做什麼
+```
+
+每台 worker 上做的事：兩個 repo `git pull --ff-only origin main`（有未 commit 的已追蹤
+變更或分岔 commit 就拒絕並回報，不 stash、不 reset）→ `telegram-dispatcher` 的
+`package.json`/`bun.lock` 有變才 `bun install --frozen-lockfile` → `sync-mirrors.sh --check`
+symlink 健檢 → `launchctl kickstart -k` 重啟 worker agent → 回報兩個 repo 的 HEAD、
+head 端比對是否等於 `origin/main`。
+
+- **進行中的 pipeline**：worker 上 `/tmp/bug-analysis-locks/` 有 ticket 鎖時**預設跳過重啟**
+  （回報 `restart=skipped(N jobs)`，pull 仍會做），等單跑完再跑一次或 `--force-restart`。
+  重啟 agent 不會殺掉已 spawn 的 pipeline，但那些單的 `/cluster/job-done` 回報會丟，
+  由 head 的 remote sweeper 10 分鐘內補查——所以能等就等。
+- **一次性前提（每台 worker）**：系統設定 → 一般 → 共享 → 開「遠端登入」允許 `user`；
+  從 head 執行 `ssh-copy-id user@<worker_ip>`；`doctor-worker.sh` 已加「Remote Login」
+  檢查（22 port 監聽 + `authorized_keys` 非空）。
+- 名冊來自 `logs/cluster-workers.json`（`disabled: true` 跳過）；ssh 用 `BatchMode`
+  免密連線，連不上／權限不足會回 `WORKER_FAIL <name> ...` 並 exit 1，不會半途卡住。
+- 主程式碼 repo（agrabah/abu/lago/rajah）**不在派送範圍**——pipeline 自己每次
+  `fresh-pull.sh` + `setup-worktree.sh` 會拉，不需要預先同步。
+
 ### 已知限制（v1，刻意的取捨）
 
 - **Claude 帳號額度是共享的**：多台機器若共用同一個 Claude 訂閱/帳號，
