@@ -287,9 +287,14 @@ worker **不需要** cloudflared/tunnel/webhook——那些是 head 專屬。
 - **Claude 帳號額度是共享的**：多台機器若共用同一個 Claude 訂閱/帳號，
   rate limit 與用量池不會因為加機器而變大——擴容解的是單機 CPU/記憶體
   瓶頸；若瓶頸在帳號額度，要搭配各機獨立帳號或 API billing 才有意義。
-- head 本機 FIFO 佇列裡的單只會在**本機**名額釋放時遞補，不會在 worker
-  釋放名額時撿去遠端跑（佇列只在全 cluster 滿員時才累積，暫不值得多一層
-  跨機遞補的複雜度）。
+- （2026-09-01 起已解除，保留紀錄）舊版限制：head 本機 FIFO 佇列裡的單只會
+  在**本機**名額釋放時遞補，不會在 worker 釋放名額時撿去遠端跑。現在改成
+  cluster-wide 遞補（`lib/cluster/backlog-dispatcher.ts`）：head 佇列只在全
+  cluster（本機 + 全部 worker）滿員時才累積，之後不管本機或哪一台 worker
+  先釋放名額，都會把隊頭遞補過去——worker 端 `/cluster/job-done` 回報是主要
+  觸發點（事件驅動），該回報是 best-effort（worker 打不到 head 時無法送達），
+  所以另外有一顆跟 remote sweeper 共用的 10 分鐘週期性掃描當安全網，逐台探測
+  名額補救漏接的回報。
 - tg-monitor 只看得到自己機器上的 pipeline；派去 worker 的單要去 worker
   的 logs/ 看。tg-monitor 的重試按鈕也只影響本機，且看不到遠端登記表——
   避免對「派在別台跑的單」按重試。

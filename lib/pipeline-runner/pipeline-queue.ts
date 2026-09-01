@@ -80,6 +80,17 @@ export type PipelineQueue<P> = {
   /** running 集合的快照（worker-agent 的本機活動盤點要跟鎖目錄/ps 掃描做
    * 聯集，需要集合本身而不只數量，見 lib/cluster/local-activity.ts）。 */
   runningTickets: () => string[]
+  /** 把隊頭那張單同步取出，交給呼叫端嘗試遠端派工（給 lib/cluster/
+   * backlog-dispatcher.ts 用：cluster-wide 遞補，不只認本機釋放的名額）。
+   * 呼叫端必須在 attempt 內第一行同步完成防重複佔位（例如 dispatch-registry
+   * 的 markDispatching）——shift 之後、attempt 內第一個 await 之前是唯一安全
+   * 的同步窗口，錯過這個窗口會讓「單已離開佇列、但還沒登記派去哪」的空窗期
+   * 被另一個幾乎同時的認領誤判成沒人在處理。attempt 回 true＝已消化（成功
+   * 或依既有 ambiguous 慣例保守視為成功）；回 false＝退回隊頭（塞回原位置，
+   * 保留 FIFO），本次呼叫只嘗試一張，不繼續嘗試佇列後面的單（避免對剛回絕
+   * 的目標連續嘗試）。中途遇到 skipReason 非 null 的條目，行為與 drain()/
+   * recoverFromDisk 一致（移除、觸發 onSkipped、不佔用嘗試次數）。 */
+  tryDispatchFront: (attempt: (entry: QueueEntry<P>) => Promise<boolean>) => Promise<'empty' | 'dispatched' | 'declined'>
 }
 
 export function createPipelineQueue<P>(cfg: {
@@ -271,6 +282,46 @@ export function createPipelineQueue<P>(cfg: {
     return { started, requeued: queue.length, skipped }
   }
 
+  async function tryDispatchFront(attempt: (entry: QueueEntry<P>) => Promise<boolean>): Promise<'empty' | 'dispatched' | 'declined'> {
+    while (queue.length > 0) {
+      // 前提重驗，理由與 drain() 相同：隊頭可能已不該再跑（鎖被別的流程持有、
+      // 排隊逾時）。
+      const head = queue[0]!
+      const reason = evalDequeueSkip(head)
+      if (reason !== null) {
+        queue.shift()
+        persist()
+        safeHook('onSkipped', () => cfg.onSkipped?.(head, reason))
+        continue
+      }
+      // 同步取出（shift + persist 之間、以及取出後呼叫 attempt 之間都沒有
+      // await）：呼叫端在 attempt 的同步區段內完成佔位，見本方法型別註解。
+      queue.shift()
+      persist()
+      // attempt 不應該 reject（production 唯一呼叫端 backlog-dispatcher.ts
+      // 的 postJob/registry 操作全部自己吞例外），但這裡不能像其他地方一樣
+      // 直接信任這個前提——沒有 try/catch 的話，一旦真的 reject，這張單會
+      // 永遠從佇列與登記表消失（不像 onSkipped/onExited 等 hook 有 safeHook
+      // 防線）。丟例外時比照「拒絕」處理：塞回隊頭、記 log，不吞掉例外本身
+      // 造成的診斷資訊遺失，但也不讓它中斷佇列運作。
+      let ok: boolean
+      try {
+        ok = await attempt(head)
+      } catch (err) {
+        console.error(`pipeline-queue: tryDispatchFront 的 attempt 對 ${head.ticket} 丟出例外（視為拒絕，塞回隊頭）: ${err}`)
+        queue.unshift(head)
+        persist()
+        return 'declined'
+      }
+      if (ok) return 'dispatched'
+      // 呼叫端確定沒接下這張單：塞回隊頭保留 FIFO 位置，不繼續嘗試下一張。
+      queue.unshift(head)
+      persist()
+      return 'declined'
+    }
+    return 'empty'
+  }
+
   return {
     submit,
     recoverFromDisk,
@@ -278,5 +329,6 @@ export function createPipelineQueue<P>(cfg: {
     has: (ticket: string) => (running.has(ticket) ? 'running' : queue.some(e => e.ticket === ticket) ? 'queued' : null),
     runningCount: () => running.size,
     runningTickets: () => [...running],
+    tryDispatchFront,
   }
 }

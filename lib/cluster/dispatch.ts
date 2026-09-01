@@ -27,9 +27,14 @@ import type { TechUser } from '../user-resolution/tech-user.ts'
 //   在跑的單清掉，也不冒兩台同時跑同一張單的風險。worker 回
 //   already_running（它自己就發現這張單在該機有活動）→ 同樣回填登記表。
 //
-// v1 已知限制（記錄於 README）：
-// - 本機 FIFO 佇列裡的單只會在「本機」名額釋放時遞補，不會在 worker 名額
-//   釋放時撿去遠端跑。
+// 本機 FIFO 佇列裡的單改成 cluster-wide 遞補（見 lib/cluster/
+// backlog-dispatcher.ts，2026-09-01 新增）：head 本機釋放名額仍走這裡
+// submitLocal 之後的既有 drain()；worker 釋放名額則由 backlog-dispatcher.ts
+// 在 /cluster/job-done 收到回報時、以及週期性掃描時，把佇列隊頭遞補過去。
+// 兩條路徑共用同一個 pipeline-queue 的 `queue` 陣列（新增的 tryDispatchFront
+// 方法），只操作隊頭且中間不夾 await，天然不會搶到同一張單。
+//
+// v1 已知限制（記錄於 README，仍未解的部分）：
 // - 步驟 4 的探測對「當下失聯的 worker」問不到活動狀態：若那台正好在跑這
 //   張單又正好斷線，重複防護退回登記表本身（正常都在）；登記表也沒有時
 //   （job-done 已清 + out-of-band 重跑 + 該機斷線三者疊加）是已接受的殘餘
@@ -60,8 +65,10 @@ export type DispatchDeps = {
   }
 }
 
-function freeSlots(stats: QueueStats): number {
-  // 有單在排隊代表名額實際上已滿（排隊者優先於新單），不論 running 數字。
+/** 剩餘名額判斷：有單在排隊代表名額實際上已滿（排隊者優先於新單），不論
+ * running 數字。export 給 lib/cluster/backlog-dispatcher.ts 的週期性掃描共用，
+ * 避免兩處各自實作同一個判斷而漂移。 */
+export function freeSlots(stats: QueueStats): number {
   if (stats.queued > 0) return 0
   return Math.max(0, stats.limit - stats.running)
 }

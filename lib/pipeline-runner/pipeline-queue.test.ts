@@ -400,3 +400,99 @@ describe('createPipelineQueue — 多機派工新增介面（has / runningCount 
     rmSync(dir, { recursive: true, force: true })
   })
 })
+
+describe('createPipelineQueue — tryDispatchFront（cluster-wide 遞補，給 lib/cluster/backlog-dispatcher.ts 用）', () => {
+  test('佇列空：回 empty，attempt 不被呼叫', async () => {
+    const h = makeHarness(0) // limit=0，submit 一律入列
+    const called: string[] = []
+    const outcome = await h.queue.tryDispatchFront(async entry => {
+      called.push(entry.ticket)
+      return true
+    })
+    expect(outcome).toBe('empty')
+    expect(called).toEqual([])
+    h.cleanup()
+  })
+
+  test('隊頭在 attempt 呼叫前已同步從佇列移除（防止與本機 drain 搶同一張單）；attempt 回 true 視為已消化', async () => {
+    const h = makeHarness(0)
+    h.queue.submit('FAQ-1', null, { tag: 'a' })
+    h.queue.submit('FAQ-2', null, { tag: 'b' })
+    expect(h.queue.size()).toBe(2)
+    let sawDuringAttempt: 'running' | 'queued' | null = 'queued'
+    const outcome = await h.queue.tryDispatchFront(async entry => {
+      expect(entry.ticket).toBe('FAQ-1')
+      // 進到 attempt 當下，這張單必須已經不在佇列裡（has 回 null）——
+      // 這就是「同步取出」防重複派工的可觀察前提。
+      sawDuringAttempt = h.queue.has(entry.ticket)
+      return true
+    })
+    expect(outcome).toBe('dispatched')
+    expect(sawDuringAttempt).toBe(null)
+    expect(h.queue.size()).toBe(1) // 只剩 FAQ-2
+    h.cleanup()
+  })
+
+  test('attempt 回 false：單塞回隊頭，保留 FIFO 位置，不繼續嘗試下一張', async () => {
+    const h = makeHarness(0)
+    h.queue.submit('FAQ-1', null, { tag: 'a' })
+    h.queue.submit('FAQ-2', null, { tag: 'b' })
+    const attempted: string[] = []
+    const outcome = await h.queue.tryDispatchFront(async entry => {
+      attempted.push(entry.ticket)
+      return false
+    })
+    expect(outcome).toBe('declined')
+    expect(attempted).toEqual(['FAQ-1']) // FAQ-2 完全沒被嘗試
+    expect(h.queue.size()).toBe(2)
+    // 再呼叫一次：隊頭仍是 FAQ-1（順序沒被打亂）
+    const outcome2 = await h.queue.tryDispatchFront(async entry => {
+      attempted.push(entry.ticket)
+      return true
+    })
+    expect(outcome2).toBe('dispatched')
+    expect(attempted).toEqual(['FAQ-1', 'FAQ-1'])
+    expect(h.queue.size()).toBe(1)
+    h.cleanup()
+  })
+
+  test('隊頭 skipReason 非 null：移除、觸發 onSkipped，繼續往後找到第一張可嘗試的單', async () => {
+    const h = makeHarness(0, { skipTickets: new Map([['FAQ-1', '排隊已超過 24 小時']]) })
+    h.queue.submit('FAQ-1', null, { tag: 'a' })
+    h.queue.submit('FAQ-2', null, { tag: 'b' })
+    const attempted: string[] = []
+    const outcome = await h.queue.tryDispatchFront(async entry => {
+      attempted.push(entry.ticket)
+      return true
+    })
+    expect(outcome).toBe('dispatched')
+    expect(attempted).toEqual(['FAQ-2'])
+    expect(h.skipped).toEqual([{ ticket: 'FAQ-1', reason: '排隊已超過 24 小時' }])
+    expect(h.queue.size()).toBe(0)
+    h.cleanup()
+  })
+
+  test('attempt 丟例外：視為拒絕，單塞回隊頭，不吞掉、不讓單消失', async () => {
+    const h = makeHarness(0)
+    h.queue.submit('FAQ-1', null, { tag: 'a' })
+    h.queue.submit('FAQ-2', null, { tag: 'b' })
+    const outcome = await h.queue.tryDispatchFront(async () => {
+      throw new Error('postJob 炸了')
+    })
+    expect(outcome).toBe('declined')
+    expect(h.queue.size()).toBe(2) // FAQ-1 沒有消失
+    expect(h.queue.has('FAQ-1')).toBe('queued')
+    h.cleanup()
+  })
+
+  test('塞回隊頭的單會落盤（persist 開啟時）：重啟恢復不會遺漏', () => {
+    const h = makeHarness(0, { enablePersist: true })
+    h.queue.submit('FAQ-1', null, { tag: 'a' })
+    return h.queue.tryDispatchFront(async () => false).then(outcome => {
+      expect(outcome).toBe('declined')
+      const state = h.readState()
+      expect(state.entries.map(e => e.ticket)).toEqual(['FAQ-1'])
+      h.cleanup()
+    })
+  })
+})

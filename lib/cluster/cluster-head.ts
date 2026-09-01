@@ -6,9 +6,16 @@ import { createWorkerRegistry } from './worker-registry.ts'
 import { createDispatchRegistry, type DispatchEntry } from './dispatch-registry.ts'
 import { createDispatcher, type DispatchResult } from './dispatch.ts'
 import { createRemoteSweeper } from './remote-sweeper.ts'
+import { createBacklogDispatcher } from './backlog-dispatcher.ts'
 import { fetchWorkerCapacity, fetchWorkerJobStatus, postWorkerJob } from './worker-client.ts'
-import { submitCreateMr, getBugQueueStats, hasBugTicketActive, notifyQueueEvent } from '../pipeline-runner/spawn-create-mr.ts'
-import { submitDemandPipeline, getDemandQueueStats, hasDemandTicketActive, resetAiAnalysisForReclaim } from '../pipeline-runner/spawn-demand-pipeline.ts'
+import { submitCreateMr, getBugQueueStats, hasBugTicketActive, notifyQueueEvent, tryDispatchBugQueueFront } from '../pipeline-runner/spawn-create-mr.ts'
+import {
+  submitDemandPipeline,
+  getDemandQueueStats,
+  hasDemandTicketActive,
+  resetAiAnalysisForReclaim,
+  tryDispatchDemandQueueFront,
+} from '../pipeline-runner/spawn-demand-pipeline.ts'
 import { notifyOperator } from '../notify/operator.ts'
 import type { TechUser } from '../user-resolution/tech-user.ts'
 
@@ -55,6 +62,18 @@ const sweeper = createRemoteSweeper({
   notifyOperator,
   notifyUser: notifyQueueEvent,
   resetDemand: resetAiAnalysisForReclaim,
+})
+
+// head 佇列的 cluster-wide 遞補（見 backlog-dispatcher.ts 檔頭）。listWorkers
+// 過濾 disabled，跟 dispatcher 的候選名單同一套規則——過濾點刻意放在 wiring
+// 層，理由見 worker-registry.ts「disabled」段落。
+const backlogDispatcher = createBacklogDispatcher({
+  registry: dispatchRegistry,
+  postJob: (w, job) => postWorkerJob(w.url, secret ?? '', job),
+  fetchCapacity: w => fetchWorkerCapacity(w.url, secret ?? ''),
+  listWorkers: () => (secret === null ? [] : workerRegistry.list().filter(w => !w.disabled)),
+  bug: { tryDispatchFront: tryDispatchBugQueueFront },
+  demand: { tryDispatchFront: tryDispatchDemandQueueFront },
 })
 
 export function isClusterEnabled(): boolean {
@@ -132,6 +151,13 @@ export function registerClusterRoutes(app: Hono): void {
     dispatchRegistry.clear(body.ticket)
     sweeper.noteCleared(body.ticket) // M-3：失聯計數與告警旗標一併歸零
     console.error(`cluster: ${body.ticket} 於 worker ${worker} 執行結束（job-done 回報）`)
+    // 這台 worker 剛釋放一個名額：把 head 佇列隊頭遞補過去（cluster-wide
+    // 遞補，見 backlog-dispatcher.ts）。fire-and-forget，不擋這支 HTTP 回應
+    // ——比照 notifyQueueEvent 等既有 best-effort 收尾的寫法。找不到該 worker
+    // （已被移除/停用）就不遞補，理由見 worker-registry.ts「disabled」段落。
+    const kind = body.ticket.startsWith('FAQ-') ? 'bug' : 'demand'
+    const w = workerRegistry.list().find(x => x.name === worker && !x.disabled)
+    if (w) void backlogDispatcher.fillFreedSlot(kind, w).catch(err => console.error(`cluster: ${body.ticket} 的 backlog 遞補失敗: ${err}`))
     return c.json({ ok: true })
   })
 
@@ -178,6 +204,9 @@ export function initClusterHead(): void {
   if (recovered > 0) console.error(`cluster: 撿回 ${recovered} 筆重啟前的遠端派工登記（含 dispatching 待求證條目，交由 sweeper 校正）`)
   setInterval(() => {
     sweeper.sweep().catch(err => console.error(`cluster: sweep 失敗: ${err}`))
+    // job-done 回報遺失時的安全網（見 backlog-dispatcher.ts 檔頭）：同一顆
+    // timer 順便補做一次 backlog 遞補探測，不另開新 timer。
+    backlogDispatcher.sweepBacklog().catch(err => console.error(`cluster: backlog sweep 失敗: ${err}`))
   }, SWEEP_INTERVAL_MS)
   console.error(
     `cluster: head 模式啟用（已登記 worker：${workerRegistry.list().map(w => w.name).join(', ') || '無'}；/cluster/* 的公網封鎖依賴 cloudflared 注入 CF-Connecting-IP，換 tunnel 需重新評估）`,

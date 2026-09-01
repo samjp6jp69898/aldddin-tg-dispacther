@@ -260,7 +260,7 @@ timeout 7200 ${CLAUDE_BIN} -p "/create-mr:create-mr $1 $3" --model opus --permis
 // 2026-08-28（使用者定案）：額滿改排隊。spawnCreateMrNow 是「真正起背景流程」
 // 的部分（不含額度檢查），額度與 FIFO 佇列交給 bugQueue 統一管理——排隊、
 // 遞補、重啟恢復的完整語意見 pipeline-queue.ts 檔頭註解。
-type BugPayload = { resume: boolean }
+export type BugPayload = { resume: boolean }
 
 function spawnCreateMrNow(entry: QueueEntry<BugPayload>, onExit: () => void): { ok: true; pid: number | undefined } | { ok: false } {
   const { ticket } = entry
@@ -404,6 +404,13 @@ export function hasBugTicketActive(ticket: string): 'running' | 'queued' | null 
 /** running 集合快照（見 pipeline-queue.ts runningTickets 註解）。 */
 export function getBugRunningTickets(): string[] {
   return bugQueue.runningTickets()
+}
+
+/** 多機派工（lib/cluster/backlog-dispatcher.ts）用的旁路出口：把 head 本機
+ * Bug 佇列的隊頭遞補去某台剛釋放名額的 worker，見 pipeline-queue.ts
+ * tryDispatchFront 註解。 */
+export function tryDispatchBugQueueFront(attempt: (entry: QueueEntry<BugPayload>) => Promise<boolean>): Promise<'empty' | 'dispatched' | 'declined'> {
+  return bugQueue.tryDispatchFront(attempt)
 }
 
 /** 提交一張 Bug 單：有名額直接 spawn（started）、額滿排入 FIFO 佇列（queued，

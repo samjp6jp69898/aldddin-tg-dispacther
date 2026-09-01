@@ -61,7 +61,7 @@ const concurrencyLimiter = createConcurrencyLimiter(DEMAND_CONCURRENCY_LIMIT)
 // 2026-08-28（使用者定案）：額滿改排隊，結構比照 spawn-create-mr.ts——
 // spawnDemandPipelineNow 只負責真正起背景流程，額度與 FIFO 佇列交給
 // demandQueue（見 pipeline-queue.ts 檔頭註解）。
-type DemandPayload = { assigneeEmail: string }
+export type DemandPayload = { assigneeEmail: string }
 
 function spawnDemandPipelineNow(entry: QueueEntry<DemandPayload>, onExit: () => void): { ok: true; pid: number | undefined } | { ok: false } {
   const { ticket } = entry
@@ -199,6 +199,12 @@ export function hasDemandTicketActive(ticket: string): 'running' | 'queued' | nu
 
 export function getDemandRunningTickets(): string[] {
   return demandQueue.runningTickets()
+}
+
+/** 多機派工（lib/cluster/backlog-dispatcher.ts）用的旁路出口，介面說明比照
+ * spawn-create-mr.ts 的 tryDispatchBugQueueFront。 */
+export function tryDispatchDemandQueueFront(attempt: (entry: QueueEntry<DemandPayload>) => Promise<boolean>): Promise<'empty' | 'dispatched' | 'declined'> {
+  return demandQueue.tryDispatchFront(attempt)
 }
 
 /** 提交一張需求單：有名額直接 spawn、額滿排入 FIFO 佇列（回覆順位）、已在
