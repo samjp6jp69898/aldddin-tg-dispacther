@@ -17,9 +17,9 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { InputFile, type Context } from 'grammy'
-import { runKitScript } from '/Users/user/aladdin/obsidian/mcps/aladdin-kit-admin/src/spawn_kit_script.ts'
+import { runKitScript } from '/Users/user/aladdin/aladdin_mcps/aladdin-kit-admin/src/spawn_kit_script.ts'
 
-const KIT_DIST_DIR = '/Users/user/aladdin/obsidian/mcps/aladdin-ai-assistant-kit/dist'
+const KIT_DIST_DIR = '/Users/user/aladdin/aladdin_mcps/aladdin-ai-assistant-kit/dist'
 
 /** 只從根目錄 .env 的 TG_KIT_ADMIN_CHAT_ID 讀（比照 bot.ts 對 token 的手法），不寫死。 */
 export function isKitAdminChat(chatId: string): boolean {

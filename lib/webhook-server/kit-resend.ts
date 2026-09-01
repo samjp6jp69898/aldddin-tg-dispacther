@@ -27,10 +27,10 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { parseArgs } from 'node:util'
-import { runKitScript } from '/Users/user/aladdin/obsidian/mcps/aladdin-kit-admin/src/spawn_kit_script.ts'
+import { runKitScript } from '/Users/user/aladdin/aladdin_mcps/aladdin-kit-admin/src/spawn_kit_script.ts'
 import { buildKitUsageText, readDistAliases } from './kit-issue.ts'
 
-const KIT_DIST_DIR = '/Users/user/aladdin/obsidian/mcps/aladdin-ai-assistant-kit/dist'
+const KIT_DIST_DIR = '/Users/user/aladdin/aladdin_mcps/aladdin-ai-assistant-kit/dist'
 // 2026-08-31：obsidian/scripts/ 已被拆分掉、tg-notify.sh 實際搬到 aladdin_ai/scripts/。
 const TG_NOTIFY_SCRIPT = '/Users/user/aladdin/aladdin_ai/scripts/tg-notify.sh'
 const ROOT_ENV_FILE = '/Users/user/aladdin/telegram-dispatcher/.env'

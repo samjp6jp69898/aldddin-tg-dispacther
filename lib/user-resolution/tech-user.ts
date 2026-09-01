@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs'
 
-const TECH_USERS_CSV = '/Users/user/aladdin/obsidian/commands/create-mr/references/tech-users.csv'
+const TECH_USERS_CSV = '/Users/user/aladdin/aladdin_ai/commands/create-mr/references/tech-users.csv'
 
 export type TechUser = {
   notion_user_id: string

@@ -11,7 +11,7 @@ import { join } from 'node:path'
 // whitelist.test.ts／kit-issue.test.ts 用的都是真的模組，不會互相污染
 // （mock.module 是 process 全域生效，實測驗證過同一個 leaf 若被兩個檔案
 // 各自 mock 才會有先後互相覆蓋的風險——這裡刻意只有這一個檔案碰它）。
-const SPAWN_KIT_SCRIPT_PATH = '/Users/user/aladdin/obsidian/mcps/aladdin-kit-admin/src/spawn_kit_script.ts'
+const SPAWN_KIT_SCRIPT_PATH = '/Users/user/aladdin/aladdin_mcps/aladdin-kit-admin/src/spawn_kit_script.ts'
 const runKitScriptMock = mock((_args: string[]) => ({ success: true, stdout: '', stderr: '' }))
 mock.module(SPAWN_KIT_SCRIPT_PATH, () => ({ runKitScript: runKitScriptMock }))
 
@@ -19,7 +19,7 @@ const { registerHandlers } = await import('./whitelist.ts')
 
 const KIT_ADMIN_CHAT_ID = 5022865804 // Landon，見 tech-users.csv／.env TG_KIT_ADMIN_CHAT_ID 真實值
 const OTHER_TECH_CHAT_ID = 2095624031 // 另一位真實白名單內技術（Eden Li KHH，見 tech-users.csv），非 kit admin
-const KIT_DIST_DIR = '/Users/user/aladdin/obsidian/mcps/aladdin-ai-assistant-kit/dist'
+const KIT_DIST_DIR = '/Users/user/aladdin/aladdin_mcps/aladdin-ai-assistant-kit/dist'
 
 function captureHandlers() {
   const handlers: Record<string, (ctx: any) => Promise<void>> = {}
