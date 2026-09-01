@@ -38,7 +38,7 @@ else
 fi
 
 echo "== repo checkout 與遠端連通 =="
-for repo in obsidian agrabah abu lago rajah telegram-dispatcher; do
+for repo in obsidian aladdin_ai aladdin_mcps agrabah abu lago rajah telegram-dispatcher; do
   if [ -d "$ALADDIN/$repo/.git" ]; then
     if git -C "$ALADDIN/$repo" ls-remote origin HEAD >/dev/null 2>&1; then
       ok "${repo}（origin 可達）"
@@ -51,7 +51,7 @@ for repo in obsidian agrabah abu lago rajah telegram-dispatcher; do
 done
 
 echo "== symlink 與腳本 =="
-for link in "$ALADDIN/.claude/commands" "$ALADDIN/.claude/agents" "$ALADDIN/.claude/skills" "$ALADDIN/.claude/doctrine" "$ALADDIN/scripts"; do
+for link in "$ALADDIN/.claude/commands" "$ALADDIN/.claude/agents" "$ALADDIN/.claude/skills" "$ALADDIN/.claude/doctrine" "$ALADDIN/scripts" "$ALADDIN/conn"; do
   [ -L "$link" ] && [ -e "$link" ] && ok "symlink $link" || bad "symlink 壞掉/缺失：${link}（見 bootstrap-worker.sh 第 4 節）"
 done
 for sh in bug-lock.sh tracker.sh notion.sh tg-notify.sh setup-worktree.sh; do

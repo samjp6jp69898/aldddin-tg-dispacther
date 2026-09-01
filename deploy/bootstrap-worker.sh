@@ -37,21 +37,22 @@ if command -v glab >/dev/null 2>&1; then ok "glab"; else todo "brew install glab
 # worker 機不需要 cloudflared / tunnel / webhook——那些是 head 專屬。
 
 echo "== 3. repo checkout（需自備 git 憑證，本腳本不代 clone）=="
-for repo in obsidian agrabah abu lago rajah telegram-dispatcher; do
+for repo in obsidian aladdin_ai aladdin_mcps agrabah abu lago rajah telegram-dispatcher; do
   if [ -d "$ALADDIN/$repo/.git" ]; then ok "$repo"; else todo "clone $repo 到 $ALADDIN/$repo"; fi
 done
 
-echo "== 4. symlink 重建（obsidian 為單一來源，見 CLAUDE.md）=="
-if [ -d "$ALADDIN/obsidian" ]; then
+echo "== 4. symlink 重建（aladdin_ai 為單一來源，見 CLAUDE.md；obsidian 2026-08-31 起改為純知識庫，不再是 symlink 來源）=="
+if [ -d "$ALADDIN/aladdin_ai" ]; then
   mkdir -p "$ALADDIN/.claude"
-  ln -sfn "$ALADDIN/obsidian/commands" "$ALADDIN/.claude/commands"
-  ln -sfn "$ALADDIN/obsidian/agents"   "$ALADDIN/.claude/agents"
-  ln -sfn "$ALADDIN/obsidian/skills"   "$ALADDIN/.claude/skills"
-  ln -sfn "$ALADDIN/obsidian/doctrine" "$ALADDIN/.claude/doctrine"
-  ln -sfn "$ALADDIN/obsidian/scripts"  "$ALADDIN/scripts"
-  ok "5 條 symlink 已重建（.claude/{commands,agents,skills,doctrine} + scripts）"
+  ln -sfn "$ALADDIN/aladdin_ai/commands" "$ALADDIN/.claude/commands"
+  ln -sfn "$ALADDIN/aladdin_ai/agents"   "$ALADDIN/.claude/agents"
+  ln -sfn "$ALADDIN/aladdin_ai/skills"   "$ALADDIN/.claude/skills"
+  ln -sfn "$ALADDIN/aladdin_ai/doctrine" "$ALADDIN/.claude/doctrine"
+  ln -sfn "$ALADDIN/aladdin_ai/scripts"  "$ALADDIN/scripts"
+  ln -sfn "$ALADDIN/aladdin_ai/conn"     "$ALADDIN/conn"
+  ok "6 條 symlink 已重建（.claude/{commands,agents,skills,doctrine} + scripts + conn）"
 else
-  todo "obsidian repo 尚未 clone，symlink 留待 clone 後重跑本腳本"
+  todo "aladdin_ai repo 尚未 clone，symlink 留待 clone 後重跑本腳本"
 fi
 
 echo "== 5. telegram-dispatcher 依賴與工作目錄 =="

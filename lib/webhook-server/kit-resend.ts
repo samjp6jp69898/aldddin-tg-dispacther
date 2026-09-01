@@ -27,11 +27,11 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { parseArgs } from 'node:util'
-import { runKitScript } from '/Users/user/aladdin/obsidian/mcps/aladdin-kit-admin/src/spawn_kit_script.ts'
+import { runKitScript } from '/Users/user/aladdin/aladdin_mcps/aladdin-kit-admin/src/spawn_kit_script.ts'
 import { buildKitUsageText, readDistAliases } from './kit-issue.ts'
 
-const KIT_DIST_DIR = '/Users/user/aladdin/obsidian/mcps/aladdin-ai-assistant-kit/dist'
-const TG_NOTIFY_SCRIPT = '/Users/user/aladdin/obsidian/scripts/tg-notify.sh'
+const KIT_DIST_DIR = '/Users/user/aladdin/aladdin_mcps/aladdin-ai-assistant-kit/dist'
+const TG_NOTIFY_SCRIPT = '/Users/user/aladdin/aladdin_ai/scripts/tg-notify.sh'
 const ROOT_ENV_FILE = '/Users/user/aladdin/.env'
 
 /** 只從根目錄 .env 讀 TG_KIT_ADMIN_CHAT_ID（比照 tg-notify.sh 對 token 的手法），不寫死。 */

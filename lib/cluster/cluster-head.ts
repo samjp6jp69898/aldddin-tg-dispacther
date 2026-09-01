@@ -28,7 +28,10 @@ const dispatchRegistry = createDispatchRegistry(join(LOG_DIR, 'cluster-dispatche
 
 const dispatcher = createDispatcher({
   registry: dispatchRegistry,
-  listWorkers: () => (secret === null ? [] : workerRegistry.list()),
+  // disabled 的 worker（tg-monitor Workers 分頁「中斷」按鈕，見 worker-registry.ts
+  // 檔頭）不參與派工選擇，但仍留在名冊裡可查詢——過濾點刻意放在這裡（wiring
+  // 層）而非 dispatch.ts 本體，讓派工邏輯本身保持對「disabled」這個概念無感。
+  listWorkers: () => (secret === null ? [] : workerRegistry.list().filter(w => !w.disabled)),
   fetchCapacity: (w, ticket) => fetchWorkerCapacity(w.url, secret ?? '', ticket),
   postJob: (w, job) => postWorkerJob(w.url, secret ?? '', job),
   local: {
@@ -130,6 +133,34 @@ export function registerClusterRoutes(app: Hono): void {
     sweeper.noteCleared(body.ticket) // M-3：失聯計數與告警旗標一併歸零
     console.error(`cluster: ${body.ticket} 於 worker ${worker} 執行結束（job-done 回報）`)
     return c.json({ ok: true })
+  })
+
+  // worker 名冊管理（2026-08-31，tg-monitor Workers 分頁「中斷／恢復／移除」
+  // 按鈕新增）：呼叫端是本機的 tg-monitor（打 127.0.0.1:8787），不是遠端
+  // worker，但仍走同一組 guard（LAN-only + secret）——這組操作一樣不該對
+  // 公網開放，跟 /cluster/register 同等敏感度。
+  app.post('/cluster/worker/:name/disable', guard, c => {
+    const name = c.req.param('name')
+    if (!WORKER_NAME_RE.test(name)) return c.json({ ok: false }, 400)
+    const ok = workerRegistry.setDisabled(name, true)
+    if (ok) console.error(`cluster: worker ${name} 已停用（不再收到新工作，該台身上既有的工作不受影響）`)
+    return c.json({ ok }, ok ? 200 : 404)
+  })
+
+  app.post('/cluster/worker/:name/enable', guard, c => {
+    const name = c.req.param('name')
+    if (!WORKER_NAME_RE.test(name)) return c.json({ ok: false }, 400)
+    const ok = workerRegistry.setDisabled(name, false)
+    if (ok) console.error(`cluster: worker ${name} 已恢復，可再收到新工作`)
+    return c.json({ ok }, ok ? 200 : 404)
+  })
+
+  app.post('/cluster/worker/:name/remove', guard, c => {
+    const name = c.req.param('name')
+    if (!WORKER_NAME_RE.test(name)) return c.json({ ok: false }, 400)
+    const ok = workerRegistry.remove(name)
+    if (ok) console.error(`cluster: worker ${name} 已從名冊移除（若該機 worker-agent 行程仍在跑，30 分鐘內會自動重新登記回來——見 worker-registry.ts 檔頭）`)
+    return c.json({ ok }, ok ? 200 : 404)
   })
 }
 

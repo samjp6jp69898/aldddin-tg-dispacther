@@ -57,10 +57,10 @@ export async function checkCloudflaredTunnelReachable(apiUrl: string = CLOUDFLAR
 // aladdin-toolsmith 不在清單裡：它沒有名冊檔（認證機制不同），列進來只會變成
 // 永遠告警的假陽性。
 const TOKEN_REGISTRY_PATHS = [
-  '/Users/user/aladdin/obsidian/mcps/aladdin-admin/tokens.json',
-  '/Users/user/aladdin/obsidian/mcps/aladdin-admin/tokens.pre.json',
-  '/Users/user/aladdin/obsidian/mcps/aladdin-admin/tokens.evi.json',
-  '/Users/user/aladdin/obsidian/mcps/aladdin-platform/tokens.json',
+  '/Users/user/aladdin/aladdin_mcps/aladdin-admin/tokens.json',
+  '/Users/user/aladdin/aladdin_mcps/aladdin-admin/tokens.pre.json',
+  '/Users/user/aladdin/aladdin_mcps/aladdin-admin/tokens.evi.json',
+  '/Users/user/aladdin/aladdin_mcps/aladdin-platform/tokens.json',
 ]
 
 /**
