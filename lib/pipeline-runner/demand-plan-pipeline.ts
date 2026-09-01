@@ -41,7 +41,7 @@ function log(msg: string): void {
  * 建立一個輕量、唯讀分析用的 git worktree——跟 setup-worktree.sh 的差別：
  * 不跑 bootstrap.sh（不含 code generation、不含 DB migrate、不 symlink
  * node_modules），純粹 `git worktree add`，因為這個 pipeline 不需要真的
- * 啟動任何服務，只需要一份跟 origin/dev 一致、可以安全讀寫（其實只讀）的
+ * 啟動任何服務，只需要一份跟 origin/main 一致、可以安全讀寫（其實只讀）的
  * 檔案系統起點。分支名故意跟 setup-worktree.sh 的 mr/{ticket} 不同（改用
  * plan/{ticket}），避免跟真的要拿去開 MR 的分支語意混在一起。
  *
@@ -67,7 +67,14 @@ async function createLightweightWorktree(ticket: string, repo: string): Promise<
       // 分支不存在是正常情況，忽略
     }
     mkdirSync(join(ROOT, 'worktrees', ticket), { recursive: true })
-    await execFileAsync('git', ['-C', repoRoot, 'worktree', 'add', wtPath, '-B', branch, 'origin/dev'], {
+    // 2026-09-01：建 worktree 前先拉新 origin/main——這條 pipeline 不經過
+    // fresh-pull.sh，本機 origin/main 的新鮮度只能靠這裡保證，否則 plan 會
+    // 基於過期的程式碼分析。fetch 失敗直接視為建立失敗（回傳 reason）。
+    await execFileAsync('git', ['-C', repoRoot, 'fetch', 'origin', 'main', '--quiet'], {
+      encoding: 'utf8',
+      timeout: 120_000,
+    })
+    await execFileAsync('git', ['-C', repoRoot, 'worktree', 'add', wtPath, '-B', branch, 'origin/main'], {
       encoding: 'utf8',
       timeout: 60_000,
     })

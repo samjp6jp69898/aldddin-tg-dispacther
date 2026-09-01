@@ -73,7 +73,7 @@ export function buildDraftPrompt(ticket: string, specText: string, comments: str
 
 **這是唯讀分析任務，不要用 Edit/Write 類工具改動任何檔案**（這次執行環境本來就沒有提供這類工具）。
 
-**目標 repo**（判斷這張單會動到以下 ${repos.length} 個 repo，各自都有唯讀 git worktree，內容跟 origin/dev 一致）：
+**目標 repo**（判斷這張單會動到以下 ${repos.length} 個 repo，各自都有唯讀 git worktree，內容跟 origin/main 一致）：
 ${repoLines}
 
 實際範圍仍可能延伸到列表外的其他 repo（agrabah/abu/lago/rajah 都在 /Users/user/aladdin/ 底下，是開發者的真實工作目錄，唯讀讀取沒問題，但**絕對不要對這些路徑執行任何寫入/修改指令**）。
