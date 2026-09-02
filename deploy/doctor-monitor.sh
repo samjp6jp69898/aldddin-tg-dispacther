@@ -173,7 +173,13 @@ if [ -f "$TGMON/.env" ] && [ -f "$TGMON/.env.example" ] && grep -q 'MON_DB_ENABL
   TGMON_PID=$(launchctl list | awk '$3=="com.aladdin.tg-monitor"{print $1}')
   if [ -n "$TGMON_PID" ] && [ "$TGMON_PID" != "-" ] && curl -s -o /dev/null -w '' "http://127.0.0.1:8799/" ; then
     HC=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:8799/")
-    [ "$HC" = "200" ] && ok "tg-monitor 8799 正常回應 (pid=$TGMON_PID)" || err "tg-monitor 8799 回應異常: $HC"
+    # 302 也算正常：ff 的 7818207（2026-09-02）刪掉舊版 public/index.html 之後，
+    # `/` 改成導向 `/next/`（React 版是唯一前端）。原本只認 200，那次改動之後這一項
+    # 就恆紅，`[ "$ERRORS" -eq 0 ]` 永遠不成立、整份 doctor 的驗收價值歸零。
+    case "$HC" in
+      200|302) ok "tg-monitor 8799 正常回應 HTTP $HC (pid=$TGMON_PID)" ;;
+      *)       err "tg-monitor 8799 回應異常: $HC" ;;
+    esac
   else
     err "tg-monitor 未在跑或 8799 無回應"
   fi
