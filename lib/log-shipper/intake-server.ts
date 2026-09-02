@@ -27,8 +27,17 @@ import { getClusterSecret, WORKER_NAME_RE } from '../cluster/cluster-env.ts'
 import { createClusterAuthGuard } from '../cluster/cluster-auth.ts'
 import { createWorkerRegistry } from '../cluster/worker-registry.ts'
 import { respondUniform401 } from '../security/uniform-401.ts'
-import { MON_HOST } from '../monitor-db/env.ts'
+import { declareMonitorRole, MON_HOST } from '../monitor-db/env.ts'
 import { startMonitorHeartbeat } from '../monitor-db/heartbeat.ts'
+
+// 【183bf5a 同原則，總指揮 2026-09-02 裁定】進入點顯式宣告角色：本行程是
+// head only 的 log intake，MON_HOST 必須釘死 'head'，不得依賴環境嗅探——
+// head .env 殘留 CLUSTER_WORKER_NAME 時，嗅探值會污染下方 POST /cluster/logs
+// 的 `worker === MON_HOST` 拒絕判準（擋錯對象）。放在 module init 最前端是
+// 結構保證（先於 serve 與任何 monitor 引用），不繫於 heartbeat 啟動時序；
+// heartbeat.ts 內對 log-intake 的條件補宣告（9551686）由 Phase 4 側後續
+// 清理 commit 移除。
+declareMonitorRole('mon_head')
 
 const IDENTITY = 'com.aladdin.monitor-log-intake'
 const LOG_DIR = '/Users/user/aladdin/telegram-dispatcher/logs'
