@@ -31,6 +31,7 @@ import { isMonitorDbEnabled, MON_HOST } from './env.ts'
 import { withMonitorDeadline } from './deadline.ts'
 import { getLongLivedMonitorPool, getLongLivedMonitorSpoolWriter } from './runtime.ts'
 import { upsertMonitorHeartbeat, type MonitorDbExecutor } from './writes.ts'
+import { readSpoolStatsForHeartbeat } from './spool/depth.ts'
 import { createSpoolWriter, type SpoolWriterHandle } from './spool/writer.ts'
 import type { MonitorHeartbeatWriter } from './types.ts'
 
@@ -55,17 +56,39 @@ export interface MonitorHeartbeatDeps {
 
 export type HeartbeatResult = 'written' | 'spooled' | 'lost' | 'disabled'
 
+// 本行程各 writer 最近一拍的結果。唯一消費者是 worker-agent 的
+// `/cluster/monitor-status` 主動回報（§6.8(e) / MJ-E4）——它要回報的
+// `db_writable` 就是「上一拍心跳有沒有真的寫進 DB」，這是本行程手上唯一
+// 不需要**額外**打一次 DB 就能得到的答案（再打一次 SELECT 1 只是多一個
+// 網路來回，且回答的還是不同的問題：可讀 ≠ 可寫）。
+const lastResults = new Map<MonitorHeartbeatWriter, HeartbeatResult>()
+
+/** 本行程該 writer 最近一拍的心跳結果；還沒打過任何一拍回 null。 */
+export function getLastHeartbeatResult(writer: MonitorHeartbeatWriter): HeartbeatResult | null {
+  return lastResults.get(writer) ?? null
+}
+
+/** 測試專用：清掉上面那張表（模組級狀態跨測試檔共用同一個 bun test process）。 */
+export function __resetLastHeartbeatResultsForTest(): void {
+  lastResults.clear()
+}
+
+
 /**
  * 打一拍心跳。**永不 throw**——回傳值只供測試與觀察。
  *
- * `spool_depth` / `spool_oldest_ts`：沒有注入 `spoolStats` 時一律寫 NULL。
- * 這是刻意的——§6.8 對這兩欄的語意是「待重放**條目**數與最舊條目時間」，而
- * spool 模組目前沒有「數條目」的公開函式（游標檔只有 acked_bytes，數條目要
- * 掃檔），本檔不發明一個「檔案數」之類語意不同的替代值去填一個下游會拿來
- * 判讀的欄位。補齊它是獨立工項（需要 spool 側先提供計數 API）。
+ * `spool_depth` / `spool_oldest_ts`：`beatOnce()` 本身沒有注入 `spoolStats` 時
+ * 一律寫 NULL（保持這支函式對檔案系統零依賴，測試才能完全確定性）。
+ * production 的三個長駐行程不會走到這條路——`startMonitorHeartbeat()` 會補上
+ * `spool/depth.ts` 的讀取器當預設值（見該函式）。那支讀取器就是這段註解原本
+ * 說的「獨立工項」：§6.8(b) 定義的「未 ack 位元組換算條目數」現在有公開 API 了。
  */
 export async function beatOnce(deps: MonitorHeartbeatDeps): Promise<HeartbeatResult> {
   if (!isMonitorDbEnabled()) return 'disabled'
+  const record = (r: HeartbeatResult): HeartbeatResult => {
+    lastResults.set(deps.writer, r)
+    return r
+  }
   const now = deps.now ?? Date.now
   // §6.5(a) 硬規則：時間一律是寫入當下算好的絕對 ISO 字串，不留給重放時求值。
   const ts = new Date(now()).toISOString()
@@ -87,7 +110,7 @@ export async function beatOnce(deps: MonitorHeartbeatDeps): Promise<HeartbeatRes
       // 也不落 spool，正是本模組要消滅的靜默失敗（對抗性審查 B1）。
       const target = pool
       await withMonitorDeadline(`upsertMonitorHeartbeat(${deps.writer})`, () => upsertMonitorHeartbeat(target, input), deps.queryBudgetMs)
-      return 'written'
+      return record('written')
     } catch (err) {
       console.error(`monitor-db heartbeat(${deps.writer}): 寫入失敗，改落 spool: ${err}`)
     }
@@ -97,11 +120,11 @@ export async function beatOnce(deps: MonitorHeartbeatDeps): Promise<HeartbeatRes
 
   try {
     resolveSpool(deps).append({ ts, host: MON_HOST, run_id: null, fn: 'upsertMonitorHeartbeat', args: [input] })
-    return 'spooled'
+    return record('spooled')
   } catch (spoolErr) {
     // 兩層都失敗：只記錄，絕不外拋（心跳失敗不得影響宿主行程）。
     console.error(`monitor-db heartbeat(${deps.writer}): 落 spool 也失敗，本拍遺失: ${spoolErr}`)
-    return 'lost'
+    return record('lost')
   }
 }
 
@@ -162,8 +185,15 @@ const NOOP_HANDLE: MonitorHeartbeatHandle = { stop() {}, firstBeat: Promise.reso
 export function startMonitorHeartbeat(deps: MonitorHeartbeatDeps, tickMs = MONITOR_HEARTBEAT_TICK_MS): MonitorHeartbeatHandle {
   if (!isMonitorDbEnabled()) return NOOP_HANDLE
 
-  const firstBeat = beatOnce(deps)
-  const timer = setInterval(() => void beatOnce(deps), tickMs)
+  // `spool_depth` / `spool_oldest_ts` 的預設來源（§6.8(b)）。放在這裡而不是
+  // `beatOnce()` 裡：三個長駐進入點（server.ts / worker-agent.ts /
+  // log-intake 的 intake-server.ts）都只呼叫這一支，一處補齊就三個行程全中，
+  // 不需要動到各進入點（其中 `lib/log-shipper/` 這一輪不可改）；而
+  // `beatOnce()` 維持對檔案系統零依賴，單元測試不會意外掃到真的 spool 目錄。
+  const withDefaults: MonitorHeartbeatDeps = deps.spoolStats ? deps : { ...deps, spoolStats: () => readSpoolStatsForHeartbeat() }
+
+  const firstBeat = beatOnce(withDefaults)
+  const timer = setInterval(() => void beatOnce(withDefaults), tickMs)
   return {
     firstBeat,
     stop() {

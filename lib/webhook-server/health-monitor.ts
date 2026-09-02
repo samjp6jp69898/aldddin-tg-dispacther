@@ -1,6 +1,8 @@
 import { execFileSync } from 'node:child_process'
 import { appendFileSync, mkdirSync, readFileSync } from 'node:fs'
 import { basename, join } from 'node:path'
+import { evaluateMonitorDbAlerts, type MonitorAlertDeps } from '../monitor-db/alerts.ts'
+import { isMonitorDbEnabled } from '../monitor-db/env.ts'
 
 const CLOUDFLARED_METRICS_URL = 'http://127.0.0.1:20241/ready'
 const TG_NOTIFY_SH = '/Users/user/aladdin/scripts/tg-notify.sh'
@@ -145,11 +147,22 @@ export function createHealthMonitor(
     chatId?: string
     notify?: (text: string) => void
     registryPaths?: string[]
+    /**
+     * §6.8(3) a–f 的判定依賴。production 不傳，由 lib/monitor-db/alerts.ts
+     * 自己的預設值供給（真 DB／真 ssh／真 spool 目錄）。
+     *
+     * `false` ＝ 整組告警停用。**這個開關存在的唯一理由是測試**：本 repo 的
+     * `.env` 有 `MON_DB_ENABLED=1` 而 bun 會自動載入它，所以單元測試裡
+     * `isMonitorDbEnabled()` 預設就是 true——只驗 tunnel／名冊那兩半的測試若
+     * 不明確停用，會連帶去打真的 monitor DB 與真的 `ssh <worker>`。
+     */
+    monitorAlerts?: MonitorAlertDeps | false
   } = {},
 ): HealthMonitor {
   const apiUrl = deps.apiUrl ?? CLOUDFLARED_METRICS_URL
   const chatId = deps.chatId ?? OPERATOR_CHAT_ID
   const registryPaths = deps.registryPaths ?? TOKEN_REGISTRY_PATHS
+  const monitorAlertDeps = deps.monitorAlerts ?? {}
   const notify =
     deps.notify ??
     ((text: string) => {
@@ -168,6 +181,10 @@ export function createHealthMonitor(
   // 一個布林，第二份壞掉時整體狀態沒有翻轉，就不會再發第二次告警）。
   // 值是「上次看到的原因」，null = 當時可載入；key 不存在 = 還沒檢查過。
   const lastRegistryFailure = new Map<string, string | null>()
+  // §6.8(3) a–f：每個條件各自記「上一輪是不是 tripped」，翻轉才發——與上面
+  // 名冊那張表同一套理由（併成一個布林會讓第二個條件壞掉時整體狀態不翻轉，
+  // 第二則告警就永遠不會發）。key 不存在＝還沒評估過（或該輪評估出錯被省略）。
+  const lastMonitorAlert = new Map<string, boolean>()
 
   // 跟 ngrok 那半刻意不同：這裡**第一次檢查就會告警**，沒有「只記基準值」的
   // 寬限。tunnel 需要寬限是因為 dispatcher 可能比 tunnel 早起來，是暫態；
@@ -196,8 +213,45 @@ export function createHealthMonitor(
     }
   }
 
+  /**
+   * §6.8(3) a–f 的六條營運告警。判定本身全在 lib/monitor-db/alerts.ts，本函式
+   * 只負責「翻轉才通知」這一層狀態機（與上面 tunnel／名冊兩套完全同型）。
+   *
+   * **flag 閘門在這裡，而且是整段的第一行**：`MON_DB_ENABLED != '1'` 時本函式
+   * 立刻 return，一次 DB 讀取、一次 ssh 探測、一次 spool 掃描都不會發生
+   * ——health-monitor 的行為與本次改動前逐位元組相同。
+   *
+   * 沒有「第一次只記基準」的寬限，比照名冊那半：這些條件描述的是**已經成立的
+   * 故障狀態**（心跳落後 5 分鐘、spool 積壓 200 條、tunnel 不通），dispatcher
+   * 剛重啟不會讓它們變成暫態誤報；反過來，「重啟時就已經壞掉」正是最該被
+   * 告警、卻會被基準寬限永久靜默的情境。
+   */
+  async function checkMonitorDbAlerts(): Promise<void> {
+    if (monitorAlertDeps === false || !isMonitorDbEnabled()) return
+    let alerts
+    try {
+      alerts = await evaluateMonitorDbAlerts(monitorAlertDeps)
+    } catch (err) {
+      // evaluateMonitorDbAlerts 自己已經逐條件 try/catch，理論上不會走到這裡；
+      // 真的走到也只記錄，不讓監控告警本身弄壞健康檢查的其他部分。
+      log(`monitor-db alerts 評估整體失敗: ${err}`)
+      return
+    }
+    for (const alert of alerts) {
+      const prev = lastMonitorAlert.get(alert.key)
+      if (prev === alert.tripped) continue
+      lastMonitorAlert.set(alert.key, alert.tripped)
+      if (alert.tripped) {
+        notify(`${alert.level === 'warn' ? '⚠️' : '🚨'} [監控 DB 告警] ${alert.detail}`)
+      } else if (prev !== undefined) {
+        notify(`✅ [監控 DB 告警] ${alert.label} 已恢復正常`)
+      }
+    }
+  }
+
   async function runOnce(): Promise<boolean> {
     checkRegistries()
+    await checkMonitorDbAlerts()
 
     const healthy = await checkCloudflaredTunnelReachable(apiUrl)
 

@@ -6,6 +6,7 @@ import { createWorkerRegistry } from './worker-registry.ts'
 import { createDispatchRegistry, DISPATCH_STATUS_RANK, type DispatchEntry } from './dispatch-registry.ts'
 import { createDispatcher, type DispatchAttemptWriteDeps, type DispatchResult } from './dispatch.ts'
 import { createRemoteSweeper } from './remote-sweeper.ts'
+import { recordWorkerMonitorStatus } from './worker-monitor-status.ts'
 import { createBacklogDispatcher } from './backlog-dispatcher.ts'
 import { fetchWorkerCapacity, fetchWorkerJobStatus, postWorkerJob } from './worker-client.ts'
 import { isMonitorDbEnabled } from '../monitor-db/env.ts'
@@ -234,6 +235,26 @@ export function registerClusterRoutes(app: Hono): void {
     const kind = body.ticket.startsWith('FAQ-') ? 'bug' : 'demand'
     const w = workerRegistry.list().find(x => x.name === worker && !x.disabled)
     if (w) void backlogDispatcher.fillFreedSlot(kind, w).catch(err => console.error(`cluster: ${body.ticket} 的 backlog 遞補失敗: ${err}`))
+    return c.json({ ok: true })
+  })
+
+  // 【plan-db-as-truth-v3.2.md MJ-E4 ＝ MAJOR-F6，§6.8(e)】worker 的監控自況
+  // 主動回報。與上面兩條 /cluster/register、/cluster/job-done **完全同型**：
+  // 同一組 guard（LAN-only + shared secret）、同樣低頻（每 worker 每 60 秒
+  // 一次）、同樣小 payload、同樣不擴大能力面——這是本案往 8787 唯一新增的
+  // 路由（【G:MN-G8】）。刻意不動 worker 的 `GET /health`（那是 worker 上唯一
+  // 不驗證的路由，MJ-E4 的裁定就是一個字都不改它）。
+  // head 只存記憶體（worker-monitor-status.ts），判斷與告警在 health-monitor
+  // 的 60 秒 timer 內，不在這支 handler 裡——handler 本身零 I/O。
+  app.post('/cluster/monitor-status', guard, async c => {
+    const body = (await c.req.json().catch(() => null)) as { worker?: unknown } | null
+    if (!body || typeof body.worker !== 'string' || !WORKER_NAME_RE.test(body.worker)) {
+      return c.json({ ok: false }, 400)
+    }
+    // 三個數值欄的型別收斂在 recordWorkerMonitorStatus 內（不合法一律 null =
+    // 「不知道」）：回報端暫時算不出 spool 深度時仍該讓這筆回報留下時間戳，
+    // 400 掉整筆會讓 §6.8(e) 誤判成「這台完全失聯」。
+    recordWorkerMonitorStatus(body.worker, body as Parameters<typeof recordWorkerMonitorStatus>[1])
     return c.json({ ok: true })
   })
 

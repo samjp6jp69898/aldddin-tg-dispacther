@@ -12,6 +12,7 @@
 // 為「整合期任務」（見兩檔各自檔頭）。本檔把兩組（長駐、短命）各自收斂成
 // 單一實作，spawn-create-mr.ts / demand-monitor-writes.ts / post-run-notify.ts
 // 改為 import，行為不變。
+import { noteWriteOutcome } from './counters.ts'
 import { getDeclaredMonitorRole, isMonitorDbEnabled, MON_HOST, type MonitorRole } from './env.ts'
 import { createSpoolWriter, type SpoolWriterHandle } from './spool/writer.ts'
 import type { MonitorDbExecutor } from './writes.ts'
@@ -137,10 +138,15 @@ export function dispatchMonitorWrite<A extends { runId?: string | null }>(
       return
     }
     try {
-      await Promise.race([
+      // §6.3 的計數器記錄點（見 counters.ts 檔頭）：`writes.ts` 早就算好了
+      // `WriteOutcome.guardedReason`，但這裡原本把回傳值整個丟掉，
+      // `r1_violation` 因此沒有任何可讀面。接住它、+1，其餘一切不變
+      // （noteWriteOutcome 對非 WriteOutcome 的值靜默忽略、永不拋）。
+      const outcome = await Promise.race([
         call(pool),
         new Promise((_resolve, reject) => setTimeout(() => reject(new Error(`monitor-db 寫入逾時（${LONG_LIVED_WRITE_TIMEOUT_MS}ms）`)), LONG_LIVED_WRITE_TIMEOUT_MS)),
       ])
+      noteWriteOutcome(outcome)
     } catch (err) {
       fallbackToSpool(err)
     }
@@ -173,10 +179,12 @@ export async function tryWriteOrSpool(opts: {
   onFailLabel: string
 }): Promise<void> {
   try {
-    await Promise.race([
+    // 同 dispatchMonitorWrite：接住 WriteOutcome 記進 §6.3 計數器（見 counters.ts）。
+    const outcome = await Promise.race([
       opts.attempt(opts.pool),
       new Promise<never>((_, reject) => setTimeout(() => reject(new Error(`${opts.onFailLabel}: 逾時`)), opts.budgetMs)),
     ])
+    noteWriteOutcome(outcome)
   } catch (err) {
     try {
       opts.spool.append({ ts: new Date().toISOString(), host: MON_HOST, run_id: opts.runId, fn: opts.fn, args: opts.args })

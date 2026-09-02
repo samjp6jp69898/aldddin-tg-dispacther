@@ -48,9 +48,10 @@ import { isTicketLocked, describeTicketProgress, getTicketProgressStages } from 
 import { ensureTrackerPending } from './lib/pipeline-runner/tracker-sync.ts'
 import { startStaleLockReaper } from './lib/pipeline-runner/stale-lock-reaper.ts'
 import { startMonitorMaintenance, runRestartSweep } from './lib/monitor-db/maintenance.ts'
-import { declareMonitorRole } from './lib/monitor-db/env.ts'
+import { declareMonitorRole, isMonitorDbEnabled } from './lib/monitor-db/env.ts'
 import { startMonitorCollectors } from './lib/monitor-db/collectors/index.ts'
-import { startMonitorHeartbeat } from './lib/monitor-db/heartbeat.ts'
+import { getLastHeartbeatResult, startMonitorHeartbeat } from './lib/monitor-db/heartbeat.ts'
+import { readSpoolDepth } from './lib/monitor-db/spool/depth.ts'
 import type { SubmitResult } from './lib/pipeline-runner/pipeline-queue.ts'
 import type { TechUser } from './lib/user-resolution/tech-user.ts'
 
@@ -179,6 +180,46 @@ startMonitorCollectors({ role: 'mon_exec' })
 // （writer='worker-agent'，PK 是 (host, writer)，每台 worker 自己一列）。
 // 失敗只 WARN + 落 spool；isMonitorDbEnabled()=false 時整段 no-op。
 startMonitorHeartbeat({ writer: 'worker-agent' })
+
+// 【plan-db-as-truth-v3.2.md MJ-E4 ＝ MAJOR-F6，§6.8(e)】每 60 秒把本機的監控
+// 自況主動回報給 head（head 存記憶體，由它的 health-monitor 判斷告警）。
+//
+// 為什麼是主動回報：v3 原本要把這三個欄位塞進本機 `GET /health`，但那是本機
+// 唯一不驗證的路由（下面 :/health），且「head 本來就每輪打 /health」是事實
+// 錯誤。改走已認證的 postToHead 之後，`/health` 一個字不用改，head 也不需要
+// 新增任何輪詢工項。
+//
+// 紀律：這支跑在**自己的 timer 內**，絕不掛進 `/jobs` 熱路徑（那條路徑不得
+// 有任何 DB／網路 I/O）。`isMonitorDbEnabled()` 關閉時連 timer 都不建——
+// flag=0 時本行程的行為與本次改動前完全相同。
+const MONITOR_STATUS_TICK_MS = 60_000
+
+async function reportMonitorStatus(): Promise<void> {
+  try {
+    const spool = readSpoolDepth()
+    // `oldest_age_s`：由 worker 自己換算（head 只會拿它跟門檻比大小，不做
+    // 跨機時鐘校正——兩端時鐘偏移的影響因此只落在這一個數字上，不會污染
+    // head 蓋章的 receivedAt）。
+    const oldestAgeS = spool.oldestTs === null ? null : Math.max(0, Math.round((Date.now() - Date.parse(spool.oldestTs)) / 1000))
+    const ok = await postToHead('/cluster/monitor-status', {
+      worker: workerName,
+      spool_depth: spool.depth,
+      oldest_age_s: oldestAgeS,
+      // 「上一拍心跳有沒有真的寫進 DB」——本行程手上唯一不需要多打一次 DB
+      // 就能得到的可寫性證據（見 heartbeat.ts 的 getLastHeartbeatResult）。
+      db_writable: getLastHeartbeatResult('worker-agent') === 'written',
+    })
+    if (!ok) console.error('worker-agent: monitor-status 回報失敗（head 打不到），下一輪重試')
+  } catch (err) {
+    // best-effort：回報失敗絕不影響本行程任何其他職責。
+    console.error(`worker-agent: monitor-status 回報時發生例外: ${err}`)
+  }
+}
+
+if (isMonitorDbEnabled()) {
+  void reportMonitorStatus()
+  setInterval(() => void reportMonitorStatus(), MONITOR_STATUS_TICK_MS)
+}
 
 // ---- HTTP 介面 ----
 
