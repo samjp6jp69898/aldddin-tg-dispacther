@@ -61,25 +61,27 @@ export interface RunIdentity {
 }
 
 /**
- * W1：進度寫入（queued/running）。八條賦值全部包 `IF(runs.host = new.host, …, runs.<col>)`
+ * W1：進度寫入（queued/running）。十條賦值全部包 `IF(runs.host = new.host, …, runs.<col>)`
  * 守衛（【G:MJ-E1】），host 不符時全部欄位寫回原值 ⇒ 無變更 ⇒ `-FOUND_ROWS` 下 affectedRows=0，
  * 冷路徑 SELECT 可偵測出 r1_violation。
  */
 export const W1_SQL = `
 INSERT INTO runs
   (run_id, host, ticket, kind, lifecycle_rank, started_at, pid, stdout_path, stderr_path,
-   trigger_source, retry_of_run_id, dispatch_id, legacy_key, created_at)
-VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?, NOW(3)) AS new
+   trigger_source, retry_of_run_id, dispatch_id, legacy_key, triggered_by_email, triggered_by_name, created_at)
+VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, NOW(3)) AS new
 ON DUPLICATE KEY UPDATE
-  lifecycle_rank  = IF(runs.host = new.host, GREATEST(runs.lifecycle_rank, new.lifecycle_rank), runs.lifecycle_rank),
-  started_at      = IF(runs.host = new.host, COALESCE(runs.started_at,      new.started_at),      runs.started_at),
-  pid             = IF(runs.host = new.host, COALESCE(runs.pid,             new.pid),             runs.pid),
-  stdout_path     = IF(runs.host = new.host, COALESCE(runs.stdout_path,     new.stdout_path),     runs.stdout_path),
-  stderr_path     = IF(runs.host = new.host, COALESCE(runs.stderr_path,     new.stderr_path),     runs.stderr_path),
-  trigger_source  = IF(runs.host = new.host, COALESCE(runs.trigger_source,  new.trigger_source),  runs.trigger_source),
-  retry_of_run_id = IF(runs.host = new.host, COALESCE(runs.retry_of_run_id, new.retry_of_run_id), runs.retry_of_run_id),
-  dispatch_id     = IF(runs.host = new.host, COALESCE(runs.dispatch_id,     new.dispatch_id),     runs.dispatch_id),
-  legacy_key      = IF(runs.host = new.host, COALESCE(runs.legacy_key,      new.legacy_key),      runs.legacy_key)
+  lifecycle_rank     = IF(runs.host = new.host, GREATEST(runs.lifecycle_rank, new.lifecycle_rank), runs.lifecycle_rank),
+  started_at         = IF(runs.host = new.host, COALESCE(runs.started_at,         new.started_at),         runs.started_at),
+  pid                = IF(runs.host = new.host, COALESCE(runs.pid,                new.pid),                runs.pid),
+  stdout_path        = IF(runs.host = new.host, COALESCE(runs.stdout_path,        new.stdout_path),        runs.stdout_path),
+  stderr_path        = IF(runs.host = new.host, COALESCE(runs.stderr_path,        new.stderr_path),        runs.stderr_path),
+  trigger_source     = IF(runs.host = new.host, COALESCE(runs.trigger_source,     new.trigger_source),     runs.trigger_source),
+  retry_of_run_id    = IF(runs.host = new.host, COALESCE(runs.retry_of_run_id,    new.retry_of_run_id),    runs.retry_of_run_id),
+  dispatch_id        = IF(runs.host = new.host, COALESCE(runs.dispatch_id,        new.dispatch_id),        runs.dispatch_id),
+  legacy_key         = IF(runs.host = new.host, COALESCE(runs.legacy_key,         new.legacy_key),         runs.legacy_key),
+  triggered_by_email = IF(runs.host = new.host, COALESCE(runs.triggered_by_email, new.triggered_by_email), runs.triggered_by_email),
+  triggered_by_name  = IF(runs.host = new.host, COALESCE(runs.triggered_by_name,  new.triggered_by_name),  runs.triggered_by_name)
 `.trim()
 
 export const RUNS_COLD_PATH_W1_SQL = 'SELECT host, lifecycle_rank FROM runs WHERE run_id = ?'
@@ -94,6 +96,8 @@ export interface WriteRunProgressInput extends RunIdentity {
   retryOfRunId?: string | null
   dispatchId?: string | null
   legacyKey?: string | null
+  triggeredByEmail?: string | null
+  triggeredByName?: string | null
 }
 
 export async function writeRunProgress(pool: MonitorDbExecutor, input: WriteRunProgressInput): Promise<WriteOutcome> {
@@ -111,6 +115,8 @@ export async function writeRunProgress(pool: MonitorDbExecutor, input: WriteRunP
     input.retryOfRunId ?? null,
     input.dispatchId ?? null,
     input.legacyKey ?? null,
+    input.triggeredByEmail ?? null,
+    input.triggeredByName ?? null,
   ]
   const [header] = await pool.execute<ResultSetHeader>(W1_SQL, params)
   const affected = (header as ResultSetHeader).affectedRows

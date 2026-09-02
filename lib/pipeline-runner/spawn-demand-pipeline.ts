@@ -186,6 +186,8 @@ function spawnDemandPipelineNow(entry: QueueEntry<DemandPayload>, onExit: () => 
           retryOfRunId,
           dispatchId,
           legacyKey,
+          triggeredByEmail: entry.triggeredBy?.email ?? null,
+          triggeredByName: entry.triggeredBy?.name ?? null,
         },
         pool =>
           writeRunProgress(pool, {
@@ -201,6 +203,8 @@ function spawnDemandPipelineNow(entry: QueueEntry<DemandPayload>, onExit: () => 
             retryOfRunId,
             dispatchId,
             legacyKey,
+            triggeredByEmail: entry.triggeredBy?.email ?? null,
+            triggeredByName: entry.triggeredBy?.name ?? null,
           }),
       )
     }

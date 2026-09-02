@@ -28,6 +28,8 @@ export interface FakeRunRow {
   retry_of_run_id: string | null
   dispatch_id: string | null
   legacy_key: string | null
+  triggered_by_email: string | null
+  triggered_by_name: string | null
   outcome: string | null
   outcome_tier: number | null
   outcome_source: string | null
@@ -96,6 +98,8 @@ export class FakeRunsDb implements MonitorDbExecutor {
       retry_of_run_id: null,
       dispatch_id: null,
       legacy_key: null,
+      triggered_by_email: null,
+      triggered_by_name: null,
       outcome: null,
       outcome_tier: null,
       outcome_source: null,
@@ -117,7 +121,23 @@ export class FakeRunsDb implements MonitorDbExecutor {
 
   // W1：INSERT … ON DUPLICATE KEY UPDATE（形狀 A）
   private handleW1(params: unknown[]): ResultSetHeader {
-    const [runId, host, ticket, kind, rank, startedAt, pid, stdoutPath, stderrPath, triggerSource, retryOfRunId, dispatchId, legacyKey] = params as [
+    const [
+      runId,
+      host,
+      ticket,
+      kind,
+      rank,
+      startedAt,
+      pid,
+      stdoutPath,
+      stderrPath,
+      triggerSource,
+      retryOfRunId,
+      dispatchId,
+      legacyKey,
+      triggeredByEmail,
+      triggeredByName,
+    ] = params as [
       string,
       string,
       string,
@@ -125,6 +145,8 @@ export class FakeRunsDb implements MonitorDbExecutor {
       number,
       string | null,
       number | null,
+      string | null,
+      string | null,
       string | null,
       string | null,
       string | null,
@@ -144,6 +166,8 @@ export class FakeRunsDb implements MonitorDbExecutor {
         retry_of_run_id: retryOfRunId,
         dispatch_id: dispatchId,
         legacy_key: legacyKey,
+        triggered_by_email: triggeredByEmail,
+        triggered_by_name: triggeredByName,
       })
       return okHeader(1)
     }
@@ -161,6 +185,8 @@ export class FakeRunsDb implements MonitorDbExecutor {
     existing.retry_of_run_id = existing.retry_of_run_id ?? retryOfRunId
     existing.dispatch_id = existing.dispatch_id ?? dispatchId
     existing.legacy_key = existing.legacy_key ?? legacyKey
+    existing.triggered_by_email = existing.triggered_by_email ?? triggeredByEmail
+    existing.triggered_by_name = existing.triggered_by_name ?? triggeredByName
     const changed = JSON.stringify(existing) !== before
     return okHeader(changed ? 2 : 0)
   }

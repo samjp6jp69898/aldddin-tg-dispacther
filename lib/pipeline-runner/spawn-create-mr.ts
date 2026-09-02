@@ -435,6 +435,8 @@ function spawnCreateMrNow(entry: QueueEntry<BugPayload>, onExit: () => void): { 
           retryOfRunId,
           dispatchId,
           legacyKey,
+          triggeredByEmail: entry.triggeredBy?.email ?? null,
+          triggeredByName: entry.triggeredBy?.name ?? null,
         },
         pool =>
           writeRunProgress(pool, {
@@ -450,6 +452,8 @@ function spawnCreateMrNow(entry: QueueEntry<BugPayload>, onExit: () => void): { 
             retryOfRunId,
             dispatchId,
             legacyKey,
+            triggeredByEmail: entry.triggeredBy?.email ?? null,
+            triggeredByName: entry.triggeredBy?.name ?? null,
           }),
       )
     }

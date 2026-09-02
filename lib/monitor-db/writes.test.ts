@@ -43,6 +43,8 @@ describe('writeRunProgress（W1，形狀 A）', () => {
       startedAt: '2026-09-02T00:00:00.000Z',
       stdoutPath: '/tmp/run-1.stdout.log',
       stderrPath: '/tmp/run-1.stderr.log',
+      triggeredByEmail: 'a@b.com',
+      triggeredByName: 'A B',
     })
     expect(r2.kind).toBe('applied')
     const row = db.rows.get('run-1')!
@@ -50,6 +52,8 @@ describe('writeRunProgress（W1，形狀 A）', () => {
     expect(row.pid).toBe(4321)
     expect(row.stdout_path).toBe('/tmp/run-1.stdout.log')
     expect(row.stderr_path).toBe('/tmp/run-1.stderr.log')
+    expect(row.triggered_by_email).toBe('a@b.com')
+    expect(row.triggered_by_name).toBe('A B')
   })
 
   test('lifecycle rank 後退寫入 → guarded_rank，值不變', async () => {
@@ -77,6 +81,8 @@ describe('writeRunProgress（W1，形狀 A）', () => {
       retry_of_run_id: null,
       dispatch_id: null,
       legacy_key: null,
+      triggered_by_email: null,
+      triggered_by_name: null,
       outcome: null,
       outcome_tier: null,
       outcome_source: null,
@@ -179,6 +185,8 @@ describe("writeRunOutcomeAuthoritative（W2，tier 2）與 writeRunOutcomeProvis
       retry_of_run_id: null,
       dispatch_id: null,
       legacy_key: null,
+      triggered_by_email: null,
+      triggered_by_name: null,
       outcome: null,
       outcome_tier: null,
       outcome_source: null,
