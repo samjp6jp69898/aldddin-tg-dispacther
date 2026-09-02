@@ -33,6 +33,12 @@
 // 第一條就是最舊的**——只需要解析開頭幾行，不需要 parse 整個檔案。開頭若剛好
 // 是壞行，往後最多再看 `MAX_TS_PROBE_LINES` 行；都取不到就這一檔回 null
 // （「不知道」，不是「沒有」）。
+// **已知界線**：ts 只在未 ack 區開頭 `HEAD_SCAN_BYTES`（64KB）內探測。若未 ack
+// 區的第一條條目本身就超過 64KB（正常條目約 112 bytes，實務上不會發生——超大的
+// stdout 行走 VictoriaLogs，不進 spool），`oldestTs` 回 **null＝不知道**，
+// 而不是退而回報後面某條的 ts。這是刻意的：回後面那條會**低報**積壓年齡，
+// 讓 §6.8(b) 的 15 分鐘門檻在最該觸發時失效；回 null 只是讓該檔不參與年齡判定，
+// 深度那一半仍然完整計數。
 
 import { closeSync, existsSync, fstatSync, openSync, readSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
@@ -118,6 +124,13 @@ function measureFile(filePath: string): SpoolFileDepth | null {
     let pos = start
     let depth = 0
     let lastNewlineAbs = -1
+    // 「目前這一行的起點」的**絕對**位移。空行判準必須拿它比，不能拿 chunk 內的
+    // 相對 index 比——後者在每個 chunk 的第一次迭代恆為 0，會把「換行恰好落在
+    // start + k×READ_CHUNK_BYTES」的正常條目誤判成空行漏計（對抗性覆核實證：
+    // 邊界對齊的兩條目檔案會回 depth=1，且與同檔算對的 unackedBytes 自相矛盾）。
+    // 那個方向是**反保守**的，也與 replayer.ts:98-100 的判準分歧——本檔宣稱
+    // 「與 replayer 同判準」，就不能在分塊邊界上偷偷少算。
+    let lineStartAbs = start
     const headParts: Buffer[] = []
     let headBytes = 0
     const buf = Buffer.allocUnsafe(READ_CHUNK_BYTES)
@@ -139,8 +152,10 @@ function measureFile(filePath: string): SpoolFileDepth | null {
       for (;;) {
         const nl = chunk.indexOf(0x0a, idx)
         if (nl === -1) break
-        if (nl > idx) depth += 1 // 空行不計（同 replayer.ts）
-        lastNewlineAbs = chunkStart + nl
+        const nlAbs = chunkStart + nl
+        if (nlAbs > lineStartAbs) depth += 1 // 空行不計（同 replayer.ts）：行起點就是換行 ⇒ 該行長度為 0
+        lastNewlineAbs = nlAbs
+        lineStartAbs = nlAbs + 1
         idx = nl + 1
       }
       pos += n

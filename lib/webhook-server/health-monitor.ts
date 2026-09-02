@@ -15,6 +15,12 @@ const EXEC_TIMEOUT_MS = 10_000
 const LOG_DIR = '/Users/user/aladdin/telegram-dispatcher/logs'
 const LOG_FILE = join(LOG_DIR, 'health-monitor.log')
 
+/** §6.8(3) 中「條件 key 帶 worker 名」的三條（(c) tunnel、(d) worker 心跳、
+ * (e) worker spool 回報）。捕獲組 1 是 worker 名——`WORKER_NAME_RE` 不含冒號，
+ * 所以最後一段冒號之後的整串就是名字，不會誤切。用來清掉退場 worker 的
+ * 翻轉狀態 key（見 retireStaleWorkerKeys）。 */
+const PER_WORKER_ALERT_KEY_RE = /^monitor-db:(?:tunnel|worker-heartbeat|worker-spool):(.+)$/
+
 // review 發現：原本 notify 失敗被 catch 空吞掉，完全沒有任何 fallback
 // 記錄——tunnel 真的斷線、且 tg-notify.sh 本身也失敗（例如逾時/被誤刪）這種
 // 雙重故障會無聲無息、哪裡都查不到。比照 T13 post-run-notify.ts 的既有慣例
@@ -214,6 +220,36 @@ export function createHealthMonitor(
   }
 
   /**
+   * 清掉「已經不在名冊裡」的 worker 所留下的翻轉狀態 key，並對其中**仍處於
+   * tripped** 的發一則收尾通知。
+   *
+   * 沒有這一步的後果（對抗性覆核指認）：`(c)(d)(e)` 的 key 帶 worker 名，一台
+   * worker 被移出名冊／被停用之後，它的條件從此不再被評估 ⇒ 狀態表永遠停在
+   * `true` ⇒ 那則告警再也等不到「已恢復」，維運端看到的是一則**沒有下文的
+   * 警報**，而且它會一直佔著 Map。
+   *
+   * `rosterWorkers === null`（名冊本身讀不到）時**什麼都不做**——「讀不到名冊」
+   * 不等於「所有 worker 都退場了」，把兩者混為一談會在名冊檔暫時壞掉的那一輪
+   * 把全部既有告警一次清光。
+   */
+  function retireStaleWorkerKeys(rosterWorkers: string[] | null): void {
+    if (rosterWorkers === null) return
+    const alive = new Set(rosterWorkers)
+    for (const key of [...lastMonitorAlert.keys()]) {
+      const matched = PER_WORKER_ALERT_KEY_RE.exec(key)
+      if (matched === null || alive.has(matched[1]!)) continue
+      const wasTripped = lastMonitorAlert.get(key) === true
+      lastMonitorAlert.delete(key)
+      if (wasTripped) {
+        notify(
+          `✅ [監控 DB 告警] worker ${matched[1]} 已不在名冊（移除或停用），停止追蹤它的監控狀態；` +
+            '先前對這台發出的告警在此收尾（不是因為問題修好了，是這台不再受監控）。',
+        )
+      }
+    }
+  }
+
+  /**
    * §6.8(3) a–f 的六條營運告警。判定本身全在 lib/monitor-db/alerts.ts，本函式
    * 只負責「翻轉才通知」這一層狀態機（與上面 tunnel／名冊兩套完全同型）。
    *
@@ -229,14 +265,24 @@ export function createHealthMonitor(
   async function checkMonitorDbAlerts(): Promise<void> {
     if (monitorAlertDeps === false || !isMonitorDbEnabled()) return
     let alerts
+    // 名冊解析成功時 alerts.ts 會回呼一次，帶當前 enabled 的 worker 名單；
+    // 讀不到名冊就**不會**回呼（維持 null），下面因此不會清掉任何 key。
+    let rosterWorkers: string[] | null = null
     try {
-      alerts = await evaluateMonitorDbAlerts(monitorAlertDeps)
+      alerts = await evaluateMonitorDbAlerts({
+        ...monitorAlertDeps,
+        onRosterResolved: names => {
+          rosterWorkers = names
+          monitorAlertDeps.onRosterResolved?.(names)
+        },
+      })
     } catch (err) {
       // evaluateMonitorDbAlerts 自己已經逐條件 try/catch，理論上不會走到這裡；
       // 真的走到也只記錄，不讓監控告警本身弄壞健康檢查的其他部分。
       log(`monitor-db alerts 評估整體失敗: ${err}`)
       return
     }
+    retireStaleWorkerKeys(rosterWorkers)
     for (const alert of alerts) {
       const prev = lastMonitorAlert.get(alert.key)
       if (prev === alert.tripped) continue

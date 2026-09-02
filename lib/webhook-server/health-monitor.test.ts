@@ -256,7 +256,7 @@ describe('createHealthMonitor — 監控 DB 告警（§6.8(3) a–f）', () => {
     probeTunnel: async () => true,
     readWorkerStatuses: () => [],
     readR1Violations: () => 0,
-    readReadSource: async () => ({ requested: 'mysql', effective: 'mysql', degraded: false }),
+    readReadSource: async () => ({ requested: 'mysql', effective: 'mysql', degraded: false, requestedValid: true }),
     ...over,
   })
 
@@ -446,7 +446,7 @@ describe('createHealthMonitor — (g) 讀取面靜默降級（2026-09-02 追加�
     probeTunnel: async () => true,
     readWorkerStatuses: () => [],
     readR1Violations: () => 0,
-    readReadSource: async () => ({ requested: 'mysql', effective: 'mysql', degraded: false }),
+    readReadSource: async () => ({ requested: 'mysql', effective: 'mysql', degraded: false, requestedValid: true }),
     ...over,
   })
 
@@ -460,7 +460,10 @@ describe('createHealthMonitor — (g) 讀取面靜默降級（2026-09-02 追加�
       notify,
       registryPaths: [],
       monitorAlerts: deps({
-        readReadSource: async () => (degraded ? { requested: 'mysql', effective: 'sqlite', degraded: true } : { requested: 'mysql', effective: 'mysql', degraded: false }),
+        readReadSource: async () =>
+          degraded
+            ? { requested: 'mysql', effective: 'sqlite', degraded: true, requestedValid: true }
+            : { requested: 'mysql', effective: 'mysql', degraded: false, requestedValid: true },
       }),
     })
 
@@ -485,7 +488,7 @@ describe('createHealthMonitor — (g) 讀取面靜默降級（2026-09-02 追加�
     process.env.MON_DB_ENABLED = '1'
     readyConnections = 1
     const notify = mock((_t: string) => {})
-    let result: unknown = { requested: 'mysql', effective: 'sqlite', degraded: true }
+    let result: unknown = { requested: 'mysql', effective: 'sqlite', degraded: true, requestedValid: true }
     const monitor = createHealthMonitor({
       apiUrl: `${BASE}/ready`,
       notify,
@@ -518,5 +521,133 @@ describe('createHealthMonitor — (g) 讀取面靜默降級（2026-09-02 追加�
     await monitor.runOnce()
     await monitor.runOnce()
     expect(notify).not.toHaveBeenCalled()
+  })
+})
+
+// NONBLOCKING 4 的修補：per-worker 條件 key 的生命週期。worker 被移出名冊後
+// 它的條件不再被評估，若不清 key，那則告警永遠等不到收尾。
+describe('createHealthMonitor — 退場 worker 的告警 key 生命週期', () => {
+  const prevFlag = process.env.MON_DB_ENABLED
+  afterEach(() => {
+    if (prevFlag === undefined) delete process.env.MON_DB_ENABLED
+    else process.env.MON_DB_ENABLED = prevFlag
+  })
+
+  const NOW = Date.parse('2026-09-02T12:00:00.000Z')
+  const old = new Date(NOW - 60 * 60_000).toISOString()
+
+  /** w1 的 tunnel 不通（tripped），名冊內容由 `roster` 控制。 */
+  const deps = (roster: () => Array<{ name: string; registeredAt: string; disabled: boolean }>) => ({
+    now: () => NOW,
+    readHeartbeats: async () => [
+      { host: 'head', writer: 'server', ts: new Date(NOW - 1000).toISOString() },
+      { host: 'head', writer: 'tg-monitor', ts: new Date(NOW - 1000).toISOString() },
+      { host: 'head', writer: 'log-intake', ts: new Date(NOW - 1000).toISOString() },
+      { host: 'w1', writer: 'worker-agent', ts: new Date(NOW - 1000).toISOString() },
+    ],
+    readSpool: () => ({ depth: 0, oldestTs: null }),
+    listWorkers: roster,
+    probeTunnel: async () => false, // w1 的 tunnel 不通
+    readWorkerStatuses: () => [{ worker: 'w1', spoolDepth: 0, oldestAgeS: 0, dbWritable: true, receivedAt: NOW - 1000 }],
+    readR1Violations: () => 0,
+    readReadSource: async () => ({ requested: 'mysql', effective: 'mysql', degraded: false, requestedValid: true }),
+  })
+
+  test('worker 在 tripped 狀態下被移出名冊 → 發一則收尾通知，且只發一次', async () => {
+    process.env.MON_DB_ENABLED = '1'
+    readyConnections = 1
+    const notify = mock((_t: string) => {})
+    let roster = [{ name: 'w1', registeredAt: old, disabled: false }]
+    const monitor = createHealthMonitor({ apiUrl: `${BASE}/ready`, notify, registryPaths: [], monitorAlerts: deps(() => roster) })
+
+    await monitor.runOnce() // w1 tunnel 不通 → 告警一次
+    expect(notify).toHaveBeenCalledTimes(1)
+    expect(notify.mock.calls[0]![0]).toContain('tunnel')
+
+    roster = [] // 維運把 w1 移出名冊（或按了「中斷」）
+    await monitor.runOnce()
+    expect(notify).toHaveBeenCalledTimes(2)
+    expect(notify.mock.calls[1]![0]).toContain('已不在名冊')
+    expect(notify.mock.calls[1]![0]).toContain('不是因為問題修好了')
+
+    await monitor.runOnce() // key 已清掉，不會再重複收尾
+    expect(notify).toHaveBeenCalledTimes(2)
+  })
+
+  test('worker 在**正常**狀態下被移出名冊 → 靜默清掉 key，不發任何通知', async () => {
+    process.env.MON_DB_ENABLED = '1'
+    readyConnections = 1
+    const notify = mock((_t: string) => {})
+    let roster = [{ name: 'w1', registeredAt: old, disabled: false }]
+    const monitor = createHealthMonitor({
+      apiUrl: `${BASE}/ready`,
+      notify,
+      registryPaths: [],
+      monitorAlerts: { ...deps(() => roster), probeTunnel: async () => true },
+    })
+
+    await monitor.runOnce()
+    expect(notify).not.toHaveBeenCalled()
+
+    roster = []
+    await monitor.runOnce()
+    expect(notify).not.toHaveBeenCalled()
+  })
+
+  test('名冊讀不到 → 一個 key 都不清（「讀不到」≠「全部退場」，不得吞掉既有告警的收尾）', async () => {
+    process.env.MON_DB_ENABLED = '1'
+    readyConnections = 1
+    const notify = mock((_t: string) => {})
+    let broken = false
+    const roster = [{ name: 'w1', registeredAt: old, disabled: false }]
+    let tunnelOk = false
+    const monitor = createHealthMonitor({
+      apiUrl: `${BASE}/ready`,
+      notify,
+      registryPaths: [],
+      monitorAlerts: {
+        ...deps(() => {
+          if (broken) throw new Error('名冊檔壞了')
+          return roster
+        }),
+        probeTunnel: async () => tunnelOk,
+      },
+    })
+
+    await monitor.runOnce() // tunnel 不通 → 告警
+    expect(notify).toHaveBeenCalledTimes(1)
+
+    broken = true
+    await monitor.runOnce() // 名冊壞掉：不清 key、不發收尾
+    expect(notify).toHaveBeenCalledTimes(1)
+
+    broken = false
+    tunnelOk = true
+    await monitor.runOnce() // 名冊修好且 tunnel 恢復 → 正常的「已恢復」通知還在
+    expect(notify).toHaveBeenCalledTimes(2)
+    expect(notify.mock.calls[1]![0]).toContain('已恢復正常')
+  })
+
+  test('head 自己的條件 key（不帶 worker 名）永遠不會被清掉', async () => {
+    process.env.MON_DB_ENABLED = '1'
+    readyConnections = 1
+    const notify = mock((_t: string) => {})
+    let violations = 1
+    const monitor = createHealthMonitor({
+      apiUrl: `${BASE}/ready`,
+      notify,
+      registryPaths: [],
+      monitorAlerts: { ...deps(() => []), readR1Violations: () => violations },
+    })
+
+    await monitor.runOnce() // r1 告警
+    expect(notify).toHaveBeenCalledTimes(1)
+    await monitor.runOnce() // 名冊是空的，但 head 的 key 不受 retire 影響 → 不重複發
+    expect(notify).toHaveBeenCalledTimes(1)
+
+    violations = 0
+    await monitor.runOnce() // 仍然收得到恢復通知（key 沒有被誤清）
+    expect(notify).toHaveBeenCalledTimes(2)
+    expect(notify.mock.calls[1]![0]).toContain('已恢復正常')
   })
 })

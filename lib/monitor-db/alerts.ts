@@ -21,11 +21,20 @@
 //   e. 任一 worker 主動回報的 spool 深度 > 200；回報本身缺席或落後 > 5 分鐘
 //      視為「未知」，WARN 級（§6.8(e) 改為主動回報，MJ-E4）。
 //   f. `r1_violation` 計數器 > 0（§6.3；計數來源見 counters.ts，含其範圍限制）。
-//   g. **讀取面靜默降級**（2026-09-02 指揮官追加）：tg-monitor 的
-//      `GET 127.0.0.1:8799/api/read-source` 回 `{requested, effective, degraded}`；
-//      `degraded === true` 或 `effective !== requested` 即告警——語意是
-//      「`MON_READ_SOURCE=mysql` 但探針失敗、面板靜默退回 sqlite」，這種降級
-//      在畫面上完全看不出來（數字還是有，只是來源變了）。
+//   g. **讀取面靜默降級**（2026-09-02 指揮官追加，判準於同日更正）：tg-monitor 的
+//      `GET 127.0.0.1:8799/api/read-source` 回
+//      `{requested, effective, degraded, requestedValid}`；
+//      **判準 ＝ `degraded === true || requestedValid === false`**。語意是
+//      「`MON_READ_SOURCE=mysql` 但探針失敗、面板靜默退回 sqlite」或
+//      「`MON_READ_SOURCE` 根本填了非法值、被 fail-safe 吃掉」——兩種降級在畫面上
+//      都完全看不出來（數字還是有，只是來源變了）。
+//      **不再比對 `effective !== requested`**（原判準，已移除，不留兩套）：裸字串
+//      比對會對三種**健康**設定誤報——未設（`requested` 為空字串）、大小寫不同
+//      （`MySQL`）、尾隨空白（`'mysql '`）。這些 tg-monitor 端都正常解析，
+//      `requestedValid` 為 true，不該吵人。合法性判定的權威在 tg-monitor 那邊
+//      （它才知道自己認得哪些值），head 這裡只讀結論、不自己重寫一套解析。
+//      **`requestedValid` 欄位不存在**（對面還是舊版、尚未部署 a4）→ **只以
+//      `degraded` 判定**，不誤翻轉。
 //      **端點 404／連線拒絕／逾時／回應形狀不對一律判 unknown、跳過不告警**：
 //      tg-monitor 尚未載入 Phase 8 的碼之前這條端點根本不存在，不得誤翻轉。
 //
@@ -110,6 +119,12 @@ export interface ReadSourceStatus {
   requested: string
   effective: string
   degraded: boolean
+  /**
+   * `MON_READ_SOURCE` 的設定值本身是否合法（由 tg-monitor 判定——合法值域的權威
+   * 在它那邊）。**`null` ＝ 回應裡沒有這個欄位**，代表對面還是舊版（a4 之前），
+   * 此時只以 `degraded` 判定，不得因為「讀不到這個欄位」就翻轉。
+   */
+  requestedValid: boolean | null
 }
 
 export interface MonitorAlertDeps {
@@ -128,6 +143,20 @@ export interface MonitorAlertDeps {
   readR1Violations?: () => number
   /** (g) tg-monitor 的讀取面自況；`null` ＝ unknown（跳過不告警）。 */
   readReadSource?: () => Promise<ReadSourceStatus | null>
+  /**
+   * 名冊**解析成功**時回呼一次，帶本輪 enabled 的 worker 名單。
+   *
+   * 存在的理由是呼叫端的 key 生命週期：`(c)(d)(e)` 的條件 key 帶 worker 名，
+   * 一台 worker 被移出名冊／停用之後，它的條件從此不再被評估——若移除當下該
+   * 條件正處於 tripped，呼叫端的翻轉狀態表會**永遠停在 true**，那則告警再也
+   * 等不到收尾（維運看到一則沒有下文的警報）。呼叫端需要知道「誰還在名冊裡」
+   * 才能安全地清掉退場者的 key。
+   *
+   * **名冊讀取失敗時刻意不呼叫**——這是本回呼唯一重要的不變式：「讀不到名冊」
+   * 與「名冊裡沒有這台」是兩件事，前者絕不能被當成「所有 worker 都退場了」
+   * 而把全部 key 清光（那會在名冊檔暫時壞掉時吞掉所有既有告警的收尾）。
+   */
+  onRosterResolved?: (workerNames: string[]) => void
 }
 
 function tsToMs(ts: string | Date | null): number | null {
@@ -201,9 +230,18 @@ export async function probeReadSource(url: string = READ_SOURCE_URL): Promise<Re
   try {
     const res = await fetch(url, { signal: AbortSignal.timeout(READ_SOURCE_PROBE_TIMEOUT_MS) })
     if (!res.ok) return null
-    const data = (await res.json()) as { requested?: unknown; effective?: unknown; degraded?: unknown }
+    const data = (await res.json()) as { requested?: unknown; effective?: unknown; degraded?: unknown; requestedValid?: unknown }
     if (typeof data.requested !== 'string' || typeof data.effective !== 'string' || typeof data.degraded !== 'boolean') return null
-    return { requested: data.requested, effective: data.effective, degraded: data.degraded }
+    // `requestedValid` 是 a4 才加上的欄位：缺欄（舊版）或型別不對一律收斂成
+    // `null`＝「這個問題對面答不出來」，由判定端退回只看 `degraded`。
+    // 三個字串欄位一律**原文透傳、零正規化**（無 lowercase／trim／enum 解析）：
+    // 它們只進診斷訊息，維運要看到的是自己實際打錯的那串字。
+    return {
+      requested: data.requested,
+      effective: data.effective,
+      degraded: data.degraded,
+      requestedValid: typeof data.requestedValid === 'boolean' ? data.requestedValid : null,
+    }
   } catch {
     return null
   }
@@ -228,6 +266,13 @@ export async function evaluateMonitorDbAlerts(deps: MonitorAlertDeps = {}): Prom
   let workers: RosterWorker[] | null = null
   try {
     workers = (deps.listWorkers ?? defaultListWorkers)()
+    // 只有解析成功才通知呼叫端（見 onRosterResolved 的不變式）。回呼自己拋錯
+    // 不得波及告警評估——它是呼叫端的 key 生命週期維護，不是判定的一部分。
+    try {
+      deps.onRosterResolved?.(workers.map(w => w.name))
+    } catch (cbErr) {
+      console.error(`monitor-db alerts: onRosterResolved 回呼拋錯（不影響告警評估）: ${cbErr}`)
+    }
   } catch (err) {
     console.error(`monitor-db alerts: 讀取 worker 名冊失敗，本輪跳過 (c)(d)(e): ${err}`)
   }
@@ -244,27 +289,36 @@ export async function evaluateMonitorDbAlerts(deps: MonitorAlertDeps = {}): Prom
     console.error(`monitor-db alerts: monitor_heartbeat 查詢失敗: ${heartbeatError}`)
   }
 
+  // 逐 writer 各自 try/catch：本函式對外宣稱「永不拋例外」，而這個迴圈會碰
+  // 注入來的 `readHeartbeats` 回傳值（型別擋不住假 dep 回非陣列、或元素形狀
+  // 不對）。少了這層，一個壞掉的 row 會讓整個 evaluateMonitorDbAlerts 拋出，
+  // 連帶 (b)~(g) 全部不評估——正是「單一條件失敗不得中斷其他條件」要防的事。
+  const heartbeatRows = heartbeats ?? []
   for (const writer of HEAD_WRITERS) {
     const key = `monitor-db:head-heartbeat:${writer}`
     const label = `head 的 ${writer} 監控心跳`
-    if (heartbeatError !== null) {
-      alerts.push({ key, label, tripped: true, level: 'error', detail: `${label}讀不到：monitor_heartbeat 查詢失敗（${heartbeatError}）` })
-      continue
+    try {
+      if (heartbeatError !== null) {
+        alerts.push({ key, label, tripped: true, level: 'error', detail: `${label}讀不到：monitor_heartbeat 查詢失敗（${heartbeatError}）` })
+        continue
+      }
+      const row = heartbeatRows.find(r => r.host === 'head' && r.writer === writer)
+      const ms = row ? tsToMs(row.ts) : null
+      if (ms === null) {
+        alerts.push({ key, label, tripped: true, level: 'error', detail: `${label}在 monitor_heartbeat 沒有可用的列（該行程可能從未成功寫入過）` })
+        continue
+      }
+      const age = now - ms
+      alerts.push({
+        key,
+        label,
+        tripped: age > HEARTBEAT_STALE_MS,
+        level: 'error',
+        detail: `${label}已落後 ${minutes(age)}（門檻 ${minutes(HEARTBEAT_STALE_MS)}），該行程可能已死或其監控 DB 寫入全部失敗`,
+      })
+    } catch (err) {
+      console.error(`monitor-db alerts: (a) ${writer} 的心跳判定拋錯，本輪跳過該條: ${err}`)
     }
-    const row = heartbeats!.find(r => r.host === 'head' && r.writer === writer)
-    const ms = row ? tsToMs(row.ts) : null
-    if (ms === null) {
-      alerts.push({ key, label, tripped: true, level: 'error', detail: `${label}在 monitor_heartbeat 沒有可用的列（該行程可能從未成功寫入過）` })
-      continue
-    }
-    const age = now - ms
-    alerts.push({
-      key,
-      label,
-      tripped: age > HEARTBEAT_STALE_MS,
-      level: 'error',
-      detail: `${label}已落後 ${minutes(age)}（門檻 ${minutes(HEARTBEAT_STALE_MS)}），該行程可能已死或其監控 DB 寫入全部失敗`,
-    })
   }
 
   // ── (b) head 的 spool 積壓 ──
@@ -315,29 +369,34 @@ export async function evaluateMonitorDbAlerts(deps: MonitorAlertDeps = {}): Prom
     // ── (d) 每台 worker 的 (worker,'worker-agent') 心跳 ──
     if (heartbeats !== null) {
       for (const w of workers) {
-        if (withinGrace(w, now)) continue
-        const key = `monitor-db:worker-heartbeat:${w.name}`
-        const label = `worker ${w.name} 的 worker-agent 心跳`
-        const row = heartbeats.find(r => r.host === w.name && r.writer === 'worker-agent')
-        const ms = row ? tsToMs(row.ts) : null
-        if (ms === null) {
+        // 同 (a)：逐台各自 try/catch，一台的判定拋錯不得中斷其餘各台與後面的條件。
+        try {
+          if (withinGrace(w, now)) continue
+          const key = `monitor-db:worker-heartbeat:${w.name}`
+          const label = `worker ${w.name} 的 worker-agent 心跳`
+          const row = heartbeatRows.find(r => r.host === w.name && r.writer === 'worker-agent')
+          const ms = row ? tsToMs(row.ts) : null
+          if (ms === null) {
+            alerts.push({
+              key,
+              label,
+              tripped: true,
+              level: 'error',
+              detail: `${label}在 monitor_heartbeat **沒有列**——該台可能 tunnel 通但憑證錯／匯出白名單漏了／.env 沒 scp（這正是 MAJOR-D13 的盲區）`,
+            })
+            continue
+          }
+          const age = now - ms
           alerts.push({
             key,
             label,
-            tripped: true,
+            tripped: age > HEARTBEAT_STALE_MS,
             level: 'error',
-            detail: `${label}在 monitor_heartbeat **沒有列**——該台可能 tunnel 通但憑證錯／匯出白名單漏了／.env 沒 scp（這正是 MAJOR-D13 的盲區）`,
+            detail: `${label}已落後 ${minutes(age)}（門檻 ${minutes(HEARTBEAT_STALE_MS)}）`,
           })
-          continue
+        } catch (err) {
+          console.error(`monitor-db alerts: (d) worker ${w.name} 的心跳判定拋錯，本輪跳過該台: ${err}`)
         }
-        const age = now - ms
-        alerts.push({
-          key,
-          label,
-          tripped: age > HEARTBEAT_STALE_MS,
-          level: 'error',
-          detail: `${label}已落後 ${minutes(age)}（門檻 ${minutes(HEARTBEAT_STALE_MS)}）`,
-        })
       }
     }
 
@@ -373,7 +432,10 @@ export async function evaluateMonitorDbAlerts(deps: MonitorAlertDeps = {}): Prom
           detail:
             `worker ${w.name} 回報 spool 未 ack ${depth} 條（門檻 ${SPOOL_DEPTH_THRESHOLD}）` +
             (st.oldestAgeS === null ? '' : `、最舊 ${minutes(st.oldestAgeS * 1000)}`) +
-            (st.dbWritable === false ? '、且該台回報監控 DB 不可寫' : ''),
+            // 三態逐字對應（a7-D15：null＝不知道，不得說成「不可寫」）：
+            // true → 不加字（沒有壞消息就不要製造壞消息）；false → 明說不可寫；
+            // null → 明說「未知」，讓維運知道這一格沒有答案，而不是被當成正常。
+            (st.dbWritable === false ? '、且該台回報監控 DB 不可寫' : st.dbWritable === null ? '、該台的監控 DB 可寫性未知（尚未有成功心跳）' : ''),
         })
       }
     } catch (err) {
@@ -401,17 +463,21 @@ export async function evaluateMonitorDbAlerts(deps: MonitorAlertDeps = {}): Prom
   try {
     const rs = await (deps.readReadSource ?? probeReadSource)()
     if (rs !== null) {
-      // 兩個判準都要：`degraded` 是 tg-monitor 自報的旗標，`effective !== requested`
-      // 是不依賴那個旗標正確性的獨立佐證——旗標忘了設也抓得到。
-      const degraded = rs.degraded || rs.effective !== rs.requested
+      // 判準（2026-09-02 更正）：`degraded === true || requestedValid === false`。
+      // **刻意不比對 `effective !== requested`**——裸字串比對會對「未設／大小寫
+      // 不同／尾隨空白」這三種健康設定誤報，而那三種 tg-monitor 都正常解析。
+      // `requestedValid === null`（舊版沒有這個欄位）時只看 `degraded`。
+      const invalidSetting = rs.requestedValid === false
       alerts.push({
         key: 'monitor-db:read-source-degraded',
         label: 'tg-monitor 讀取面來源',
-        tripped: degraded,
+        tripped: rs.degraded === true || invalidSetting,
         level: 'error',
-        detail:
-          `tg-monitor 的讀取面已靜默降級：requested='${rs.requested}' 但 effective='${rs.effective}'` +
-          `（degraded=${rs.degraded}）——面板上的數字看起來正常，實際來源已不是要求的那一個`,
+        detail: invalidSetting
+          ? `tg-monitor 的 MON_READ_SOURCE 設定值不合法：requested='${rs.requested}'，已被 fail-safe 成 effective='${rs.effective}'` +
+            `（degraded=${rs.degraded}）——面板上的數字看起來正常，但讀的根本不是你以為的那個來源，請改正設定值`
+          : `tg-monitor 的讀取面已靜默降級：requested='${rs.requested}'、effective='${rs.effective}'（degraded=true）` +
+            '——面板上的數字看起來正常，實際來源已不是要求的那一個',
       })
     }
     // rs === null ＝ unknown：**刻意不 push 任何條件**，呼叫端因此保留前一狀態，

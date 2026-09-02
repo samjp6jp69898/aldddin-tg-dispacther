@@ -194,6 +194,12 @@ startMonitorHeartbeat({ writer: 'worker-agent' })
 // flag=0 時本行程的行為與本次改動前完全相同。
 const MONITOR_STATUS_TICK_MS = 60_000
 
+/** 心跳結果 → `db_writable` 的三態：`null`（還沒打過任何一拍＝不知道）／
+ * `true`（上一拍真的寫進 DB）／`false`（上一拍落 spool 或整個遺失）。 */
+function toTriState(result: ReturnType<typeof getLastHeartbeatResult>): boolean | null {
+  return result === null ? null : result === 'written'
+}
+
 async function reportMonitorStatus(): Promise<void> {
   try {
     const spool = readSpoolDepth()
@@ -207,7 +213,13 @@ async function reportMonitorStatus(): Promise<void> {
       oldest_age_s: oldestAgeS,
       // 「上一拍心跳有沒有真的寫進 DB」——本行程手上唯一不需要多打一次 DB
       // 就能得到的可寫性證據（見 heartbeat.ts 的 getLastHeartbeatResult）。
-      db_writable: getLastHeartbeatResult('worker-agent') === 'written',
+      //
+      // **`null` ＝ 還沒打過任何一拍，也就是「不知道」**（a7-D15：null 必須貫穿，
+      // 不得在任何一段被壓成 false/0）。本函式在 :220 開機當下就跑第一輪，與
+      // `startMonitorHeartbeat()` 的首拍是競跑的——舊寫法 `=== 'written'` 會把
+      // 這個必然發生的起步期回報成 `false`＝「該台監控 DB 不可寫」，那是**捏造的
+      // 壞消息**，會讓 (e) 的告警文字冤枉一台其實好好的機器。
+      db_writable: toTriState(getLastHeartbeatResult('worker-agent')),
     })
     if (!ok) console.error('worker-agent: monitor-status 回報失敗（head 打不到），下一輪重試')
   } catch (err) {

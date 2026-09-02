@@ -89,6 +89,20 @@ describe('POST /cluster/monitor-status — 正常寫入與輸入收斂', () => {
     expect(getWorkerMonitorStatus('landon2')).toMatchObject({ spoolDepth: null, oldestAgeS: null, dbWritable: null })
   })
 
+  test('db_writable 明確送 null（worker 還沒有成功心跳＝不知道）→ 原樣存成 null，不壓成 false', async () => {
+    // a7-D15：worker 端在首拍心跳之前送的就是 null，這個「不知道」必須貫穿。
+    const res = await post({ worker: 'landon2', spool_depth: 0, oldest_age_s: null, db_writable: null })
+    expect(res.status).toBe(200)
+    expect(getWorkerMonitorStatus('landon2')).toMatchObject({ spoolDepth: 0, oldestAgeS: null, dbWritable: null })
+  })
+
+  test('db_writable=false 與 null 是可區分的兩件事', async () => {
+    await post({ worker: 'a1', spool_depth: 0, db_writable: false })
+    await post({ worker: 'a2', spool_depth: 0, db_writable: null })
+    expect(getWorkerMonitorStatus('a1')!.dbWritable).toBe(false)
+    expect(getWorkerMonitorStatus('a2')!.dbWritable).toBeNull()
+  })
+
   test('body 不是 JSON → 400', async () => {
     const res = await app.request('/cluster/monitor-status', {
       method: 'POST',

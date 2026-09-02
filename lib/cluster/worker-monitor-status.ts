@@ -26,7 +26,12 @@ export interface WorkerMonitorStatus {
   spoolDepth: number | null
   /** worker 本機 spool 最舊未 ack 條目的年齡（秒）。 */
   oldestAgeS: number | null
-  /** worker 上一拍 `monitor_heartbeat` 是否真的寫進 DB。 */
+  /**
+   * worker 上一拍 `monitor_heartbeat` 是否真的寫進 DB。
+   * **`null` ＝ 不知道**（該台還沒打過任何一拍心跳，或回報值不是布林）——
+   * a7-D15：這個「不知道」必須從 worker 的回報端一路貫穿到告警文字，
+   * 任何一段把它壓成 `false` 都是在捏造「DB 不可寫」這個壞消息。
+   */
   dbWritable: boolean | null
   /** head 收到這筆回報的時刻（epoch ms）——由 head 蓋章，不信任 worker 自報時間。 */
   receivedAt: number

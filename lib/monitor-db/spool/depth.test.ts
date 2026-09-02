@@ -7,6 +7,10 @@ import { readSpoolDepth, readSpoolStatsForHeartbeat } from './depth.ts'
 // §6.8(b)：spool_depth ＝ 全部資料檔「未 ack 位元組」換算的條目數總和；
 // oldest ＝ 未 ack 條目中最舊的 ts。壞檔／缺游標一律按「整檔未 ack」保守計。
 
+/** 與 depth.ts 的 READ_CHUNK_BYTES 同值。刻意在測試裡寫死：這組測試要驗的就是
+ * 「換行剛好落在讀取分塊邊界」，值若跟著實作變動就驗不到那個位移了。 */
+const CHUNK = 1 << 20
+
 const dirs: string[] = []
 
 function tmpDir(): string {
@@ -161,15 +165,86 @@ describe('readSpoolDepth', () => {
     expect(readSpoolDepth(dir)).toMatchObject({ depth: 1, files: 1 })
   })
 
-  test('跨越 1MB 讀取分塊邊界仍正確計數（大量條目）', () => {
-    const dir = tmpDir()
-    const lines: string[] = []
-    for (let i = 1; i <= 6000; i++) lines.push(entry(i, `2026-09-01T00:00:00.${String(i % 1000).padStart(3, '0')}Z`))
-    writeDataFile(dir, 'server.100.1000.jsonl', lines)
-    // 一條約 130 bytes × 6000 ≈ 780KB，加上下面重複寫一份確保跨過 1MB。
-    writeDataFile(dir, 'server.101.1000.jsonl', lines)
+  // 對抗性覆核（2026-09-02）實證的邊界缺陷：舊實作用 chunk 內相對 index 當行起點
+  // 判空行，換行恰好落在 start + k×1MB 時該條目被漏計。舊測試寫的是**兩個各
+  // 672KB 的獨立檔案**（measureFile 逐檔掃描 ⇒ 兩檔都在單一 chunk 內跑完），
+  // 從未跨過任何 chunk 邊界，正是那個缺陷得以存活的原因。下面三條都是**單一檔案**
+  // 且真的跨界，其中兩條把換行精確釘在邊界位移上。
+  describe('1MB 讀取分塊邊界', () => {
+    /** 產生一條位元組長度**精確**為 totalBytes 的條目（不含換行）。 */
+    function paddedEntry(seq: number, ts: string, totalBytes: number): string {
+      const shell = { seq, ts, host: 'head', run_id: null, fn: 'upsertMonitorHeartbeat', pad: '' }
+      const need = totalBytes - Buffer.byteLength(JSON.stringify(shell))
+      if (need < 0) throw new Error(`paddedEntry: totalBytes 太小（至少 ${Buffer.byteLength(JSON.stringify(shell))}）`)
+      // pad 全是 ASCII 'x'，JSON.stringify 不會轉義 ⇒ 每加 1 個字元剛好加 1 byte。
+      return JSON.stringify({ ...shell, pad: 'x'.repeat(need) })
+    }
 
-    expect(readSpoolDepth(dir).depth).toBe(12_000)
+    test('paddedEntry 自身的長度保證（下面兩條測試的前提）', () => {
+      expect(Buffer.byteLength(paddedEntry(1, '2026-09-01T00:00:00.000Z', CHUNK))).toBe(CHUNK)
+    })
+
+    test('換行位元組**恰好**落在第一個 chunk 邊界（絕對位移 = 1MB）→ 兩條都要算到', () => {
+      const dir = tmpDir()
+      // 第一行內容佔 byte 0..CHUNK-1，換行落在 byte CHUNK ⇒ 它是第 2 個 chunk 的
+      // 第一個位元組（chunk 內 index 0）。舊實作在這裡回 depth=1。
+      const first = paddedEntry(1, '2026-09-01T00:00:00.000Z', CHUNK)
+      writeFileSync(join(dir, 'server.100.1000.jsonl'), `${first}\n${entry(2, '2026-09-01T00:01:00.000Z')}`)
+
+      const stats = readSpoolDepth(dir)
+      expect(stats.depth).toBe(2)
+      // depth 與 unackedBytes 必須互相自洽（舊實作這兩個值會互相矛盾）
+      expect(stats.unackedBytes).toBe(CHUNK + 1 + Buffer.byteLength(entry(2, '2026-09-01T00:01:00.000Z')))
+      // oldestTs 在這個人造 fixture 下是 null——第一條就有 1MB，超出 64KB 的 ts
+      // 探測窗（見下面「ts 探測窗」那條測試）。這裡驗的是 depth，不是 ts。
+    })
+
+    test('游標非 0 時，邊界是 start + 1MB（不是檔案的 1MB）→ 一樣要算到', () => {
+      const dir = tmpDir()
+      const name = 'server.100.1000.jsonl'
+      const acked = entry(1, '2026-09-01T00:00:00.000Z')
+      const start = Buffer.byteLength(acked)
+      // 未 ack 區的第一行內容佔 start..start+CHUNK-1，換行落在 start+CHUNK。
+      const second = paddedEntry(2, '2026-09-01T00:01:00.000Z', CHUNK)
+      writeFileSync(join(dir, name), `${acked}${second}\n${entry(3, '2026-09-01T00:02:00.000Z')}`)
+      writeCursor(dir, name, JSON.stringify({ acked_bytes: start, acked_seq: 1, failing: {}, updated_at: '' }))
+
+      expect(readSpoolDepth(dir).depth).toBe(2)
+    })
+
+    test('單檔遠大於 1MB 的大量條目（跨多個邊界）逐條計數正確，oldestTs 取未 ack 區第一條', () => {
+      const dir = tmpDir()
+      const lines: string[] = []
+      for (let i = 1; i <= 20_000; i++) lines.push(entry(i, `2026-09-01T00:00:00.${String(i % 1000).padStart(3, '0')}Z`))
+      const total = lines.reduce((a, l) => a + Buffer.byteLength(l), 0)
+      writeDataFile(dir, 'server.100.1000.jsonl', lines)
+
+      expect(total).toBeGreaterThan(2 * CHUNK) // 真的跨過至少兩個邊界
+      const stats = readSpoolDepth(dir)
+      expect(stats.depth).toBe(20_000)
+      // 正常尺寸的條目下，跨多個 chunk 邊界不影響 oldestTs
+      expect(stats.oldestTs).toBe('2026-09-01T00:00:00.001Z')
+    })
+
+    test('ts 探測窗：未 ack 區第一條就超過 64KB ⇒ oldestTs = null（未知），不是猜一個錯的值', () => {
+      const dir = tmpDir()
+      const huge = paddedEntry(1, '2026-09-01T00:00:00.000Z', 100 * 1024)
+      writeFileSync(join(dir, 'server.100.1000.jsonl'), `${huge}\n${entry(2, '2026-09-01T00:01:00.000Z')}`)
+
+      const stats = readSpoolDepth(dir)
+      expect(stats.depth).toBe(2) // 計數不受影響
+      expect(stats.oldestTs).toBeNull() // 「不知道」而非回第二條的 ts（那會低報積壓年齡）
+    })
+
+    test('空行恰好落在 chunk 邊界時仍然不計（修正不得把空行判準弄丟）', () => {
+      const dir = tmpDir()
+      // 第一行 CHUNK-1 bytes + '\n'（換行在 byte CHUNK-1）⇒ 下一行起點正好是 byte
+      // CHUNK ＝ 第 2 個 chunk 的 index 0；讓那一行是空行。
+      const first = paddedEntry(1, '2026-09-01T00:00:00.000Z', CHUNK - 1)
+      writeFileSync(join(dir, 'server.100.1000.jsonl'), `${first}\n\n${entry(3, '2026-09-01T00:02:00.000Z')}`)
+
+      expect(readSpoolDepth(dir).depth).toBe(2) // 第一行 + 最後一行，中間空行不算
+    })
   })
 })
 
