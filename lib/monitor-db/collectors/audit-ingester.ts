@@ -30,6 +30,7 @@
 //   （結構上只重複、不缺口）。
 import { existsSync } from 'node:fs'
 import { MON_HOST, isMonitorDbEnabled } from '../env.ts'
+import { withMonitorDeadline } from '../deadline.ts'
 import { insertMcpUsage, upsertFileOffset, type InsertMcpUsageInput, type MonitorDbExecutor } from '../writes.ts'
 import type { SpoolWriterHandle } from '../spool/writer.ts'
 import { createEventSeqCounter, eventSeqToNumber, type EventSeqCounter } from '../../log-shipper/event-seq.ts'
@@ -122,6 +123,8 @@ export interface AuditIngesterDeps {
   host?: string
   eventSeqCounter?: EventSeqCounter
   now?: () => number
+  /** 單次查詢的逾時預算（§6.7，預設 1000ms）。測試注入小值以確定性驗證逾時路徑。 */
+  queryBudgetMs?: number
 }
 
 export interface AuditIngester {
@@ -170,7 +173,14 @@ export function createAuditIngester(deps: AuditIngesterDeps): AuditIngester {
     if (inMemory) return inMemory
     if (restored.has(path)) return null
     try {
-      const [rows] = await pool.execute(FILE_OFFSET_SELECT_SQL, [host, path])
+      // §6.7：對位／游標 SELECT 一律套 1000ms deadline（對抗性審查 B1）——
+      // tunnel 半開時裸 await 會讓整輪 runOnce 永遠掛住，spooling 降級旗標
+      // 也就永遠不會被設起來。
+      const [rows] = await withMonitorDeadline(
+        'file_offsets SELECT',
+        () => pool.execute(FILE_OFFSET_SELECT_SQL, [host, path]),
+        deps.queryBudgetMs,
+      )
       restored.add(path)
       const list = Array.isArray(rows) ? (rows as Array<{ inode?: unknown; offset?: unknown }>) : []
       const row = list[0]
@@ -231,7 +241,7 @@ export function createAuditIngester(deps: AuditIngesterDeps): AuditIngester {
 
       if (!spooling) {
         try {
-          const outcome = await insertMcpUsage(pool, input)
+          const outcome = await withMonitorDeadline('insertMcpUsage', () => insertMcpUsage(pool, input), deps.queryBudgetMs)
           if (outcome.kind === 'inserted') stats.linesInserted++
           consumed++
           continue
@@ -281,7 +291,7 @@ export function createAuditIngester(deps: AuditIngesterDeps): AuditIngester {
   ): Promise<void> {
     const input = { path, inode, offset, eventSeq: eventSeqToNumber(eventSeq.next()) }
     try {
-      await upsertFileOffset(pool, input)
+      await withMonitorDeadline('upsertFileOffset', () => upsertFileOffset(pool, input), deps.queryBudgetMs)
     } catch (err) {
       console.error(`audit ingester: file_offsets 推進失敗（${path}）: ${err}`)
       stats.offsetWriteErrors++
@@ -333,10 +343,25 @@ export interface AuditIngesterHandle {
 export function startAuditIngester(deps: AuditIngesterDeps, tickMs = AUDIT_INGEST_TICK_MS): AuditIngesterHandle {
   if (!isMonitorDbEnabled()) return { stop() {} }
   const ingester = createAuditIngester(deps)
+  // re-entrancy 閘門（對抗性審查 B1）：上一輪還沒結束就跳過本輪。兩輪並行會
+  // 共用同一份記憶體游標（cursors / restored），把「只重複、不缺口」的不變式
+  // 弄髒。這不是用等待解決正確性——是結構性互斥，單一 event loop 上的布林
+  // 旗標讀寫之間沒有 await，不可能交錯。
+  let running = false
   const timer = setInterval(() => {
-    void ingester.runOnce().catch(err => {
-      console.error(`audit ingester: tick 失敗: ${err}`)
-    })
+    if (running) {
+      console.error('audit ingester: 上一輪尚未結束，跳過本輪（re-entrancy 閘門）')
+      return
+    }
+    running = true
+    void ingester
+      .runOnce()
+      .catch(err => {
+        console.error(`audit ingester: tick 失敗: ${err}`)
+      })
+      .finally(() => {
+        running = false
+      })
   }, tickMs)
   return {
     stop() {

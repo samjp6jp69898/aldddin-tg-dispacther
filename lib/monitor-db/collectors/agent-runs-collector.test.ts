@@ -10,6 +10,7 @@ import {
   createAgentRunsCollector,
   fileTsToIso,
   parseClaudeEvents,
+  STDOUT_MISS_RETRY_MS,
   startAgentRunsCollector,
   summarizeEvents,
 } from './agent-runs-collector.ts'
@@ -450,5 +451,176 @@ describe('整輪跳過與 flag 閘門', () => {
       if (prev === undefined) delete process.env.MON_DB_ENABLED
       else process.env.MON_DB_ENABLED = prev
     }
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────
+// 對抗性審查 B1（§6.7 deadline + re-entrancy）與 B2（stdout 負向快取）的修復驗證
+// ─────────────────────────────────────────────────────────────────────────
+
+/** execute() 永不 resolve 的假 pool（模擬 SSH tunnel 半開）。 */
+function hangingPool(onCall: () => void = () => {}): MonitorDbExecutor {
+  return {
+    execute: () => {
+      onCall()
+      return new Promise(() => {})
+    },
+  }
+}
+
+describe('B1：對位 SELECT 的 1000ms deadline', () => {
+  test('SELECT 永不 resolve → 逾時後計 lookupErrors、不寫入、游標乾淨（不會卡住整輪）', async () => {
+    const { traceDir, logDir } = tmpRoot()
+    writeTrace(traceDir, 'FAQ-20', '2026-09-01T00-00-00-000Z-classify.json', {
+      ticket: 'FAQ-20',
+      stage: 'classify',
+      startedAt: '2026-09-01T00:00:00.000Z',
+      endedAt: '2026-09-01T00:01:00.000Z',
+      events: RESULT_EVENTS,
+    })
+    writeFileSync(join(logDir, 'FAQ-21.2026-08-21T01-23-16-901Z.stdout.log'), JSON.stringify(RESULT_EVENTS), 'utf8')
+
+    const writes: UpsertAgentRunInput[] = []
+    const collector = createAgentRunsCollector({
+      getExecutor: async () => hangingPool(),
+      writeAgentRun: async input => {
+        writes.push(input)
+      },
+      traceDir,
+      dispatcherLogDir: logDir,
+      host: 'head',
+      queryBudgetMs: 1,
+    })
+
+    const stats = await collector.runOnce()
+
+    // trace 一次 + stdout 一次，兩條對位都逾時。
+    expect(stats.lookupErrors).toBe(2)
+    expect(writes).toHaveLength(0)
+    expect(collector.getCursors()).toEqual({})
+    // 逾時不算「對不上」，不得污染負向快取（否則真正的 DB 故障會被記成孤兒）。
+    expect(collector.getStdoutMisses()).toEqual({})
+  })
+})
+
+describe('B1：setInterval 的 re-entrancy 閘門', () => {
+  test('上一輪未結束時，下一輪不進場（不會有兩輪共用同一份記憶體游標）', () => {
+    const prev = process.env.MON_DB_ENABLED
+    process.env.MON_DB_ENABLED = '1'
+    const { traceDir, logDir } = tmpRoot()
+    writeFileSync(join(logDir, 'FAQ-22.2026-08-21T01-23-16-901Z.stdout.log'), JSON.stringify(RESULT_EVENTS), 'utf8')
+
+    const realSetInterval = globalThis.setInterval
+    let tick: (() => void) | null = null
+    // @ts-expect-error 測試用替身：攔下 tick callback，由測試自己決定何時觸發。
+    globalThis.setInterval = (cb: () => void) => {
+      tick = cb
+      return 0 as unknown as ReturnType<typeof setInterval>
+    }
+
+    let executorAsked = 0
+    try {
+      const handle = startAgentRunsCollector({
+        getExecutor: async () => {
+          executorAsked++
+          // 永遠不 resolve：模擬「這一輪還沒結束」。
+          return new Promise<never>(() => {}) as unknown as Promise<MonitorDbExecutor | null>
+        },
+        writeAgentRun: async () => {},
+        traceDir,
+        dispatcherLogDir: logDir,
+      })
+      tick!() // 第一輪進場，卡在 getExecutor
+      tick!() // 第二輪必須被閘門擋下
+      tick!()
+      handle.stop()
+    } finally {
+      globalThis.setInterval = realSetInterval
+      if (prev === undefined) delete process.env.MON_DB_ENABLED
+      else process.env.MON_DB_ENABLED = prev
+    }
+
+    expect(executorAsked).toBe(1)
+  })
+})
+
+describe('B2：stdout 對不上 runs 時的負向快取 + 退避', () => {
+  const STDOUT = 'FAQ-30.2026-08-21T01-23-16-901Z.stdout.log'
+
+  function collectorWithClock(traceDir: string, logDir: string, db: MonitorDbExecutor, clock: () => number) {
+    const writes: UpsertAgentRunInput[] = []
+    const collector = createAgentRunsCollector({
+      getExecutor: async () => db,
+      writeAgentRun: async input => {
+        writes.push(input)
+      },
+      traceDir,
+      dispatcherLogDir: logDir,
+      host: 'head',
+      now: clock,
+    })
+    return { collector, writes }
+  }
+
+  test('對不上 → 記負向快取；檔案指紋未變且未到退避時刻的後續輪次連 SELECT 都不發', async () => {
+    const { traceDir, logDir } = tmpRoot()
+    const path = join(logDir, STDOUT)
+    writeFileSync(path, JSON.stringify(RESULT_EVENTS), 'utf8')
+    const db = new FakeLookupDb()
+    let clock = 1_000_000
+    const { collector } = collectorWithClock(traceDir, logDir, db, () => clock)
+
+    const first = await collector.runOnce()
+    expect(first.stdoutSkippedUnresolved).toBe(1)
+    expect(db.calls.filter(c => c.sql === RESOLVE_BY_STDOUT_PATH_SQL)).toHaveLength(1)
+    expect(Object.keys(collector.getStdoutMisses())).toEqual([path])
+
+    clock += 60_000 // 兩分鐘後（遠小於 30 分鐘退避）
+    const second = await collector.runOnce()
+    expect(second.stdoutSkippedCached).toBe(1)
+    expect(second.stdoutSkippedUnresolved).toBe(0)
+    // 關鍵斷言：整個第二輪沒有再打任何一次 runs 全表掃描。
+    expect(db.calls.filter(c => c.sql === RESOLVE_BY_STDOUT_PATH_SQL)).toHaveLength(1)
+  })
+
+  test('退避時間到 → 重試一次；仍對不上就重新退避', async () => {
+    const { traceDir, logDir } = tmpRoot()
+    writeFileSync(join(logDir, STDOUT), JSON.stringify(RESULT_EVENTS), 'utf8')
+    const db = new FakeLookupDb()
+    let clock = 1_000_000
+    const { collector } = collectorWithClock(traceDir, logDir, db, () => clock)
+
+    await collector.runOnce()
+    clock += STDOUT_MISS_RETRY_MS + 1
+    const retry = await collector.runOnce()
+
+    expect(retry.stdoutSkippedUnresolved).toBe(1)
+    expect(retry.stdoutSkippedCached).toBe(0)
+    expect(db.calls.filter(c => c.sql === RESOLVE_BY_STDOUT_PATH_SQL)).toHaveLength(2)
+  })
+
+  test('檔案指紋（mtime/size）一變 → 不等退避，立刻重試並在對上後清掉負向快取', async () => {
+    const { traceDir, logDir } = tmpRoot()
+    const path = join(logDir, STDOUT)
+    writeFileSync(path, JSON.stringify(RESULT_EVENTS), 'utf8')
+    const rows: Record<string, Array<{ run_id: string; lifecycle_rank: number }>> = {}
+    const db = new FakeLookupDb({}, rows)
+    let clock = 1_000_000
+    const { collector, writes } = collectorWithClock(traceDir, logDir, db, () => clock)
+
+    await collector.runOnce()
+    expect(Object.keys(collector.getStdoutMisses())).toEqual([path])
+
+    // 檔案被 append（size 變大）＋ runs 這時才寫進來。
+    writeFileSync(path, `${JSON.stringify(RESULT_EVENTS)}\n${JSON.stringify(RESULT_EVENTS[2])}`, 'utf8')
+    rows[path] = [{ run_id: 'run-30', lifecycle_rank: 30 }]
+    clock += 30_000 // 遠小於退避時間，靠的是指紋改變
+
+    const second = await collector.runOnce()
+
+    expect(second.stdoutSkippedCached).toBe(0)
+    expect(second.stdoutWritten).toBe(1)
+    expect(writes[0]).toMatchObject({ runId: 'run-30', agentName: 'create-mr' })
+    expect(collector.getStdoutMisses()).toEqual({})
   })
 })

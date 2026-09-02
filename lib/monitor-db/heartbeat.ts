@@ -27,7 +27,8 @@
 //     `mon_head` / `connectionLimit: 2` 的池，spool 身分是 `log-intake`
 //     （runtime.ts 的單例身分只會是 server|worker-agent，對這個行程是錯的）。
 //     兩者都 lazy——只有 flag 開啟且真的要寫入時才建立。
-import { getDeclaredMonitorRole, declareMonitorRole, isMonitorDbEnabled, MON_HOST } from './env.ts'
+import { isMonitorDbEnabled, MON_HOST } from './env.ts'
+import { withMonitorDeadline } from './deadline.ts'
 import { getLongLivedMonitorPool, getLongLivedMonitorSpoolWriter } from './runtime.ts'
 import { upsertMonitorHeartbeat, type MonitorDbExecutor } from './writes.ts'
 import { createSpoolWriter, type SpoolWriterHandle } from './spool/writer.ts'
@@ -47,6 +48,8 @@ export interface MonitorHeartbeatDeps {
   getSpool?: () => SpoolWriterHandle
   /** `spool_depth` / `spool_oldest_ts` 兩個觀察欄的來源；不給就寫 NULL（見下）。 */
   spoolStats?: () => { depth: number | null; oldestTs: string | null }
+  /** 單次查詢的逾時預算（§6.7，預設 1000ms）。測試注入小值以確定性驗證逾時路徑。 */
+  queryBudgetMs?: number
   now?: () => number
 }
 
@@ -79,7 +82,11 @@ export async function beatOnce(deps: MonitorHeartbeatDeps): Promise<HeartbeatRes
 
   if (pool) {
     try {
-      await upsertMonitorHeartbeat(pool, input)
+      // §6.7：單次查詢一律套 1000ms deadline。沒有這一層時，tunnel 半開造成
+      // 的「query 永不 resolve」會讓下面的 catch 永遠不執行——這一拍既不 WARN
+      // 也不落 spool，正是本模組要消滅的靜默失敗（對抗性審查 B1）。
+      const target = pool
+      await withMonitorDeadline(`upsertMonitorHeartbeat(${deps.writer})`, () => upsertMonitorHeartbeat(target, input), deps.queryBudgetMs)
       return 'written'
     } catch (err) {
       console.error(`monitor-db heartbeat(${deps.writer}): 寫入失敗，改落 spool: ${err}`)
@@ -144,22 +151,16 @@ const NOOP_HANDLE: MonitorHeartbeatHandle = { stop() {}, firstBeat: Promise.reso
  * 60 秒一拍。任何失敗都只 WARN，不外拋——呼叫端（server.ts / worker-agent.ts /
  * intake-server.ts）不需要 try/catch。
  *
- * `log-intake` 的額外處置：該行程沒有呼叫過 `declareMonitorRole()`（它不是
- * 本輪熱修範圍內的兩個進入點），若 head 的 `.env` 殘留 `CLUSTER_WORKER_NAME`，
- * `MON_HOST` 會被嗅探成別台機器的名字、心跳就寫到錯的 host 上。這裡在還沒有
- * 任何宣告時補宣告 `mon_head`（已宣告過就完全不動，避免與宿主行程的宣告打架）
- * ——這是熱修同一個 bug 的同一種修法，不是本檔自作主張的新規則。
+ * **角色宣告不是本檔的責任**（總指揮 2026-09-02 裁定）：9551686 曾在這裡對
+ * `log-intake` 做「未宣告才補宣告」的時序性 fail-safe；af 的 `3782873` 已在
+ * `intake-server.ts` 的 module init 最前端加了顯式 `declareMonitorRole('mon_head')`
+ * ——進入點顯式宣告是結構保證（先於 serve 與任何 monitor 引用），比繫於
+ * 「heartbeat 有沒有先跑」的時序更強。條件補宣告若長期保留，反而會**遮蔽
+ * 「進入點忘了宣告」這個缺陷**，裁定改為 fail-loud：沒宣告就讓 `MON_HOST`
+ * 維持嗅探值並在資料上顯現，由 doctor／覆核抓出來，本檔不再默默代勞。
  */
 export function startMonitorHeartbeat(deps: MonitorHeartbeatDeps, tickMs = MONITOR_HEARTBEAT_TICK_MS): MonitorHeartbeatHandle {
   if (!isMonitorDbEnabled()) return NOOP_HANDLE
-
-  if (deps.writer === 'log-intake' && getDeclaredMonitorRole() === null) {
-    try {
-      declareMonitorRole('mon_head')
-    } catch (err) {
-      console.error(`monitor-db heartbeat(log-intake): 宣告角色失敗，沿用既有 MON_HOST='${MON_HOST}': ${err}`)
-    }
-  }
 
   const firstBeat = beatOnce(deps)
   const timer = setInterval(() => void beatOnce(deps), tickMs)

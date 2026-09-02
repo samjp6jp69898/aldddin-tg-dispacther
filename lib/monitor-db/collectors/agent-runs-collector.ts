@@ -43,6 +43,7 @@ import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import type { RowDataPacket } from 'mysql2/promise'
 import { MON_HOST, isMonitorDbEnabled } from '../env.ts'
+import { withMonitorDeadline } from '../deadline.ts'
 import type { MonitorDbExecutor, UpsertAgentRunInput } from '../writes.ts'
 
 /** claude-exec.ts 的 TRACE_DIR（同 repo 常數，維持單一字面量來源在該檔）。 */
@@ -63,6 +64,24 @@ export const BUG_STAGE_NAME = 'create-mr'
 
 /** result_preview 欄寬 512，沿用 sqlite collector 的 300 截斷（writes.ts 另有防禦性截斷）。 */
 const RESULT_PREVIEW_CHARS = 300
+
+/**
+ * 「對不上 `runs` 的 stdout 檔」下一次重試的間隔（對抗性審查 B2）。
+ *
+ * 背景：`RESOLVE_BY_STDOUT_PATH_SQL` 打的是 `runs.stdout_path`，而 001-init.sql
+ * 的索引不含這一欄（`idx_host_lifecycle` 也用不上：缺 `lifecycle_rank` 條件、
+ * 且 head 上 `host` 幾乎全是 'head'，選擇度極低）⇒ **每次都是全表掃描**。
+ * `logs/` 底下有大量監控 DB 啟用前的舊 stdout 檔，它們在 `runs` 裡永遠不會有
+ * 對應列；沒有負向記憶時每 30 秒就把它們全部再掃一次，成本隨 `logs/` 檔案數
+ * 與 `runs` 列數雙線性成長、永不收斂，而且與 pipeline 的權威 `runs` 寫入
+ * 共用同一個 pool。
+ *
+ * 30 分鐘是「重試節流」不是正確性依據：真正保證正確性的是**檔案指紋
+ * （mtime + size）一變就立刻重試**——run 列晚一步寫進 DB 的情況下，該檔案
+ * 幾乎必然還在被 append（wrapper 仍在寫 stdout），指紋會變、下一輪就重試；
+ * 指紋不變的檔案是靜止的舊檔，晚 30 分鐘認領不會遺失任何東西。
+ */
+export const STDOUT_MISS_RETRY_MS = 30 * 60 * 1000
 
 export const RESOLVE_BY_TICKET_SQL = 'SELECT run_id FROM runs WHERE host = ? AND ticket = ? LIMIT 2'
 export const RESOLVE_BY_STDOUT_PATH_SQL =
@@ -189,6 +208,8 @@ export interface AgentRunsCollectorStats {
   stdoutSeen: number
   stdoutWritten: number
   stdoutSkippedUnresolved: number
+  /** 命中負向快取（對不上 runs 且檔案指紋未變）→ 連 SELECT 都不發（B2）。 */
+  stdoutSkippedCached: number
   stdoutSkippedUnreadable: number
   /** 對位用 SELECT 拋例外（DB 不可達）的次數——本輪 skip 對應檔案，下輪再試。 */
   lookupErrors: number
@@ -204,6 +225,7 @@ function emptyStats(): AgentRunsCollectorStats {
     stdoutSeen: 0,
     stdoutWritten: 0,
     stdoutSkippedUnresolved: 0,
+    stdoutSkippedCached: 0,
     stdoutSkippedUnreadable: 0,
     lookupErrors: 0,
   }
@@ -226,18 +248,31 @@ export interface AgentRunsCollectorDeps {
   dispatcherLogDir?: string
   /** `runs.host` 守衛值；預設 MON_HOST（與 writes.ts 內部用的同一個值）。 */
   host?: string
+  /** 負向快取退避的時鐘來源（測試注入；不靠等待時間驗證退避）。 */
+  now?: () => number
+  /** 單次查詢的逾時預算（§6.7，預設 1000ms）。測試注入小值以確定性驗證逾時路徑。 */
+  queryBudgetMs?: number
 }
 
 export interface AgentRunsCollector {
   runOnce(): Promise<AgentRunsCollectorStats>
   /** 記憶體游標快照（唯讀，供測試/觀察）。 */
   getCursors(): Record<string, { mtimeMs: number; terminal: boolean }>
+  /** 負向快取快照（唯讀，供測試/觀察）。 */
+  getStdoutMisses(): Record<string, StdoutMissEntry>
 }
 
 interface CursorEntry {
   mtimeMs: number
   /** 已寫過終態（payload 全帶）→ 之後怎麼重掃都不會再有新資訊，直接跳過。 */
   terminal: boolean
+}
+
+/** 負向快取條目：對不上 `runs` 的 stdout 檔，記下當時的檔案指紋與下次可重試時刻。 */
+interface StdoutMissEntry {
+  mtimeMs: number
+  size: number
+  nextAttemptMs: number
 }
 
 function toIsoOrNull(v: unknown): string | null {
@@ -255,7 +290,10 @@ export function createAgentRunsCollector(deps: AgentRunsCollectorDeps): AgentRun
   const traceDir = deps.traceDir ?? DEFAULT_TRACE_DIR
   const logDir = deps.dispatcherLogDir ?? DEFAULT_DISPATCHER_LOG_DIR
   const host = deps.host ?? MON_HOST
+  const now = deps.now ?? Date.now
   const cursors = new Map<string, CursorEntry>()
+  /** B2 負向快取：path → 上次對不上時的檔案指紋與下次可重試時刻。 */
+  const stdoutMisses = new Map<string, StdoutMissEntry>()
 
   /**
    * 舊 trace 檔（沒有 runId 欄）的確定性對位：(host, ticket) 恰好對到一列才採用。
@@ -271,7 +309,15 @@ export function createAgentRunsCollector(deps: AgentRunsCollectorDeps): AgentRun
     if (cached !== undefined) return cached
     let rows: RowDataPacket[]
     try {
-      const [result] = await pool.execute<RowDataPacket[]>(RESOLVE_BY_TICKET_SQL, [host, ticket])
+      // §6.7：對位 SELECT 一律套 1000ms deadline（對抗性審查 B1）。裸 await
+      // 在 tunnel 半開時永不 resolve ⇒ 本輪 tick 不結束，與下一輪並行共用同一
+      // 份記憶體游標。deadline + 下面 startAgentRunsCollector 的 re-entrancy
+      // 閘門是同一個問題的兩道防線。
+      const [result] = await withMonitorDeadline(
+        'runs SELECT by ticket',
+        () => pool.execute<RowDataPacket[]>(RESOLVE_BY_TICKET_SQL, [host, ticket]),
+        deps.queryBudgetMs,
+      )
       rows = selectRows(result)
     } catch (err) {
       console.error(`agent-runs collector: (host, ticket) 對位查詢失敗（ticket=${ticket}）: ${err}`)
@@ -290,7 +336,11 @@ export function createAgentRunsCollector(deps: AgentRunsCollectorDeps): AgentRun
   ): Promise<{ runId: string; terminal: boolean } | null | undefined> {
     let rows: RowDataPacket[]
     try {
-      const [result] = await pool.execute<RowDataPacket[]>(RESOLVE_BY_STDOUT_PATH_SQL, [host, stdoutPath])
+      const [result] = await withMonitorDeadline(
+        'runs SELECT by stdout_path',
+        () => pool.execute<RowDataPacket[]>(RESOLVE_BY_STDOUT_PATH_SQL, [host, stdoutPath]),
+        deps.queryBudgetMs,
+      )
       rows = selectRows(result)
     } catch (err) {
       console.error(`agent-runs collector: (host, stdout_path) 對位查詢失敗（path=${stdoutPath}）: ${err}`)
@@ -448,15 +498,31 @@ export function createAgentRunsCollector(deps: AgentRunsCollectorDeps): AgentRun
         continue
       }
 
+      // B2 負向快取：上一次對不上、而且**檔案指紋沒變**、又還沒到重試時刻，
+      // 就直接跳過——連 SELECT 都不發（那是 runs 的全表掃描）。指紋一變就
+      // 立刻重試（下面 delete 之後往下走），不受退避時間拘束。
+      const miss = stdoutMisses.get(path)
+      if (miss) {
+        if (miss.mtimeMs === mtimeMs && miss.size === size && now() < miss.nextAttemptMs) {
+          stats.stdoutSkippedCached++
+          continue
+        }
+        stdoutMisses.delete(path)
+      }
+
       const resolved = await resolveByStdoutPath(pool, path)
       if (resolved === undefined) {
         stats.lookupErrors++
         continue
       }
       if (resolved === null) {
+        // 對不上：記下指紋 + 退避時刻（不設 cursor——cursor 的語意是「已寫入
+        // 過」，這裡什麼都沒寫）。
+        stdoutMisses.set(path, { mtimeMs, size, nextAttemptMs: now() + STDOUT_MISS_RETRY_MS })
         stats.stdoutSkippedUnresolved++
         continue
       }
+      stdoutMisses.delete(path)
 
       // 未終態時，檔案沒長大就沒有新資訊（骨架已經寫過一次）——但終態判準來自
       // `runs` 而不是檔案，所以「mtime 沒變」不能當成整體跳過的條件，只能當成
@@ -508,6 +574,7 @@ export function createAgentRunsCollector(deps: AgentRunsCollectorDeps): AgentRun
   return {
     runOnce,
     getCursors: () => Object.fromEntries(cursors),
+    getStdoutMisses: () => Object.fromEntries(stdoutMisses),
   }
 }
 
@@ -530,10 +597,24 @@ export interface CollectorHandle {
 export function startAgentRunsCollector(deps: AgentRunsCollectorDeps, tickMs = AGENT_RUNS_COLLECT_TICK_MS): CollectorHandle {
   if (!isMonitorDbEnabled()) return { stop() {} }
   const collector = createAgentRunsCollector(deps)
+  // re-entrancy 閘門（對抗性審查 B1）：上一輪還沒結束就跳過本輪。兩輪並行會
+  // 共用同一份記憶體游標（cursors / stdoutMisses），把冪等性推論弄髒。這不是
+  // 用等待解決正確性——是結構性互斥，布林旗標的讀寫之間沒有 await。
+  let running = false
   const timer = setInterval(() => {
-    void collector.runOnce().catch(err => {
-      console.error(`agent-runs collector: tick 失敗: ${err}`)
-    })
+    if (running) {
+      console.error('agent-runs collector: 上一輪尚未結束，跳過本輪（re-entrancy 閘門）')
+      return
+    }
+    running = true
+    void collector
+      .runOnce()
+      .catch(err => {
+        console.error(`agent-runs collector: tick 失敗: ${err}`)
+      })
+      .finally(() => {
+        running = false
+      })
   }, tickMs)
   return {
     stop() {

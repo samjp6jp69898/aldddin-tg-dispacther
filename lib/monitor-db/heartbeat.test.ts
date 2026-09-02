@@ -3,6 +3,7 @@ import type { ResultSetHeader } from 'mysql2/promise'
 import * as W from './writes.ts'
 import type { MonitorDbExecutor } from './writes.ts'
 import type { SpoolWriterHandle } from './spool/writer.ts'
+import { getDeclaredMonitorRole } from './env.ts'
 import { beatOnce, startMonitorHeartbeat } from './heartbeat.ts'
 
 const prevFlag = process.env.MON_DB_ENABLED
@@ -242,5 +243,49 @@ describe('startMonitorHeartbeat', () => {
 
     expect(intervals).toBe(1)
     expect(db.calls.length).toBeGreaterThan(0)
+  })
+})
+
+// 對抗性審查 B1：§6.7 的 1000ms deadline。沒有這一層時，tunnel 半開造成的
+// 「query 永不 resolve」會讓 heartbeat.ts 的 catch 永遠不執行——這一拍既不
+// WARN 也不落 spool，就是靜默失敗本身。
+describe('beatOnce — 查詢逾時（B1 修復）', () => {
+  test('pool 的 execute 永不 resolve → 走逾時路徑，落 spool，且在預算內返回', async () => {
+    process.env.MON_DB_ENABLED = '1'
+    const hangingPool: MonitorDbExecutor = { execute: () => new Promise(() => {}) }
+    const spooled: Array<{ run_id: string | null; fn: string; args: unknown[]; ts: string }> = []
+
+    const r = await beatOnce({
+      writer: 'server',
+      getExecutor: async () => hangingPool,
+      getSpool: () => fakeSpool(spooled),
+      queryBudgetMs: 1,
+    })
+
+    expect(r).toBe('spooled')
+    expect(spooled).toHaveLength(1)
+    expect(spooled[0]).toMatchObject({ fn: 'upsertMonitorHeartbeat', run_id: null })
+  })
+})
+
+// 總指揮 2026-09-02 裁定（依據 af 的 3782873）：角色宣告是**進入點**的責任。
+// 9551686 曾在 startMonitorHeartbeat 內對 log-intake 做「未宣告才補宣告」的
+// 時序性 fail-safe，已移除——長期保留會遮蔽「進入點忘了宣告」的缺陷，改為
+// fail-loud（沒宣告就讓 MON_HOST 維持嗅探值，由 doctor／覆核抓出來）。
+describe('startMonitorHeartbeat — 不再代為宣告角色（fail-loud）', () => {
+  test('writer=log-intake 且 flag=1 時，不呼叫 declareMonitorRole（宣告狀態前後不變）', async () => {
+    process.env.MON_DB_ENABLED = '1'
+    const before = getDeclaredMonitorRole()
+    const spooled: Array<{ run_id: string | null; fn: string; args: unknown[]; ts: string }> = []
+
+    const handle = startMonitorHeartbeat({
+      writer: 'log-intake',
+      getExecutor: async () => null,
+      getSpool: () => fakeSpool(spooled),
+    })
+    await handle.firstBeat
+    handle.stop()
+
+    expect(getDeclaredMonitorRole()).toBe(before)
   })
 })
