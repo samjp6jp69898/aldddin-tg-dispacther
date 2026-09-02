@@ -107,6 +107,18 @@ WAL 踩坑（impl-constraints-addendum §4）：讀 `monitor.sqlite` **禁止 cp
      一旦 placeholder 列 ≥ 2 筆，拿掉這個 WHERE 就會 false-red。此 SQL 層檢查沒有
      讀取層 `COALESCE(legacy_key, run_id)` 那種保護，NULL 過濾是必要條件，不是風格選擇。
 
+## 回填對讀取端點的已知影響（b5 查證，2026-09-02）
+
+- **`/api/events` 顯示順序（未修，a7 裁定中）**：`queryEvents`（tg-monitor lib/read/mysql.ts:588）
+  以 `ORDER BY e.id DESC` 排序且 `e.id` 兼分頁游標——`mcp_usage` 的 AUTO_INCREMENT id 是
+  寫入序非事件時間序，回填 `events`（本腳本 `BACKFILL_TABLES` 含之）會讓歷史事件的 id
+  大於全部 collector 現有列 → 該端點把最老的回填事件排在最前面當成最新。
+  status_log 的同型問題已由讀取層修復（tg-monitor c71b88c 改 ORDER BY ts,id），但 events
+  **不能照抄**（id 兼游標，需複合游標 (ts,id)，動前端契約）。**回填 events 前確認 a7
+  對此條的裁定**；回填不只是資料量問題，會改變既有端點的顯示語意。
+- `service_status_log` 排序鍵（D43）：讀取層已修（c71b88c）；回填仍以 D44 聯合組合驗證
+  （造資料：本側；讀取檢查：b5）通過為前置。
+
 ## §10.2 對數備註（雙軌對照；容差定義 2026-09-02 與讀取面統一，a7 核定）
 
 - `runs.started_at` 兩軌語意不同：sqlite 由 log 檔名（`<ticket>.<ISO毫秒>`）反推
