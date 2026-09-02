@@ -504,9 +504,9 @@ export async function runBackfill(opts: RunBackfillOptions, deps: RunBackfillDep
     const statusLogs = db.query(`SELECT service, ts, status, pid, detail FROM status_log`).all() as SqliteStatusLog[]
 
     // 既存防撞守衛（唯讀，先於任何寫入）：runs.legacy_key 命中集合，供 pipeline_runs
-    // 與其級聯的 agent_runs 一併 skip；無 pool（純 dry-run 未連線）時視為空集合，
-    // 不做任何猜測性判斷。
-    const existingLegacyKeys = deps.pool ? await fetchExistingLegacyKeys(deps.pool) : new Set<string>()
+    // 與其級聯的 agent_runs 一併 skip。無 pool（純 dry-run 未連線）時為 null＝「未評估」，
+    // 不是空集合——a7-D42：未知不得印成 0（維持「dry-run 不連 MySQL」紀律，修輸出不修紀律）。
+    const existingLegacyKeys = deps.pool ? await fetchExistingLegacyKeys(deps.pool) : null
 
     const { report: runsReport, guardSkippedKeys } = await backfillPipelineRuns(pipelineRuns, opts.dryRun, deps.pool, existingLegacyKeys)
     const agentRunsReport = await backfillAgentRuns(agentRuns, pipelineRuns, opts.dryRun, deps.pool, guardSkippedKeys)
@@ -529,7 +529,9 @@ async function backfillPipelineRuns(
   rows: SqlitePipelineRun[],
   dryRun: boolean,
   pool: Pool | undefined,
-  existingLegacyKeys: ReadonlySet<string>,
+  // null ＝ 守衛未評估（無 pool，如 --dry-run 不連 MySQL）；Set ＝ 實測集合（可為空）。
+  // a7-D42：「未評估」與「實測為 0」是相反的兩件事，輸出必須區分，不得把未知印成 0。
+  existingLegacyKeys: ReadonlySet<string> | null,
 ): Promise<BackfillPipelineRunsResult> {
   const report = makeReport('sqlite.pipeline_runs → runs', dryRun)
   report.sourceRows = rows.length
@@ -543,7 +545,7 @@ async function backfillPipelineRuns(
     // 既存防撞守衛：這列在 mysql 已存在（live 寫入，legacy_key 命中）→ 跳過，
     // 不再進 outcome 映射／不寫入，避免同一支歷史 run 因 run_id 導出方式不同
     // （live=randomUUID vs 回填=deriveRunId）被插成兩列。
-    if (existingLegacyKeys.has(r.key)) {
+    if (existingLegacyKeys !== null && existingLegacyKeys.has(r.key)) {
       report.skipped++
       report.notes.push(`已存在於 mysql（live 寫入）：key=${r.key}`)
       guardSkippedKeys.add(r.key)
@@ -577,8 +579,10 @@ async function backfillPipelineRuns(
     report.notes.push(`timeout finished_at 重算為 started_at+7200s：${timeoutCount} 列，重算值與原值平均差 ${avg} 秒`)
   }
   report.notes.push('triggered_by 欄位語意不符：來源是顯示名不是 email，照存至 triggered_by_email')
-  if (guardSkippedKeys.size > 0) {
-    report.notes.push(`既存防撞守衛：略過 ${guardSkippedKeys.size} 列（legacy_key 已存在於 mysql runs，判定為 live 寫入）`)
+  if (existingLegacyKeys === null) {
+    report.notes.push('既存防撞守衛：未評估（--dry-run 不連 MySQL）；重疊 skip 數僅真跑時可得，不得據本輸出判斷「無重疊」')
+  } else {
+    report.notes.push(`既存防撞守衛：略過 ${guardSkippedKeys.size} 列（legacy_key 已存在於 mysql runs，判定為 live 寫入；此數字為實測值）`)
   }
 
   return { report, guardSkippedKeys }

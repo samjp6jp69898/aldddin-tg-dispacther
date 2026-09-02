@@ -615,10 +615,28 @@ describe('既存防撞守衛（runs.legacy_key 命中 mysql 既有集合 → ski
       expect(runsReport.skipped).toBe(0)
       expect(runsReport.attempted).toBe(1)
       expect(runsReport.inserted).toBe(1)
-      expect(runsReport.notes.some((n) => n.includes('既存防撞守衛'))).toBe(false)
+      // a7-D42：實測 0 要明講是實測值，不是沉默、更不是未評估。
+      expect(runsReport.notes.some((n) => n.includes('既存防撞守衛：略過 0 列') && n.includes('此數字為實測值'))).toBe(true)
+      expect(runsReport.notes.some((n) => n.includes('未評估'))).toBe(false)
 
       const runsInsertCalls = fake.calls.filter((c) => c.sql.startsWith('INSERT IGNORE INTO runs'))
       expect(runsInsertCalls.length).toBe(1)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('(d) a7-D42：無 pool（--dry-run 不連 MySQL）→ 守衛印「未評估」，不得印成 0', async () => {
+    const dir = tmpDir()
+    try {
+      const key = 'FAQ-9002.2026-08-22T00-00-00-000Z'
+      const dbPath = createGuardFixtureDb(dir, [{ key, ticket: 'FAQ-9002', stdoutPath: '/logs/FAQ-9002.stdout.log' }])
+
+      const [runsReport] = await runBackfill({ snapshotPath: dbPath, dryRun: true }, { pool: undefined })
+
+      // 未評估 ≠ 實測 0：必須有「未評估」字樣與「僅真跑時可得」警語，且不得出現「略過 N 列」的實測措辭。
+      expect(runsReport.notes.some((n) => n.includes('既存防撞守衛：未評估') && n.includes('僅真跑時可得'))).toBe(true)
+      expect(runsReport.notes.some((n) => n.includes('既存防撞守衛：略過'))).toBe(false)
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }
