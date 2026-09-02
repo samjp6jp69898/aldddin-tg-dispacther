@@ -134,3 +134,50 @@ export function describeTicketProgress(ticket: string, opts: ProgressOpts = {}):
   }
   return describeBugProgress(ticket, now, opts.debugDir ?? DEFAULT_DEBUG_DIR, opts.worktreeDir ?? DEFAULT_WORKTREE_DIR)
 }
+
+// ---- 結構化版本（供 worker /jobs/:ticket 回給 head 監控台畫表格用，2026-09-01）----
+// 跟上面 describeBugProgress／describeDemandProgress 各自獨立重算，不共用
+// 中間狀態：兩邊資料來源（Debug 產物 mtime／demand-pipeline.log 行）本來就
+// 不同，硬拆共用函式反而增加耦合，見檔頭「純讀取」原則。
+
+export type ProgressStage = { key: string; label: string; done: boolean; current: boolean; at: string | null }
+
+function bugProgressStages(ticket: string, debugDir: string, worktreeDir: string): ProgressStage[] {
+  const dir = join(debugDir, ticket)
+  if (!existsSync(dir)) return []
+  const stages: ProgressStage[] = []
+  for (const { key, label } of BUG_STAGE_FILES) {
+    const f = join(dir, `${ticket}-${key}.md`)
+    if (!existsSync(f)) continue
+    stages.push({ key, label, done: true, current: false, at: new Date(statSync(f).mtimeMs).toISOString() })
+  }
+  const reviewerFile = readdirSync(dir).find(name => name.toLowerCase().includes('reviewer'))
+  if (reviewerFile) {
+    stages.push({ key: 'reviewer', label: 'Step6 reviewer', done: true, current: false, at: new Date(statSync(join(dir, reviewerFile)).mtimeMs).toISOString() })
+  }
+  if (stages.length > 0) stages[stages.length - 1]!.current = true
+  stages.push({ key: 'worktree', label: 'Worktree（Step4+）', done: existsSync(join(worktreeDir, ticket)), current: false, at: null })
+  return stages
+}
+
+function demandProgressStages(ticket: string, demandLogPath: string, planDir: string): ProgressStage[] {
+  if (!existsSync(demandLogPath)) return []
+  const matched = readFileSync(demandLogPath, 'utf8')
+    .split('\n')
+    .filter(line => line.includes(`${ticket} `))
+  const stages: ProgressStage[] = matched.map((line, i) => {
+    const m = /^(\S+)\s(.*)$/.exec(line)
+    return { key: `log-${i}`, label: m ? m[2]! : line, done: true, current: i === matched.length - 1, at: m ? m[1]! : null }
+  })
+  stages.push({ key: 'plan', label: 'plan.md 產出', done: existsSync(join(planDir, `${ticket}-plan.md`)), current: false, at: null })
+  return stages
+}
+
+/** 供 /jobs/:ticket 表格化用：呼叫前應先用 isTicketLocked 確認鎖存在，跟
+ * describeTicketProgress 同一紀律。未鎖或查無產物回空陣列。 */
+export function getTicketProgressStages(ticket: string, opts: ProgressOpts = {}): ProgressStage[] {
+  if (ticket.startsWith('ALDREQ-')) {
+    return demandProgressStages(ticket, opts.demandLogPath ?? DEFAULT_DEMAND_LOG, opts.planDir ?? DEFAULT_PLAN_DIR)
+  }
+  return bugProgressStages(ticket, opts.debugDir ?? DEFAULT_DEBUG_DIR, opts.worktreeDir ?? DEFAULT_WORKTREE_DIR)
+}

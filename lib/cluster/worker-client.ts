@@ -1,6 +1,7 @@
 import { CLUSTER_TOKEN_HEADER } from './cluster-auth.ts'
 import type { SubmitResult } from '../pipeline-runner/pipeline-queue.ts'
 import type { TechUser } from '../user-resolution/tech-user.ts'
+import type { ProgressStage } from '../pipeline-runner/ticket-progress.ts'
 
 // head → worker 的 HTTP client。所有呼叫都帶 AbortSignal.timeout——這是
 // 網路 I/O 的逾時上限（打不通就放棄、走下一個候選），不是用等待解決任何
@@ -42,7 +43,7 @@ export type PostJobResult =
    * 已接單、交給 remote-sweeper 事後校正。 */
   | { accepted: false; reason: 'ambiguous' }
 
-export type JobStatus = { locked: boolean; queueState: 'running' | 'queued' | null; progress: string | null }
+export type JobStatus = { locked: boolean; queueState: 'running' | 'queued' | null; progress: string | null; stages?: ProgressStage[] }
 
 function headers(secret: string): Record<string, string> {
   return { [CLUSTER_TOKEN_HEADER]: secret, 'content-type': 'application/json' }

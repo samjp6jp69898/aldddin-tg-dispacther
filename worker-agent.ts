@@ -44,7 +44,7 @@ import {
   registerDemandPipelineExitListener,
 } from './lib/pipeline-runner/spawn-demand-pipeline.ts'
 import { createLocalActivity } from './lib/cluster/local-activity.ts'
-import { isTicketLocked, describeTicketProgress } from './lib/pipeline-runner/ticket-progress.ts'
+import { isTicketLocked, describeTicketProgress, getTicketProgressStages } from './lib/pipeline-runner/ticket-progress.ts'
 import { ensureTrackerPending } from './lib/pipeline-runner/tracker-sync.ts'
 import { startStaleLockReaper } from './lib/pipeline-runner/stale-lock-reaper.ts'
 import type { TechUser } from './lib/user-resolution/tech-user.ts'
@@ -236,6 +236,7 @@ app.get('/jobs/:ticket', guard, c => {
     locked,
     queueState,
     progress: locked ? describeTicketProgress(ticket) : null,
+    stages: locked ? getTicketProgressStages(ticket) : [],
   })
 })
 
