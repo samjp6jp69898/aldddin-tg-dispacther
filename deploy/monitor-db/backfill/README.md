@@ -99,7 +99,19 @@ WAL 踩坑（impl-constraints-addendum §4）：讀 `monitor.sqlite` **禁止 cp
   2. **一次跑完，不分批跨版本**：`INSERT IGNORE` 的安全性建立在「所有列由同一版
      mapping 寫入」——第一批跑完後若 mapping 被改過再跑第二批，先寫的列用舊 mapping
      且不會被修正、也不會報錯，這是 `INSERT IGNORE` 最陰的失敗模式。
-  3. **既存防撞守衛的驗收檢查（b5 對線定案）**：回填跑完後執行
+  3. **events 去重前提探針（b5 對線定案，必跑非引用）**：開跑前執行
+     `bun deploy/monitor-db/backfill/precheck-events-dedup.ts`（唯讀）。它驗的是
+     「兩軌 (service, raw) 逐位元一致」這個 `uq_service_raw` 跨寫入者去重的**前提**——
+     2026-09-02 實測 1738/1738 全命中、would-insert=0（本探針與 b5 獨立實測逐位一致），
+     但那是快照不是恆真：insertAuditLine / audit-ingester 若改了 raw 處理，前提會
+     **無聲失效**。would-insert 非零不必然錯（sqlite 可能真的累積了 mysql 沒有的事件），
+     但每一筆都要能被解釋；解釋不了＝前提已破，停下上呈。**注意 events 回填現況是
+     no-op**（mysql 已有全部 1738 筆）——「回填 events 會正確去重」在回填當天才第一次
+     真跑，風險浮現的情境是 sqlite 累積了 mysql 沒有的事件（如 ingester 停機期間）。
+     回填後對帳恆等式延伸：`mcp_usage` 列數增量必須等於探針的 would-insert 數。
+     弱鍵啟發式重複檢查（如 (service,ts,identity)）**不採**——b5 於乾淨資料實測
+     9 組全誤報，誤報恆紅的檢查比沒有檢查更糟。
+  4. **既存防撞守衛的驗收檢查（b5 對線定案）**：回填跑完後執行
      `SELECT legacy_key, COUNT(*) FROM runs WHERE legacy_key IS NOT NULL GROUP BY legacy_key
      HAVING COUNT(*)>1`，結果必須為空。**`WHERE legacy_key IS NOT NULL` 不可省**：
      cancel placeholder 路徑（`lib/monitor-db/writes.ts:304` 的 `input.legacyKey ?? null`）
