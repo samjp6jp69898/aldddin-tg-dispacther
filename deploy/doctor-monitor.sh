@@ -172,14 +172,16 @@ if [ -f "$TGMON/.env" ] && [ -f "$TGMON/.env.example" ] && grep -q 'MON_DB_ENABL
   fi
   TGMON_PID=$(launchctl list | awk '$3=="com.aladdin.tg-monitor"{print $1}')
   if [ -n "$TGMON_PID" ] && [ "$TGMON_PID" != "-" ] && curl -s -o /dev/null -w '' "http://127.0.0.1:8799/" ; then
-    HC=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:8799/")
-    # 302 也算正常：ff 的 7818207（2026-09-02）刪掉舊版 public/index.html 之後，
-    # `/` 改成導向 `/next/`（React 版是唯一前端）。原本只認 200，那次改動之後這一項
-    # 就恆紅，`[ "$ERRORS" -eq 0 ]` 永遠不成立、整份 doctor 的驗收價值歸零。
-    case "$HC" in
-      200|302) ok "tg-monitor 8799 正常回應 HTTP $HC (pid=$TGMON_PID)" ;;
-      *)       err "tg-monitor 8799 回應異常: $HC" ;;
-    esac
+    # `-L` 跟隨導向、驗**最終**狀態碼：ff 的 7818207（2026-09-02）刪掉舊版
+    # public/index.html 之後，`/` 改成導向 `/next/`（React 版是唯一前端），原本
+    # 只認 200 的寫法從那次起就恆紅，`[ "$ERRORS" -eq 0 ]` 永遠不成立、整份
+    # doctor 的驗收價值歸零。
+    # 用 `-L` 而不是「多接受一個 302」或「改打 /next/」：前者只修掉這一個狀態碼、
+    # 後者只是把一個寫死路徑換成另一個，下次前端再動入口就再壞一次；`-L` 讓這個
+    # 檢查對「`/` 到底回 200 還是 3xx」永久不敏感——它問的本來就是「這個服務的
+    # 首頁最後拿得到嗎」。（a7 2026-09-02 裁定；`/` 維持 302 不改回 200。）
+    HC=$(curl -sL -o /dev/null -w '%{http_code}' "http://127.0.0.1:8799/")
+    [ "$HC" = "200" ] && ok "tg-monitor 8799 正常回應（跟隨導向後 HTTP ${HC}, pid=${TGMON_PID}）" || err "tg-monitor 8799 回應異常: $HC"
   else
     err "tg-monitor 未在跑或 8799 無回應"
   fi
