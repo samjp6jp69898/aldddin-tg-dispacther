@@ -118,16 +118,22 @@ VALUES (?, ?, ?, ?, ?, ?, ?)
  * SET 的賦值運算式內（`IF(...)`），這是 ODKU 語法的結構性限制，不是本檔選擇偏離
  * R4 的精神（R4 要防的是「WHERE 條件被誤放進看似無條件的地方」，這裡的 IF 守衛
  * 條件與 R4 的 WHERE 守衛條件語意等價，只是語法位置被 ODKU 逼到 SET 裡）。
+ *
+ * 欄名必須全限定（`mcp_tokens.x`）：用了 row alias `AS new` 後，SET 運算式裡的
+ * 未限定欄名同時可解析成表欄與 alias 欄，MySQL 8.4.6 直接 ERROR 1052 ambiguous
+ * （2026-09-02 dry-run 真 DB 實測抓到；fake executor 不 parse SQL 測不到這類）。
+ * 本 SQL 逐字通過真 mon-mysql 驗證：撞未撤銷列 affected=2 四欄更新、撞已撤銷列
+ * affected=0 四欄 byte 不變（scratchpad p5dry/odku-probe2.sql 為最小重現）。
  */
 export const ISSUE_UPSERT_SQL = `
 INSERT INTO mcp_tokens
   (server, env, token_id, token_enc, token_bidx, issued_at, display_name)
 VALUES (?, ?, ?, ?, ?, ?, ?) AS new
 ON DUPLICATE KEY UPDATE
-  token_enc = IF(revoked_at IS NULL, new.token_enc, token_enc),
-  token_bidx = IF(revoked_at IS NULL, new.token_bidx, token_bidx),
-  issued_at = IF(revoked_at IS NULL, new.issued_at, issued_at),
-  display_name = IF(revoked_at IS NULL, new.display_name, display_name)
+  token_enc = IF(mcp_tokens.revoked_at IS NULL, new.token_enc, mcp_tokens.token_enc),
+  token_bidx = IF(mcp_tokens.revoked_at IS NULL, new.token_bidx, mcp_tokens.token_bidx),
+  issued_at = IF(mcp_tokens.revoked_at IS NULL, new.issued_at, mcp_tokens.issued_at),
+  display_name = IF(mcp_tokens.revoked_at IS NULL, new.display_name, mcp_tokens.display_name)
 `.trim()
 
 /**
