@@ -63,14 +63,14 @@ mkdir -p "$ALADDIN/worktrees" "$DISPATCHER/logs" 2>/dev/null && ok "worktrees/ �
 [ -d "$ALADDIN/obsidian" ] && mkdir -p "$ALADDIN/obsidian/Debug"
 
 echo "== 6. .env（不代辦，只檢查）=="
-if [ -f "$ALADDIN/.env" ]; then
+if [ -f "$DISPATCHER/.env" ]; then
   MISSING=""
-  for KEY in CLUSTER_SHARED_SECRET CLUSTER_HEAD_URL CLUSTER_WORKER_NAME CLUSTER_WORKER_URL TG_DISPATCH_BOT_TOKEN ALD_NOTION_TOKEN; do
-    grep -q "^${KEY}=" "$ALADDIN/.env" || MISSING="$MISSING $KEY"
+  for KEY in CLUSTER_SHARED_SECRET CLUSTER_HEAD_URL CLUSTER_WORKER_NAME CLUSTER_WORKER_URL TG_DISPATCH_BOT_TOKEN ALD_NOTION_TOKEN MON_DB_ENABLED MON_DB_HOST MON_DB_PORT MON_DB_SCHEMA MON_DB_USER MON_DB_PASSWORD; do
+    grep -q "^${KEY}=" "$DISPATCHER/.env" || MISSING="$MISSING $KEY"
   done
-  if [ -z "$MISSING" ]; then ok ".env 必要 key 齊全"; else todo ".env 缺 key：${MISSING}（CLUSTER_* 見 launchd/run-worker-agent.sh 檔頭說明；其餘從 head 的 .env 複製）"; fi
+  if [ -z "$MISSING" ]; then ok ".env 必要 key 齊全"; else todo ".env 缺 key：${MISSING}（CLUSTER_* 見 launchd/run-worker-agent.sh 檔頭說明；其餘從 head 的 .env 複製；MON_* 由 head 在 Phase 3 scp 時寫入，worker 端 MON_DB_HOST=127.0.0.1、MON_DB_PORT=3307、MON_DB_USER=mon_exec）"; fi
 else
-  todo "從 head 安全複製 .env 到 $ALADDIN/.env（AirDrop/scp/USB，不走會落地存放的通道），再補 CLUSTER_WORKER_NAME / CLUSTER_WORKER_URL 為本機值"
+  todo "從 head 安全複製 .env 到 $DISPATCHER/.env（AirDrop/scp/USB，不走會落地存放的通道），再補 CLUSTER_WORKER_NAME / CLUSTER_WORKER_URL 為本機值"
 fi
 
 echo "== 7. launchd（worker agent 常駐）=="

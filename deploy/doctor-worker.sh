@@ -70,6 +70,52 @@ else
   bad "$ENV_FILE 不存在"
 fi
 
+echo "== 監控 DB（Phase 3+）=="
+# 第 1、2 項是反向斷言（權限、禁止金鑰），任何時期都該成立，不受下方
+# 「尚未佈建」前置豁免——即使 Phase 3 還沒做，.env 權限與金鑰缺席本來就該通過。
+if [ -f "$ENV_FILE" ]; then
+  PERM=$(stat -f %Lp "$ENV_FILE" 2>/dev/null)
+  [ "$PERM" = "600" ] && ok ".env 權限 600" || bad ".env 權限是 ${PERM:-?}（非 600，BLOCKER-D1 硬檢查）：chmod 600 $ENV_FILE"
+else
+  bad "$ENV_FILE 不存在，無法檢查權限"
+fi
+
+if [ -f "$ENV_FILE" ]; then
+  LEAKED=""
+  for PAT in '^MON_FIELD_KEY' '^MON_BIDX_KEY' '^MON_DB_ROOT_PASSWORD'; do
+    grep -qE "$PAT" "$ENV_FILE" 2>/dev/null && LEAKED="$LEAKED $PAT"
+  done
+  [ -z "$LEAKED" ] && ok ".env 不含金鑰（MON_FIELD_KEY_*／MON_BIDX_KEY／MON_DB_ROOT_PASSWORD）" || bad ".env 含不該出現在 worker 的金鑰：${LEAKED}（金鑰只在 head，§4.2 反向斷言，立即撤換）"
+fi
+ENVLEAK=""
+for PAT in MON_FIELD_KEY MON_BIDX_KEY MON_DB_ROOT_PASSWORD; do
+  printenv | grep -q "^${PAT}" && ENVLEAK="$ENVLEAK $PAT"
+done
+[ -z "$ENVLEAK" ] && ok "行程環境不含金鑰" || bad "行程環境含不該出現的金鑰：${ENVLEAK}"
+
+if [ -f "$ENV_FILE" ] && grep -q '^MON_DB_' "$ENV_FILE" 2>/dev/null; then
+  MON_DB_USER="$(envval MON_DB_USER)"
+  [ "$MON_DB_USER" = "mon_exec" ] && ok "MON_DB_USER=mon_exec" || bad "MON_DB_USER=${MON_DB_USER:-<空>}（worker 不得拿到其他帳號，必須是 mon_exec）"
+
+  MON_DB_HOST="$(envval MON_DB_HOST)"
+  MON_DB_PORT="$(envval MON_DB_PORT)"
+  [ "$MON_DB_HOST" = "127.0.0.1" ] && ok "MON_DB_HOST=127.0.0.1" || bad "MON_DB_HOST=${MON_DB_HOST:-<空>}（worker 走 tunnel，應固定 127.0.0.1，見 §3.1）"
+  [ "$MON_DB_PORT" = "3307" ] && ok "MON_DB_PORT=3307" || bad "MON_DB_PORT=${MON_DB_PORT:-<空>}（worker 走 tunnel，應固定 3307，見 §3.1）"
+
+  if nc -z -G 2 127.0.0.1 3307 >/dev/null 2>&1; then
+    ok "127.0.0.1:3307 通（monitor-db tunnel）"
+  else
+    bad "127.0.0.1:3307 不通：檢查 head 的 monitor-tunnel job（com.aladdin.monitor-tunnel.<worker>）"
+  fi
+  if nc -z -G 2 127.0.0.1 9429 >/dev/null 2>&1; then
+    ok "127.0.0.1:9429 通（monitor-log-intake tunnel）"
+  else
+    bad "127.0.0.1:9429 不通：檢查 head 的 monitor-tunnel job（com.aladdin.monitor-tunnel.<worker>）"
+  fi
+else
+  info "監控 DB 尚未佈建（Phase 3 前正常），略過本節其餘檢查"
+fi
+
 echo "== .env（aladdin_ai/.env.local，pipeline 用）=="
 if [ -f "$ALADDIN_AI_ENV_FILE" ]; then
   ALD_NOTION_TOKEN=$(grep -m1 '^ALD_NOTION_TOKEN=' "$ALADDIN_AI_ENV_FILE" | cut -d= -f2- | tr -d '\r\n')
