@@ -1,0 +1,5 @@
+# repo 根的 `logs/` 規則會吃到本目錄的測試 fixture（__fixtures__/logs/ 與其中
+# 模擬 aladdin_mcps 版面的 */logs/ 子目錄）。fixture 是假資料、必須進版控，
+# 在此以較深層 .gitignore（優先權高於根層）反向重納。
+!__fixtures__/logs/
+!__fixtures__/logs/**

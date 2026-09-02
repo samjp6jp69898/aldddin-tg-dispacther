@@ -1,0 +1,16 @@
+{
+  "tokens": [
+    {
+      "id": "fake-tester-one",
+      "token": "FAKE_TOKEN_VALUE_AAAAAAAAAAAAAAAAAAAAAAAA",
+      "display_name": "Fake Tester One",
+      "issued_at": "2026-01-01T00:00:00.000Z"
+    },
+    {
+      "id": "fake-tester-two",
+      "token": "FAKE_TOKEN_VALUE_BBBBBBBBBBBBBBBBBBBBBBBB",
+      "display_name": "Fake Tester Two",
+      "issued_at": "2026-01-02"
+    }
+  ]
+}

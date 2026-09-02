@@ -1,0 +1,5 @@
+{"chat_id":"700000001","first_name":"Fake","last_name":"One","ts":"2026-08-01T00:00:00.000Z","username":"fakeone"}
+{"chat_id":"700000002","ts":"2026-08-02T00:00:00.000Z"}
+not-json-garbage-line
+{"first_name":"NoChatId","ts":"2026-08-03T00:00:00.000Z"}
+{"chat_id":"700000003","ts":"invalid-ts-format"}

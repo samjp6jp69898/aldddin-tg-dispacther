@@ -1,0 +1,4 @@
+notion_user_name,notion_user_id,email,pushed_repos,tg_chat_id
+Fake User One,fake-id-0001,fake_one@example.test,abu;agrabah,111111111
+Fake User Two,fake-id-0002,fake_two@example.test,rajah,
+Fake User Three,fake-id-0003,fake_three@example.test,,222222222
