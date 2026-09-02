@@ -296,9 +296,9 @@ if [ -z "$READ_SRC_JSON" ]; then
 elif echo "$READ_SRC_JSON" | grep -q '"effective"'; then
   EFFECTIVE=$(echo "$READ_SRC_JSON" | sed -E 's/.*"effective":"([^"]*)".*/\1/')
   if echo "$READ_SRC_JSON" | grep -q '"degraded":true'; then
-    err "讀取面靜默降級中：要的是 mysql，實際在跑 $EFFECTIVE（查 tg-monitor stderr 的探針失敗原因）"
+    err "讀取面靜默降級中：要的是 mysql，實際在跑 ${EFFECTIVE}（查 tg-monitor stderr 的探針失敗原因）"
   else
-    ok "讀取面資料源 = $EFFECTIVE（無降級）"
+    ok "讀取面資料源 = ${EFFECTIVE}（無降級）"
   fi
 else
   napb 8 "tg-monitor 尚未重啟載入含 /api/read-source 的版本（回應：${READ_SRC_JSON:0:60}）"

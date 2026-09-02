@@ -129,13 +129,13 @@ while IFS=$'\t' read -r NAME HOST DISABLED; do
   RES=$(printf '%s\n' "$OUT" | grep -m1 "^REMOTE_RESULT")
   if [ $RC -ne 0 ] || [ -z "$RES" ]; then
     REASON=$(printf '%s\n' "$OUT" | grep -m1 "REMOTE_FAIL\|Permission denied\|Connection refused\|timed out\|No route" | cut -c1-160)
-    echo "WORKER_FAIL $NAME ${REASON:-ssh exit=$RC（Remote Login 未開 / 公鑰未佈署 / 網路不通，見檔頭一次性前提）}"; FAIL=$((FAIL+1)); continue
+    echo "WORKER_FAIL $NAME ${REASON:-ssh exit=${RC}（Remote Login 未開 / 公鑰未佈署 / 網路不通，見檔頭一次性前提）}"; FAIL=$((FAIL+1)); continue
   fi
   GOT_AI=$(printf '%s' "$RES" | sed -E 's/.*aladdin_ai=([0-9a-f]+).*/\1/')
   GOT_TD=$(printf '%s' "$RES" | sed -E 's/.*telegram-dispatcher=([0-9a-f]+).*/\1/')
   GOT_MCPS=$(printf '%s' "$RES" | sed -E 's/.*aladdin_mcps=([0-9a-f]+).*/\1/')
   if [ "$GOT_AI" != "$TARGET_AI" ] || [ "$GOT_TD" != "$TARGET_TD" ] || [ "$GOT_MCPS" != "$TARGET_MCPS" ]; then
-    echo "WORKER_FAIL $NAME pull 後版本不符（aladdin_ai=$GOT_AI≠$TARGET_AI 或 telegram-dispatcher=$GOT_TD≠$TARGET_TD 或 aladdin_mcps=$GOT_MCPS≠$TARGET_MCPS）"; FAIL=$((FAIL+1)); continue
+    echo "WORKER_FAIL $NAME pull 後版本不符（aladdin_ai=${GOT_AI}≠$TARGET_AI 或 telegram-dispatcher=${GOT_TD}≠$TARGET_TD 或 aladdin_mcps=${GOT_MCPS}≠${TARGET_MCPS}）"; FAIL=$((FAIL+1)); continue
   fi
   echo "WORKER_OK $NAME ${RES#REMOTE_RESULT }"; OK=$((OK+1))
 done <<<"$WORKERS"
