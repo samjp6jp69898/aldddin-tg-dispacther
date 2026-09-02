@@ -2,6 +2,7 @@ import { execFile } from 'node:child_process'
 import { mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
+import { isMonitorDbEnabled } from '../monitor-db/env.ts'
 
 const execFileAsync = promisify(execFile)
 
@@ -37,6 +38,23 @@ const TRACE_DIR = '/Users/user/aladdin/telegram-dispatcher/logs/agent-traces'
 
 export type ClaudeTrace = { ticket: string; stage: string }
 
+/**
+ * trace 檔要不要帶 `runId` 欄（plan-db-as-truth v2 MJ-12 / v3 Phase 4）：
+ * Phase 4 的 agent_runs collector 用它把這份 trace 精確掛到 `runs` 的那一列，
+ * 省掉「(host, ticket) 對回 runs」的模糊對位。
+ *
+ * **`MON_DB_ENABLED` 關閉時一律回 `undefined`（欄位整個不出現）**，不是回
+ * `null`：`MON_RUN_ID` 是 spawn 端無條件設定的（`spawn-create-mr.ts:370` /
+ * `spawn-demand-pipeline.ts:140` 都在 flag 之外鑄 run_id 並塞進子行程環境），
+ * 所以若這裡不看 flag，flag=0 的機器上 trace 檔會多出一個欄位，違反 §9.0(B)
+ * 「flag 關閉時行為與遷移前逐位元組相同」的硬驗收。`JSON.stringify` 會直接
+ * 略過值為 `undefined` 的鍵，因此關閉時產出的 JSON 與本次改動前完全相同。
+ */
+export function runIdForTrace(): string | null | undefined {
+  if (!isMonitorDbEnabled()) return undefined
+  return (process.env.MON_RUN_ID ?? '').trim() || null
+}
+
 function writeTrace(trace: ClaudeTrace, body: Record<string, unknown>) {
   // bun test 會設 NODE_ENV=test；測試（如 repo-scope-gate.test.ts 會真打 claude）
   // 不該在正式 trace 目錄留下假票號的檔案。
@@ -46,7 +64,11 @@ function writeTrace(trace: ClaudeTrace, body: Record<string, unknown>) {
     mkdirSync(dir, { recursive: true })
     const stamp = String(body.startedAt).replace(/[:.]/g, '-')
     const safeStage = trace.stage.replace(/[^A-Za-z0-9_-]/g, '_')
-    writeFileSync(join(dir, `${stamp}-${safeStage}.json`), JSON.stringify({ ticket: trace.ticket, stage: trace.stage, ...body }), 'utf8')
+    writeFileSync(
+      join(dir, `${stamp}-${safeStage}.json`),
+      JSON.stringify({ ticket: trace.ticket, stage: trace.stage, ...body, runId: runIdForTrace() }),
+      'utf8',
+    )
   } catch (err) {
     console.error(`agent trace 落地失敗（${trace.ticket}/${trace.stage}）: ${err}`)
   }

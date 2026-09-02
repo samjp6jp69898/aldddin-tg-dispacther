@@ -17,6 +17,7 @@ import { recoverDemandQueue, hasDemandTicketActive } from './lib/pipeline-runner
 import { registerClusterRoutes, initClusterHead } from './lib/cluster/cluster-head.ts'
 import { startMonitorMaintenance, runRestartSweep } from './lib/monitor-db/maintenance.ts'
 import { declareMonitorRole } from './lib/monitor-db/env.ts'
+import { startMonitorCollectors } from './lib/monitor-db/collectors/index.ts'
 
 registerHandlers(bot)
 
@@ -250,6 +251,12 @@ void runRestartSweep(
 startMonitorMaintenance({
   isTicketActive: ticket => (ticket.startsWith('FAQ-') ? hasBugTicketActive(ticket) !== null : hasDemandTicketActive(ticket) !== null),
 })
+
+// 【plan §9 Phase 4】collectors：agent trace / bug stdout → agent_runs（head 與
+// worker 都收）＋ hosted MCP 稽核 jsonl → mcp_usage（head only，§11.1 授權
+// 對映：mon_exec 碰不到 mcp_usage）。isMonitorDbEnabled()=false 時內部整段
+// no-op（不建 timer、不取 pool、不碰 logs/spool/），啟動失敗只 WARN 不外拋。
+startMonitorCollectors({ role: 'mon_head' })
 
 const port = Number(process.env.PORT ?? 8787)
 

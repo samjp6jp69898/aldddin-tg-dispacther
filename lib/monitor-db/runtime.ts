@@ -109,16 +109,26 @@ export function getLongLivedMonitorSpoolWriter(): SpoolWriterHandle {
  * 就是 `input` 本身）。呼叫端永遠不 await 這個函式——回傳 `Promise<void>`
  * 只是為了讓測試能確定性地等它跑完（`await`），不是要呼叫端真的接住它；
  * production 呼叫點一律不接回傳值。
+ *
+ * 2026-09-02 裁定（Phase 4）：`run_id` 硬規則改為 per-fn（見 spool/types.ts 與
+ * spool/writer.ts 的 `RUN_SCOPED_SPOOL_FNS`）。因此本函式的輸入型別放寬成
+ * 「`runId` 可有可無」——`file_offsets` / `mcp_usage` 這類**結構上沒有
+ * run_id** 的寫入才寫得進 spool。runs/agent_runs 類的 fn 仍由 writer.ts 當場
+ * 拒收空 run_id，防線沒有降低。
  */
-export function dispatchMonitorWrite<A extends { runId: string }>(fn: string, input: A, call: (pool: MonitorDbExecutor) => Promise<unknown>): Promise<void> {
+export function dispatchMonitorWrite<A extends { runId?: string | null }>(
+  fn: string,
+  input: A,
+  call: (pool: MonitorDbExecutor) => Promise<unknown>,
+): Promise<void> {
   return (async () => {
     const enabled = isMonitorDbEnabled() || monitorPoolOverride !== undefined
     if (!enabled) return
     const fallbackToSpool = (reason: unknown) => {
       try {
-        getLongLivedMonitorSpoolWriter().append({ ts: new Date().toISOString(), host: MON_HOST, run_id: input.runId, fn, args: [input] })
+        getLongLivedMonitorSpoolWriter().append({ ts: new Date().toISOString(), host: MON_HOST, run_id: input.runId ?? null, fn, args: [input] })
       } catch (spoolErr) {
-        console.error(`monitor-db: ${fn}(run_id=${input.runId}) 寫入與落 spool 都失敗，本次寫入遺失: ${reason} / ${spoolErr}`)
+        console.error(`monitor-db: ${fn}(run_id=${input.runId ?? 'n/a'}) 寫入與落 spool 都失敗，本次寫入遺失: ${reason} / ${spoolErr}`)
       }
     }
     const pool = await getLongLivedMonitorPool()
@@ -155,7 +165,8 @@ export async function tryWriteOrSpool(opts: {
   budgetMs: number
   pool: MonitorDbExecutor
   spool: SpoolWriterHandle
-  runId: string
+  /** runs/agent_runs 類的 fn 必為非空字串；其餘表允許 null（per-fn 硬規則見 spool/writer.ts）。 */
+  runId: string | null
   fn: string
   args: unknown[]
   attempt: (pool: MonitorDbExecutor) => Promise<unknown>

@@ -49,6 +49,7 @@ import { ensureTrackerPending } from './lib/pipeline-runner/tracker-sync.ts'
 import { startStaleLockReaper } from './lib/pipeline-runner/stale-lock-reaper.ts'
 import { startMonitorMaintenance, runRestartSweep } from './lib/monitor-db/maintenance.ts'
 import { declareMonitorRole } from './lib/monitor-db/env.ts'
+import { startMonitorCollectors } from './lib/monitor-db/collectors/index.ts'
 import type { SubmitResult } from './lib/pipeline-runner/pipeline-queue.ts'
 import type { TechUser } from './lib/user-resolution/tech-user.ts'
 
@@ -167,6 +168,11 @@ void runRestartSweep(
 // sweeper。直接複用上面已建好的 localActivity（queue ∪ 鎖目錄 ∪ ps 三合一，
 // 不重建第二份）。isMonitorDbEnabled()=false 時內部直接 no-op。
 startMonitorMaintenance({ isTicketActive: ticket => localActivity.isActive(ticket) })
+
+// 【plan §9 Phase 4】collectors：agent trace / bug stdout → agent_runs。worker
+// 只掛這一個——`mcp_usage` 的稽核 jsonl 只在 head 上，且 mon_exec 沒有那張表
+// 的權限（§11.1 授權對映）。isMonitorDbEnabled()=false 時內部整段 no-op。
+startMonitorCollectors({ role: 'mon_exec' })
 
 // ---- HTTP 介面 ----
 
