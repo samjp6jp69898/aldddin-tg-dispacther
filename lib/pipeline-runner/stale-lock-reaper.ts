@@ -2,9 +2,11 @@ import { readdirSync, readFileSync, existsSync, mkdirSync, appendFileSync, write
 import { execFileSync } from 'node:child_process'
 import { join } from 'node:path'
 import { cleanupWorktreesForTicket } from './cleanup-worktree.ts'
-import { submitCreateMr } from './spawn-create-mr.ts'
+import { submitCreateMr, dispatchMonitorWrite } from './spawn-create-mr.ts'
 import { notifyOperator } from '../notify/operator.ts'
-import { getPipelineActiveSince, clearPipelineActive, ACTIVE_MARKER_DIR } from './active-pipeline-marker.ts'
+import { getPipelineActiveSince, clearPipelineActive, readRunIdFromActiveMarker, ACTIVE_MARKER_DIR } from './active-pipeline-marker.ts'
+import { writeRunOutcomeProvisional } from '../monitor-db/writes.ts'
+import type { RunKind } from '../monitor-db/types.ts'
 
 const LOCK_DIR = '/tmp/bug-analysis-locks'
 const BUG_LOCK_SH = '/Users/user/aladdin/scripts/bug-lock.sh'
@@ -55,14 +57,17 @@ const EXEC_TIMEOUT_MS = 30_000
 // 不嘗試用 pid 判斷 process 是否還活著：無論是鎖檔案的 pid 還是我們自己
 // spawn 的 pid，都只是短命子行程/detached 行程的 pid，直接檢查存活與否沒有
 // 意義。時間門檻本身就是結構性保證：即使 EXIT trap 完全沒機會執行（手動
-// kill -9 整組砍掉、機器斷電重開機這兩種已知情境），`timeout 7200` 這個
-// 指令本身仍會對它自己的直接子行程（claude）在 7200 秒時送
+// kill -9 整組砍掉、機器斷電重開機這兩種已知情境），`timeout 10800` 這個
+// 指令本身仍會對它自己的直接子行程（claude）在 10800 秒時送
 // SIGTERM/SIGKILL，不受父行程（bash wrapper）是否存活影響——所以只要是
-// dispatcher 自己 spawn 的 pipeline，真正的行程最晚在 spawn 之後 7200 秒
-// 左右就會結束。130 分鐘（7800 秒）在此之上留了 10 分鐘 margin，足以
+// dispatcher 自己 spawn 的 pipeline，真正的行程最晚在 spawn 之後 10800 秒
+// 左右就會結束。195 分鐘（11700 秒）在此之上留了 15 分鐘 margin
+// 【plan-db-as-truth-v3.2.md §9.0(G) 裁定：180×(130/120)≈195,同時 ≥「絕對
+// margin 讀法」190 分,取 195 分——比例 margin 與絕對 margin 兩種讀法都滿足，
+// 多出的 5 分鐘是對『180 分鐘的單本身變異更大』的合理保守】，足以
 // 涵蓋兩種收尾方式（正常結束、被 timeout 強制結束），不會誤殺一個貨真價實
 // 還在跑的 pipeline。
-const STALE_THRESHOLD_MS = 130 * 60 * 1000
+const STALE_THRESHOLD_MS = 195 * 60 * 1000
 
 // 只有 Bug pipeline（FAQ-*）自動重試：這條 pipeline 穩定、有多輪真實 E2E
 // 驗證（見 tasks.json T21/T22），重試風險可控。需求 pipeline（ALDREQ-*）刻意
@@ -152,7 +157,14 @@ export function reapStaleLocks(
     release?: (ticket: string) => void
     cleanup?: (ticket: string) => void
     clearMarker?: (ticket: string) => void
-    retry?: (ticket: string) => { ok: boolean; reason?: string }
+    /**
+     * 【plan-db-as-truth-v3.2.md §5.7 / G9】retry 血緣改為顯式參數（不靠
+     * `process.env.MON_RUN_ID` 繼承——reaper 跑在常駐行程，那個 env 恆空）：
+     * `retryOfRunId` 是被回收的那個 run 的 run_id（由 active-pipeline marker
+     * 讀出，讀不到就是 null，見下方呼叫點）。回傳值也不再吞掉新 run 的
+     * run_id（MJ-E6 指出的原型別缺口），供呼叫端記錄/測試斷言。
+     */
+    retry?: (ticket: string, retryOfRunId: string | null) => { ok: boolean; reason?: string; runId?: string }
     notify?: (text: string) => boolean
     readRetryState?: () => Record<string, number>
     writeRetryState?: (state: Record<string, number>) => void
@@ -167,7 +179,7 @@ export function reapStaleLocks(
   // 2026-08-28 起 submitCreateMr 額滿改排隊：result.ok=true 也可能是 queued
   // （排入佇列、輪到自動跑）——對這裡的語意仍算「重試已成功交付」，照舊計入
   // 重試額度。
-  const retry = deps.retry ?? ((ticket: string) => submitCreateMr(ticket))
+  const retry = deps.retry ?? ((ticket: string, retryOfRunId: string | null) => submitCreateMr(ticket, { retryOf: retryOfRunId ?? undefined }))
   const notify = deps.notify ?? notifyOperator
   const getRetryState = deps.readRetryState ?? readRetryState
   const setRetryState = deps.writeRetryState ?? writeRetryState
@@ -179,12 +191,33 @@ export function reapStaleLocks(
     const minutes = formatMinutes(ageMs)
     log(`發現逾時鎖：${ticket}（已持有 ${minutes} 分鐘，門檻 ${formatMinutes(STALE_THRESHOLD_MS)} 分鐘），開始回收`)
 
+    const isBugTicket = BUG_TICKET_RE.test(ticket)
+    const kind: RunKind = isBugTicket ? 'bug' : 'demand'
+    // 【plan-db-as-truth-v3.2.md §5.7】reaper 回收終態：在 clearMarker 把標記
+    // 檔清掉之前，先讀出它記的 run_id（本機檔案，不碰監控 DB）——這是
+    // 「reaper 不直接下 SQL、但要能顯式攜帶血緣」的前提，也是自動重試
+    // retryOfRunId 的唯一來源（reaper 跑在常駐行程，process.env.MON_RUN_ID
+    // 恆空，見上方 retry deps 註解）。讀不到（marker 寫入失敗、或這張單從
+    // 監控 DB 上線前就卡住）就是 null——不寫終態、不帶血緣，降級但不阻斷
+    // 既有的回收流程。
+    const reapedRunId = readRunIdFromActiveMarker(kind, ticket, opts.markerDir ?? ACTIVE_MARKER_DIR)
+
     release(ticket)
     try {
       cleanup(ticket)
     } catch (err) {
       log(`${ticket} 清理 worktree 時發生例外（不阻斷後續通知）: ${err}`)
     }
+
+    if (reapedRunId) {
+      const finishedAt = new Date().toISOString()
+      dispatchMonitorWrite(
+        'writeRunOutcomeProvisional',
+        { runId: reapedRunId, ticket, kind, outcome: 'unknown_reaped', outcomeSource: 'stale-lock-reaper', finishedAt },
+        pool => writeRunOutcomeProvisional(pool, { runId: reapedRunId, ticket, kind, outcome: 'unknown_reaped', outcomeSource: 'stale-lock-reaper', finishedAt }),
+      )
+    }
+
     // 標記先清掉（代表 dispatcher 不再認為自己對這張單的舊 pipeline 負責）；
     // 如果下面真的自動重試，retry() 內部的 submitCreateMr 會在 spawn 時用
     // 新的 spawn 時間重新標記，兩者不衝突。
@@ -194,7 +227,6 @@ export function reapStaleLocks(
       log(`${ticket} 清除 active-pipeline 標記時發生例外（不阻斷後續通知）: ${err}`)
     }
 
-    const isBugTicket = BUG_TICKET_RE.test(ticket)
     const priorRetries = retryState[ticket] ?? 0
     let retried = false
 
@@ -204,7 +236,7 @@ export function reapStaleLocks(
       // 剛好因為併發上限/spawn 失敗而沒有任何 pipeline 真的跑起來，這張單
       // 會被永久誤記成「已經用掉一次自動重試機會」，下次卡住時直接被判定
       // 「已達上限」，但實際上它從沒真正拿到過一次自動重試。
-      const result = retry(ticket)
+      const result = retry(ticket, reapedRunId)
       if (result.ok) {
         retried = true
         retryState[ticket] = priorRetries + 1
@@ -233,7 +265,7 @@ export function reapStaleLocks(
 
 /**
  * 週期排程（硬規則明文允許的合法用途：週期性排程器，不是拿 sleep/輪詢規避
- * 競態）。10 分鐘一次，遠低於 130 分鐘的門檻，逾時鎖最慢在門檻後 10 分鐘內
+ * 競態）。10 分鐘一次，遠低於 195 分鐘的門檻，逾時鎖最慢在門檻後 10 分鐘內
  * 會被抓到並回收。
  */
 export function startStaleLockReaper(intervalMs = 10 * 60 * 1000): ReturnType<typeof setInterval> {

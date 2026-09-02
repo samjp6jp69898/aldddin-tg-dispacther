@@ -52,6 +52,15 @@ export const KNOWN_OUTCOME_TIER: Readonly<Record<string, OutcomeTier>> = Object.
   recovered: 2,
   // tier 2（§11.2 回填：對映不到已知值域者）
   legacy_unmapped: 2,
+  // tier 2（demand pipeline 結構化 outcome，見 demand-finalize.ts
+  // demandOutcomeToRunsOutcome：全部七個值於 §6.1 R3' 分級表歸在「2 權威終態」；
+  // `success` 與 bug pipeline 共用同一個值，已在上面定義，這裡不重複）
+  already_satisfied: 2,
+  needs_clarification: 2,
+  insufficient_spec: 2,
+  setup_failed: 2,
+  implementer_error: 2,
+  unexpected_error: 2,
 })
 
 /** 三態影響列數判定（§6.3）。 */

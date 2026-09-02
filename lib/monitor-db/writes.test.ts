@@ -13,13 +13,19 @@
 import { describe, expect, test } from 'bun:test'
 import { FakeRunsDb } from './test-support/fake-runs-db.ts'
 import {
+  advanceDispatchAttempt,
+  createDispatchAttempt,
+  DISPATCH_ATTEMPT_ADVANCE_SQL,
+  DISPATCH_ATTEMPT_INSERT_SQL,
   fixCancelLateOutcome,
   writeCancelFlag,
   writeRunOutcomeAuthoritative,
   writeRunOutcomeProvisional,
   writeRunProgress,
+  type MonitorDbExecutor,
 } from './writes.ts'
 import { MON_HOST } from './env.ts'
+import type { ResultSetHeader } from 'mysql2/promise'
 
 function ident(overrides: Partial<{ runId: string; ticket: string; kind: 'bug' | 'demand' }> = {}) {
   return { runId: 'run-1', ticket: 'FAQ-1', kind: 'bug' as const, ...overrides }
@@ -271,5 +277,83 @@ describe('MON_HOST：runs 寫入函式一律不接受呼叫端傳入的 host（�
     for (const [, name, body] of blocks) {
       expect(body).not.toMatch(/\bhost\s*[:?]/i)
     }
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────
+// dispatch_attempts（§5.3）：整合修補——advanceDispatchAttempt 補
+// worker_name/worker_url（2C 回報：confirm 後永遠 NULL）。
+// ─────────────────────────────────────────────────────────────────────────
+
+interface FakeDispatchRow {
+  dispatch_id: string
+  status: string
+  status_rank: number
+  worker_name: string | null
+  worker_url: string | null
+  remote_run_id: string | null
+}
+
+class FakeDispatchAttemptsDb implements MonitorDbExecutor {
+  rows = new Map<string, FakeDispatchRow>()
+
+  async execute<T = ResultSetHeader>(sql: string, params: unknown[] = []): Promise<[T, unknown]> {
+    if (sql === DISPATCH_ATTEMPT_INSERT_SQL) {
+      const [dispatchId, , , , , status, statusRank] = params as [string, string, string, string | null, string | null, string, number]
+      this.rows.set(dispatchId, { dispatch_id: dispatchId, status, status_rank: statusRank, worker_name: null, worker_url: null, remote_run_id: null })
+      return [{ affectedRows: 1 } as unknown as T, []]
+    }
+    if (sql === DISPATCH_ATTEMPT_ADVANCE_SQL) {
+      const [status, statusRank, , , , remoteRunId, workerName, workerUrl, dispatchId, guardRank] = params as [
+        string,
+        number,
+        string | null,
+        string | null,
+        string | null,
+        string | null,
+        string | null,
+        string | null,
+        string,
+        number,
+      ]
+      const row = this.rows.get(dispatchId)
+      if (!row || !(row.status_rank < guardRank)) {
+        return [{ info: 'Rows matched: 0  Changed: 0  Warnings: 0' } as unknown as T, []]
+      }
+      row.status = status
+      row.status_rank = statusRank
+      row.remote_run_id = row.remote_run_id ?? remoteRunId
+      row.worker_name = row.worker_name ?? workerName
+      row.worker_url = row.worker_url ?? workerUrl
+      return [{ info: 'Rows matched: 1  Changed: 1  Warnings: 0' } as unknown as T, []]
+    }
+    throw new Error(`FakeDispatchAttemptsDb: 未預期的 SQL：${sql}`)
+  }
+}
+
+describe('advanceDispatchAttempt — worker_name/worker_url（整合修補：2C 回報缺口）', () => {
+  test('advance(dispatched) 帶 workerName/workerUrl → 落庫，不再永遠 NULL', async () => {
+    const db = new FakeDispatchAttemptsDb()
+    await createDispatchAttempt(db, { dispatchId: 'd-1', ticket: 'FAQ-1', kind: 'bug', status: 'dispatching', statusRank: 10 })
+    const r = await advanceDispatchAttempt(db, {
+      dispatchId: 'd-1',
+      status: 'dispatched',
+      statusRank: 20,
+      workerName: 'w1',
+      workerUrl: 'http://10.0.0.1:8801',
+    })
+    expect(r.kind).toBe('applied')
+    expect(db.rows.get('d-1')!.worker_name).toBe('w1')
+    expect(db.rows.get('d-1')!.worker_url).toBe('http://10.0.0.1:8801')
+  })
+
+  test('後續 advance(cleared) 未帶 worker 資訊 → COALESCE 不清空既有值', async () => {
+    const db = new FakeDispatchAttemptsDb()
+    await createDispatchAttempt(db, { dispatchId: 'd-1', ticket: 'FAQ-1', kind: 'bug', status: 'dispatching', statusRank: 10 })
+    await advanceDispatchAttempt(db, { dispatchId: 'd-1', status: 'dispatched', statusRank: 20, workerName: 'w1', workerUrl: 'http://10.0.0.1:8801' })
+    const r = await advanceDispatchAttempt(db, { dispatchId: 'd-1', status: 'cleared', statusRank: 100, clearReason: 'exception' })
+    expect(r.kind).toBe('applied')
+    expect(db.rows.get('d-1')!.worker_name).toBe('w1')
+    expect(db.rows.get('d-1')!.worker_url).toBe('http://10.0.0.1:8801')
   })
 })

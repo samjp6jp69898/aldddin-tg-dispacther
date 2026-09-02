@@ -12,9 +12,10 @@ import { respondUniform401 } from './lib/security/uniform-401.ts'
 import { createHealthMonitor } from './lib/webhook-server/health-monitor.ts'
 import { registerProxyRoutes } from './lib/webhook-server/mcp-proxy.ts'
 import { startStaleLockReaper } from './lib/pipeline-runner/stale-lock-reaper.ts'
-import { recoverBugQueue } from './lib/pipeline-runner/spawn-create-mr.ts'
-import { recoverDemandQueue } from './lib/pipeline-runner/spawn-demand-pipeline.ts'
+import { recoverBugQueue, hasBugTicketActive } from './lib/pipeline-runner/spawn-create-mr.ts'
+import { recoverDemandQueue, hasDemandTicketActive } from './lib/pipeline-runner/spawn-demand-pipeline.ts'
 import { registerClusterRoutes, initClusterHead } from './lib/cluster/cluster-head.ts'
+import { startMonitorMaintenance, runRestartSweep } from './lib/monitor-db/maintenance.ts'
 
 registerHandlers(bot)
 
@@ -211,11 +212,38 @@ initClusterHead()
 // 名額上限，屬已接受的取捨。
 const bugRecovered = recoverBugQueue()
 const demandRecovered = recoverDemandQueue()
-if (bugRecovered.started + bugRecovered.requeued + bugRecovered.skipped + demandRecovered.started + demandRecovered.requeued + demandRecovered.skipped > 0) {
+if (
+  bugRecovered.started.length + bugRecovered.requeued.length + bugRecovered.skipped.length + demandRecovered.started.length + demandRecovered.requeued.length + demandRecovered.skipped.length >
+  0
+) {
   console.error(
-    `telegram-dispatcher: 排隊恢復 bug(started=${bugRecovered.started}, requeued=${bugRecovered.requeued}, skipped=${bugRecovered.skipped}) demand(started=${demandRecovered.started}, requeued=${demandRecovered.requeued}, skipped=${demandRecovered.skipped})`,
+    `telegram-dispatcher: 排隊恢復 bug(started=${bugRecovered.started.length}, requeued=${bugRecovered.requeued.length}, skipped=${bugRecovered.skipped.length}) demand(started=${demandRecovered.started.length}, requeued=${demandRecovered.requeued.length}, skipped=${demandRecovered.skipped.length})`,
   )
 }
+
+// 【plan-db-as-truth-v3.md §5.6，BL-C5】seen = 上面 recoverFromDisk() 六組
+// run_id 陣列的聯集——只有 recover 這一刻的快照有意義，只跑一次，不是週期
+// tick。isMonitorDbEnabled()=false 時 runRestartSweep 內部直接 no-op。
+void runRestartSweep(
+  new Set([
+    ...bugRecovered.started,
+    ...bugRecovered.requeued,
+    ...bugRecovered.skipped,
+    ...demandRecovered.started,
+    ...demandRecovered.requeued,
+    ...demandRecovered.skipped,
+  ]),
+)
+
+// 監控 DB 週期維護（整合修補批次 item 2 + item 8）：同一 tick 內重放本機
+// spool（head 是這個 spool 目錄唯一的重放者，§6.5(d)）+ §6.6 本機 sweeper。
+// isTicketActive 用 kind 前綴（FAQ-/ALDREQ-）分流到對應的 hasXxxTicketActive，
+// head 沒有 worker 那種需要跨來源聯集的活動判定（bugQueue/demandQueue 的
+// running 集合本身就是權威，head 是這些 run 的唯一發起者）。
+// isMonitorDbEnabled()=false 時內部直接 no-op，不建 timer。
+startMonitorMaintenance({
+  isTicketActive: ticket => (ticket.startsWith('FAQ-') ? hasBugTicketActive(ticket) !== null : hasDemandTicketActive(ticket) !== null),
+})
 
 const port = Number(process.env.PORT ?? 8787)
 

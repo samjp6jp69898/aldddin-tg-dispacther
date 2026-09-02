@@ -1,4 +1,4 @@
-// 解析 T11 產生的 stdout log 檔（timeout 7200 claude -p "/create-mr:create-mr
+// 解析 T11 產生的 stdout log 檔（timeout 10800 claude -p "/create-mr:create-mr
 // {ticket}" 的**純 stdout**——T11 把 stdout/stderr 分開寫成兩個檔案，不會混進
 // stderr 雜訊），依 headless-pipeline 調查的判斷規則分類，供 T13 決定是否補發
 // 通知。格式：2026-08-26 前是 --output-format json 的單一 JSON 陣列（結束才

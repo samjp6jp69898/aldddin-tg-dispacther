@@ -35,6 +35,7 @@ function makeHarness(opts: { postResults?: Record<string, PostJobResult>; capaci
     spawnNow: () => ({ ok: false }),
   })
   const postedJobs: { worker: string; job: JobRequest; registrySnapshotAtCall: ReturnType<DispatchRegistry['get']> }[] = []
+  const dispatchAttemptCalls: { fn: 'create' | 'advance'; input: Record<string, unknown> }[] = []
   const deps: BacklogDispatcherDeps = {
     registry,
     postJob: async (w, job) => {
@@ -43,12 +44,16 @@ function makeHarness(opts: { postResults?: Record<string, PostJobResult>; capaci
       // 記錄跟著變，測試斷言就量不到「postJob 呼叫當下」的真實狀態。
       const snapshot = registry.get(job.ticket)
       postedJobs.push({ worker: w.name, job, registrySnapshotAtCall: snapshot ? { ...snapshot } : null })
-      return opts.postResults?.[w.name] ?? { accepted: true, result: { ok: true, status: 'started', pid: 1 } }
+      return opts.postResults?.[w.name] ?? { accepted: true, result: { ok: true, status: 'started', pid: 1 }, runId: null }
     },
     fetchCapacity: async w => opts.capacities?.[w.name] ?? null,
     listWorkers: () => [],
     bug: { tryDispatchFront: attempt => bugQueue.tryDispatchFront(attempt) },
     demand: { tryDispatchFront: attempt => demandQueue.tryDispatchFront(attempt) },
+    dispatchAttempts: {
+      create: input => dispatchAttemptCalls.push({ fn: 'create', input }),
+      advance: input => dispatchAttemptCalls.push({ fn: 'advance', input }),
+    },
   }
   return {
     dispatcher: createBacklogDispatcher(deps),
@@ -56,6 +61,7 @@ function makeHarness(opts: { postResults?: Record<string, PostJobResult>; capaci
     bugQueue,
     demandQueue,
     postedJobs,
+    dispatchAttemptCalls,
     cleanup: () => rmSync(dir, { recursive: true, force: true }),
   }
 }
@@ -87,6 +93,13 @@ describe('createBacklogDispatcher — fillFreedSlot', () => {
     expect(h.postedJobs[0]!.registrySnapshotAtCall).toMatchObject({ status: 'dispatching', ticket: 'FAQ-1' })
     expect(h.registry.get('FAQ-1')).toMatchObject({ status: 'confirmed', worker: 'w1' })
     expect(h.bugQueue.size()).toBe(0)
+    // dispatch_attempts 觀察面：create(dispatching) → advance(dispatched)，
+    // job body 帶的 dispatchId 與登記表一致（§5.3）。
+    expect(h.dispatchAttemptCalls.map(c => c.fn)).toEqual(['create', 'advance'])
+    const dispatchId = h.registry.get('FAQ-1')!.dispatchId
+    expect(h.dispatchAttemptCalls[0]!.input).toMatchObject({ dispatchId, ticket: 'FAQ-1', kind: 'bug', status: 'dispatching', statusRank: 10 })
+    expect(h.dispatchAttemptCalls[1]!.input).toMatchObject({ dispatchId, status: 'dispatched', statusRank: 20 })
+    expect(h.postedJobs[0]!.job.dispatchId).toBe(dispatchId)
     h.cleanup()
   })
 
@@ -99,13 +112,15 @@ describe('createBacklogDispatcher — fillFreedSlot', () => {
     h.cleanup()
   })
 
-  test('worker 拒絕（full/rejected/unreachable）：登記表清掉佔位，單塞回隊頭', async () => {
+  test('worker 拒絕（full/rejected/unreachable）：登記表清掉佔位，單塞回隊頭，dispatch_attempts advance(cleared, full)', async () => {
     const h = makeHarness({ postResults: { w1: { accepted: false, reason: 'full' } } })
     h.bugQueue.submit('FAQ-1', null, { resume: false })
     await h.dispatcher.fillFreedSlot('bug', worker('w1'))
     expect(h.registry.get('FAQ-1')).toBe(null)
     expect(h.bugQueue.size()).toBe(1)
     expect(h.bugQueue.has('FAQ-1')).toBe('queued')
+    expect(h.dispatchAttemptCalls.map(c => c.fn)).toEqual(['create', 'advance'])
+    expect(h.dispatchAttemptCalls[1]!.input).toMatchObject({ status: 'cleared', statusRank: 100, clearReason: 'full' })
     h.cleanup()
   })
 
@@ -154,7 +169,7 @@ describe('createBacklogDispatcher — sweepBacklog（job-done 遺失時的週期
       registry: h.registry,
       postJob: async (w, job) => {
         h.postedJobs.push({ worker: w.name, job, registrySnapshotAtCall: h.registry.get(job.ticket) })
-        return { accepted: true, result: { ok: true, status: 'started', pid: 1 } }
+        return { accepted: true, result: { ok: true, status: 'started', pid: 1 }, runId: null }
       },
       fetchCapacity: async w => (w.name === 'w1' ? { worker: 'w1', bug: idle, demand: full } : null),
       listWorkers: () => [worker('w1'), worker('w2')],
@@ -183,7 +198,7 @@ describe('createBacklogDispatcher — sweepBacklog（job-done 遺失時的週期
       registry: h.registry,
       postJob: async (w, job) => {
         h.postedJobs.push({ worker: w.name, job, registrySnapshotAtCall: h.registry.get(job.ticket) })
-        return { accepted: true, result: { ok: true, status: 'started', pid: 1 } }
+        return { accepted: true, result: { ok: true, status: 'started', pid: 1 }, runId: null }
       },
       fetchCapacity: async () => {
         fetchCalls++
@@ -211,7 +226,7 @@ describe('createBacklogDispatcher — sweepBacklog（job-done 遺失時的週期
       registry: h.registry,
       postJob: async (w, job) => {
         h.postedJobs.push({ worker: w.name, job, registrySnapshotAtCall: { ...h.registry.get(job.ticket)! } })
-        return { accepted: true, result: { ok: true, status: 'started', pid: 1 } }
+        return { accepted: true, result: { ok: true, status: 'started', pid: 1 }, runId: null }
       },
       fetchCapacity: async () => {
         if (shouldThrow) throw new Error('worker 打不通')

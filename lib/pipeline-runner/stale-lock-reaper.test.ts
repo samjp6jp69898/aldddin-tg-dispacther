@@ -1,12 +1,16 @@
-import { describe, expect, mock, test } from 'bun:test'
+import { afterEach, describe, expect, mock, test } from 'bun:test'
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { findStaleLocks, reapStaleLocks } from './stale-lock-reaper.ts'
+import { markPipelineActive } from './active-pipeline-marker.ts'
+import { __setMonitorTestOverrides, __resetMonitorTestOverrides } from './spawn-create-mr.ts'
+import { FakeRunsDb } from '../monitor-db/test-support/fake-runs-db.ts'
+import type { SpoolEntry } from '../monitor-db/spool/types.ts'
 
 const NOW = Date.parse('2026-08-23T12:00:00Z')
-const FRESH_TIME = '2026-08-23T11:55:00Z' // 5 分鐘前，遠低於 130 分鐘門檻
-const STALE_TIME = '2026-08-23T09:00:00Z' // 3 小時前，超過門檻
+const FRESH_TIME = '2026-08-23T11:55:00Z' // 5 分鐘前，遠低於 195 分鐘門檻
+const STALE_TIME = '2026-08-23T08:00:00Z' // 4 小時前，超過 195 分鐘門檻
 
 /** 建一個假的 bug-lock.sh LOCK_DIR：每個 ticket 一個目錄，內含 info 檔（內容
  * 不影響判斷，2026-08-23 起 staleness 改看 active-pipeline 標記，不看這裡的
@@ -46,7 +50,7 @@ describe('findStaleLocks', () => {
     expect(findStaleLocks({ lockDir, markerDir, now: NOW })).toEqual([])
   })
 
-  test('鎖持有時間超過 130 分鐘門檻（依 marker 時間）→ 判定逾時，含正確 ageMs', () => {
+  test('鎖持有時間超過 195 分鐘門檻（依 marker 時間）→ 判定逾時，含正確 ageMs', () => {
     const lockDir = makeLockDir(['FAQ-2'])
     const markerDir = makeMarkerDir({ 'FAQ-2': STALE_TIME })
     const result = findStaleLocks({ lockDir, markerDir, now: NOW })
@@ -55,8 +59,8 @@ describe('findStaleLocks', () => {
     expect(result[0]!.ageMs).toBe(NOW - Date.parse(STALE_TIME))
   })
 
-  test('恰好卡在門檻邊界（130 分鐘整）→ 算逾時（>= 不是 >）', () => {
-    const boundaryTime = new Date(NOW - 130 * 60 * 1000).toISOString()
+  test('恰好卡在門檻邊界（195 分鐘整）→ 算逾時（>= 不是 >）', () => {
+    const boundaryTime = new Date(NOW - 195 * 60 * 1000).toISOString()
     const lockDir = makeLockDir(['FAQ-3'])
     const markerDir = makeMarkerDir({ 'FAQ-3': boundaryTime })
     expect(findStaleLocks({ lockDir, markerDir, now: NOW })).toHaveLength(1)
@@ -95,7 +99,7 @@ describe('reapStaleLocks', () => {
     release: mock((_t: string) => {}),
     cleanup: mock((_t: string) => {}),
     clearMarker: mock((_t: string) => {}),
-    retry: mock((_t: string) => ({ ok: true })),
+    retry: mock((_t: string, _retryOfRunId: string | null) => ({ ok: true })),
     notify: mock((_t: string) => true),
     readRetryState: () => ({}) as Record<string, number>,
     writeRetryState: (_s: Record<string, number>) => {},
@@ -132,7 +136,7 @@ describe('reapStaleLocks', () => {
     expect(deps.release).toHaveBeenCalledWith('FAQ-100')
     expect(deps.cleanup).toHaveBeenCalledWith('FAQ-100')
     expect(deps.clearMarker).toHaveBeenCalledWith('FAQ-100')
-    expect(deps.retry).toHaveBeenCalledWith('FAQ-100')
+    expect(deps.retry).toHaveBeenCalledWith('FAQ-100', null)
     expect(deps.notify).toHaveBeenCalledTimes(1)
     expect(deps.notify.mock.calls[0]![0]).toContain('自動重新觸發')
     expect(result).toEqual([{ ticket: 'FAQ-100', ageMs: NOW - Date.parse(STALE_TIME), retried: true }])
@@ -156,7 +160,7 @@ describe('reapStaleLocks', () => {
     const retryState: Record<string, number> = {}
     const deps = {
       ...baseDeps(),
-      retry: mock((_t: string) => ({ ok: false, reason: 'concurrency_limit' })),
+      retry: mock((_t: string, _retryOfRunId: string | null) => ({ ok: false, reason: 'concurrency_limit' })),
       readRetryState: () => retryState,
       writeRetryState: (s: Record<string, number>) => Object.assign(retryState, s),
     }
@@ -202,3 +206,88 @@ describe('reapStaleLocks', () => {
     expect(deps.retry).toHaveBeenCalledTimes(1) // 只有 FAQ 那張會重試
   })
 })
+
+/** dispatchMonitorWrite 是 fire-and-forget（production 呼叫端不 await），
+ * 但它回傳 Promise<void>——測試用「讓出一個 macrotask」把已排入的微工作
+ * （getMonitorPool → pool.execute → 落 spool）全部跑完，確定性等待，不是猜
+ * 一段時間（v3.2 §6.5(a2) 的 fsync 批次寫、Phase 1.4 的 drainAll() 都是同一種
+ * 「跑到不再有進展為止」精神——這裡只是它在單一非同步鏈上的最小形式：目前
+ * 只有一個會贏過 1000ms 逾時 race 的 microtask 鏈，沒有其他 macrotask 介入）。 */
+function flushMicrotasks(): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, 0))
+}
+
+describe('reapStaleLocks — v3.2 §5.7：retry 血緣（顯式參數，不靠 env 繼承）與監控 DB 回收終態（tier1 unknown_reaped）', () => {
+  afterEach(() => {
+    __resetMonitorTestOverrides()
+  })
+
+  test('marker 是 v3.2 JSON 格式（帶 runId）→ retry 收到該 runId（不是 null）', async () => {
+    const fakeDb = new FakeRunsDb()
+    __setMonitorTestOverrides({ pool: fakeDb })
+
+    const lockDir = makeLockDir(['FAQ-200'])
+    const markerDir = mkdtempSync(join(tmpdir(), 'stale-marker-json-'))
+    // markPipelineActive 本身用「現在」當 startedAt，這裡只需要它產生合法的
+    // JSON 格式檔案；staleness 判斷讀的是 getPipelineActiveSince 解出的
+    // startedAt，所以額外用 findStaleLocks 的 now 覆寫成很久以後即可，不需要
+    // 直接操縱檔案內容裡的時間戳。
+    markPipelineActive('FAQ-200', { dir: markerDir, runId: '99999999-8888-7777-6666-555555555555', kind: 'bug' })
+    const farFuture = Date.now() + 400 * 60 * 1000 // 400 分鐘後，遠超過 195 分鐘門檻
+
+    const retryMock = mock((_t: string, _retryOfRunId: string | null) => ({ ok: true, runId: 'new-run-id' }))
+    const result = reapStaleLocks({ lockDir, markerDir, now: farFuture }, { ...baseDepsForJsonTest(), retry: retryMock })
+    expect(result).toHaveLength(1)
+    expect(retryMock).toHaveBeenCalledWith('FAQ-200', '99999999-8888-7777-6666-555555555555')
+
+    await flushMicrotasks()
+    const row = fakeDb.rows.get('99999999-8888-7777-6666-555555555555')
+    expect(row).not.toBeUndefined()
+    expect(row!.outcome).toBe('unknown_reaped')
+    expect(row!.outcome_tier).toBe(1)
+  })
+
+  test('marker 是舊格式（純 ISO 字串，無 runId）→ retry 收到 null，且不寫任何監控 DB 終態（沒有 runId 可寫）', async () => {
+    const fakeDb = new FakeRunsDb()
+    __setMonitorTestOverrides({ pool: fakeDb })
+
+    const lockDir = makeLockDir(['FAQ-201'])
+    const markerDir = makeMarkerDir({ 'FAQ-201': STALE_TIME })
+    const retryMock = mock((_t: string, retryOfRunId: string | null) => ({ ok: true }))
+    reapStaleLocks({ lockDir, markerDir, now: NOW }, { ...baseDepsForJsonTest(), retry: retryMock })
+    expect(retryMock).toHaveBeenCalledWith('FAQ-201', null)
+
+    await flushMicrotasks()
+    expect(fakeDb.calls.length).toBe(0)
+  })
+
+  test('MON_DB_ENABLED 關閉、無覆寫時 → 完全不觸碰監控 DB（reapStaleLocks 既有行為不受影響）', async () => {
+    __resetMonitorTestOverrides()
+    const prevFlag = process.env.MON_DB_ENABLED
+    delete process.env.MON_DB_ENABLED
+    try {
+      const lockDir = makeLockDir(['FAQ-202'])
+      const markerDir = mkdtempSync(join(tmpdir(), 'stale-marker-json-'))
+      markPipelineActive('FAQ-202', { dir: markerDir, runId: '11111111-2222-3333-4444-666666666666', kind: 'bug' })
+      const farFuture = Date.now() + 400 * 60 * 1000
+      const result = reapStaleLocks({ lockDir, markerDir, now: farFuture }, baseDepsForJsonTest())
+      expect(result).toHaveLength(1) // 既有的回收流程（release/cleanup/clearMarker/retry）完全不受監控 DB 影響
+      await flushMicrotasks()
+    } finally {
+      if (prevFlag === undefined) delete process.env.MON_DB_ENABLED
+      else process.env.MON_DB_ENABLED = prevFlag
+    }
+  })
+})
+
+function baseDepsForJsonTest() {
+  return {
+    release: mock((_t: string) => {}),
+    cleanup: mock((_t: string) => {}),
+    clearMarker: mock((_t: string) => {}),
+    retry: mock((_t: string, _retryOfRunId: string | null) => ({ ok: true })),
+    notify: mock((_t: string) => true),
+    readRetryState: () => ({}) as Record<string, number>,
+    writeRetryState: (_s: Record<string, number>) => {},
+  }
+}

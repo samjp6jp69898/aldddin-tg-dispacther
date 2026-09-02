@@ -3,11 +3,14 @@ import type { Hono } from 'hono'
 import { getClusterSecret, CLUSTER_TICKET_RE, WORKER_NAME_RE } from './cluster-env.ts'
 import { createClusterAuthGuard } from './cluster-auth.ts'
 import { createWorkerRegistry } from './worker-registry.ts'
-import { createDispatchRegistry, type DispatchEntry } from './dispatch-registry.ts'
-import { createDispatcher, type DispatchResult } from './dispatch.ts'
+import { createDispatchRegistry, DISPATCH_STATUS_RANK, type DispatchEntry } from './dispatch-registry.ts'
+import { createDispatcher, type DispatchAttemptWriteDeps, type DispatchResult } from './dispatch.ts'
 import { createRemoteSweeper } from './remote-sweeper.ts'
 import { createBacklogDispatcher } from './backlog-dispatcher.ts'
 import { fetchWorkerCapacity, fetchWorkerJobStatus, postWorkerJob } from './worker-client.ts'
+import { isMonitorDbEnabled } from '../monitor-db/env.ts'
+import { createMonitorPool } from '../monitor-db/pool.ts'
+import { createDispatchAttempt, advanceDispatchAttempt, supersedeOtherDispatchAttempts } from '../monitor-db/writes.ts'
 import { submitCreateMr, getBugQueueStats, hasBugTicketActive, notifyQueueEvent, tryDispatchBugQueueFront } from '../pipeline-runner/spawn-create-mr.ts'
 import {
   submitDemandPipeline,
@@ -33,6 +36,67 @@ const secret = getClusterSecret()
 const workerRegistry = createWorkerRegistry(join(LOG_DIR, 'cluster-workers.json'))
 const dispatchRegistry = createDispatchRegistry(join(LOG_DIR, 'cluster-dispatched.json'))
 
+// monitor DB 觀察面：dispatch_attempts 只有 head 寫（plan-db-as-truth-v3.md
+// §5.3；R1：head 對遠端 run 一律只寫 dispatch_attempts，絕不碰 runs）。
+// lazily 建 pool、flag 關閉時完全不建——這是「flag 關閉零行為變化」
+// （isMonitorDbEnabled()===false 時 create/advance 都是 no-op）的落地方式。
+// 全部 fire-and-forget：這張表只給 tg-monitor 面板觀察用，寫入失敗只記
+// log，不影響任何派工正確性（那完全由 DispatchRegistry 的磁碟持久化保證）。
+//
+// 注意（留給整合階段判斷是否要收斂）：這是 cluster wiring 自己的 mon_head
+// pool 實例，與 server.ts／其他 collector 若各自也建立 mon_head pool 是各自
+// 獨立的連線——lib/monitor-db/pool.ts 的「全 repo createPool( 恰好一次」只
+// 保證『唯一呼叫 mysql2.createPool 的檔案』是 pool.ts，不保證『整個 head
+// 行程只有一個 Pool 實例』。§4.6 的 pool 歸屬表把整個 head 行程的 mon_head
+// 算成一份 connectionLimit=8 預算；這裡另開一個小的（=2，dispatch_attempts
+// 遠比熱路徑低頻），不在本檔所有權範圍內處理跨行程收斂。
+let monitorPool: ReturnType<typeof createMonitorPool> | null = null
+function getMonitorPool(): ReturnType<typeof createMonitorPool> | null {
+  if (!isMonitorDbEnabled()) return null
+  if (monitorPool === null) monitorPool = createMonitorPool('mon_head', { connectionLimit: 2 })
+  return monitorPool
+}
+
+const dispatchAttemptWrites: DispatchAttemptWriteDeps = {
+  supersedeOthers(input) {
+    const pool = getMonitorPool()
+    if (pool === null) return
+    void supersedeOtherDispatchAttempts(pool, {
+      ticket: input.ticket,
+      kind: input.kind,
+      excludeDispatchId: input.excludeDispatchId,
+    }).catch(err => console.error(`cluster: dispatch_attempts supersede 失敗（ticket=${input.ticket}）：${err}`))
+  },
+  create(input) {
+    const pool = getMonitorPool()
+    if (pool === null) return
+    void createDispatchAttempt(pool, {
+      dispatchId: input.dispatchId,
+      ticket: input.ticket,
+      kind: input.kind,
+      status: input.status,
+      statusRank: input.statusRank,
+      dispatchedAt: input.dispatchedAt,
+      triggeredByEmail: input.triggeredByEmail ?? null,
+    }).catch(err => console.error(`cluster: dispatch_attempts create 失敗（dispatchId=${input.dispatchId}）：${err}`))
+  },
+  advance(input) {
+    const pool = getMonitorPool()
+    if (pool === null) return
+    void advanceDispatchAttempt(pool, {
+      dispatchId: input.dispatchId,
+      status: input.status,
+      statusRank: input.statusRank,
+      confirmedAt: input.confirmedAt ?? null,
+      clearedAt: input.clearedAt ?? null,
+      clearReason: input.clearReason ?? null,
+      remoteRunId: input.remoteRunId ?? null,
+      workerName: input.workerName ?? null,
+      workerUrl: input.workerUrl ?? null,
+    }).catch(err => console.error(`cluster: dispatch_attempts advance 失敗（dispatchId=${input.dispatchId}）：${err}`))
+  },
+}
+
 const dispatcher = createDispatcher({
   registry: dispatchRegistry,
   // disabled 的 worker（tg-monitor Workers 分頁「中斷」按鈕，見 worker-registry.ts
@@ -53,6 +117,7 @@ const dispatcher = createDispatcher({
       submit: (ticket, assigneeEmail, techUser) => submitDemandPipeline(ticket, assigneeEmail, techUser),
     },
   },
+  dispatchAttempts: dispatchAttemptWrites,
 })
 
 const sweeper = createRemoteSweeper({
@@ -62,6 +127,7 @@ const sweeper = createRemoteSweeper({
   notifyOperator,
   notifyUser: notifyQueueEvent,
   resetDemand: resetAiAnalysisForReclaim,
+  dispatchAttempts: dispatchAttemptWrites,
 })
 
 // head 佇列的 cluster-wide 遞補（見 backlog-dispatcher.ts 檔頭）。listWorkers
@@ -74,6 +140,7 @@ const backlogDispatcher = createBacklogDispatcher({
   listWorkers: () => (secret === null ? [] : workerRegistry.list().filter(w => !w.disabled)),
   bug: { tryDispatchFront: tryDispatchBugQueueFront },
   demand: { tryDispatchFront: tryDispatchDemandQueueFront },
+  dispatchAttempts: dispatchAttemptWrites,
 })
 
 export function isClusterEnabled(): boolean {
@@ -150,6 +217,15 @@ export function registerClusterRoutes(app: Hono): void {
     }
     dispatchRegistry.clear(body.ticket)
     sweeper.noteCleared(body.ticket) // M-3：失聯計數與告警旗標一併歸零
+    if (entry !== null) {
+      dispatchAttemptWrites.advance({
+        dispatchId: entry.dispatchId,
+        status: 'cleared',
+        statusRank: DISPATCH_STATUS_RANK.terminal,
+        clearedAt: new Date().toISOString(),
+        clearReason: 'job_done',
+      })
+    }
     console.error(`cluster: ${body.ticket} 於 worker ${worker} 執行結束（job-done 回報）`)
     // 這台 worker 剛釋放一個名額：把 head 佇列隊頭遞補過去（cluster-wide
     // 遞補，見 backlog-dispatcher.ts）。fire-and-forget，不擋這支 HTTP 回應

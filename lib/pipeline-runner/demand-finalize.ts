@@ -30,6 +30,35 @@ export type DemandOutcome =
 export type DemandAiAnalysisValue = '分析成功' | '不需分析' | '分析失敗' | '待釐清'
 
 /**
+ * 監控 DB 化（plan-db-as-truth-v3.md §6.1 R3'／§9 Phase 2「demand 結構化
+ * outcome」列）：demand pipeline 的結構化終態值域，供 `runs.outcome` 欄使用。
+ * 這是目前唯一的定案來源——plan 本身承認「demand pipeline 的結構化 outcome
+ * 字串尚未在任何 Phase 2 程式碼定案」（見 lib/monitor-db/types.ts
+ * KNOWN_OUTCOME_TIER 註解），這裡把它定下來。全部七個值在 §6.1 R3' 的分級表
+ * 裡都歸在「2 權威終態」（demand 結構化值），一律經 W2（tier 2）寫入
+ * ——這正是本次改動相對現況（舊軌只有截斷 80 字的 log 字串）的核心改善：
+ * `runs.outcome` 從此能精確反映 DemandOutcome 的 kind/status，而不是一段
+ * 自由文字。命名比照既有值域的 snake_case 慣例（如 `already_fixed`、
+ * `needs_qa_clarification`）。
+ */
+export function demandOutcomeToRunsOutcome(outcome: DemandOutcome): string {
+  switch (outcome.kind) {
+    case 'plan':
+      if (outcome.status === 'success') return 'success'
+      if (outcome.status === 'already-satisfied') return 'already_satisfied'
+      return 'needs_clarification'
+    case 'insufficient-spec':
+      return 'insufficient_spec'
+    case 'setup-failed':
+      return 'setup_failed'
+    case 'implementer-error':
+      return 'implementer_error'
+    case 'unexpected-error':
+      return 'unexpected_error'
+  }
+}
+
+/**
  * 這次結果要不要真的上傳 plan.md 到 Drive——只有 implementer 真的跑完、
  * 產出一份可讀 plan.md 的三種 kind:'plan' 分支才有文件可傳；其餘分支（規格
  * 不足／技術性失敗）根本沒有 plan.md 存在，不嘗試上傳。

@@ -1,11 +1,33 @@
 import { spawn, execFile } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
 import { openSync, closeSync, mkdirSync, appendFileSync, writeFileSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { GLOBAL_CONCURRENCY_LIMIT, createConcurrencyLimiter } from './concurrency-limiter.ts'
-import { createPipelineQueue, type QueueEntry, type QueueTriggeredBy, type SkipReason, type SubmitResult } from './pipeline-queue.ts'
+import { createPipelineQueue, type QueueEntry, type QueueTriggeredBy, type RecoverFromDiskResult, type SkipReason, type SubmitResult } from './pipeline-queue.ts'
 import { markPipelineActive, clearPipelineActive } from './active-pipeline-marker.ts'
 import { isTicketLocked } from './ticket-progress.ts'
 import { resolveTechUserByEmail, type TechUser } from '../user-resolution/tech-user.ts'
+import { writeRunProgress, writeRunOutcomeAuthoritative, type MonitorDbExecutor } from '../monitor-db/writes.ts'
+import type { RunKind } from '../monitor-db/types.ts'
+import { dispatchMonitorWrite } from '../monitor-db/runtime.ts'
+
+// ─────────────────────────────────────────────────────────────────────────
+// 監控 DB 化（plan-db-as-truth-v3.2.md §9 Phase2；Bug pipeline 生命週期寫入
+// 點）。全部包在 isMonitorDbEnabled() 之後、lazy import（§9.0(B)：關閉時連
+// mysql2 都不載入，行為與遷移前逐位元組相同）。
+//
+// §6.7 熱路徑非阻斷紀律：本檔（含經由 pipeline-queue.ts 的 hook 注入）全部
+// 運行在長駐的 webhook server process 裡，呼叫端一律不 await 這裡的寫入——
+// dispatchMonitorWrite() 內部自己控制 1000ms 逾時預算，逾時/失敗就落 spool，
+// 呼叫端拿到的永遠是立即返回的 void。
+//
+// 整合修補批次 item 7：pool/spool 單例與 dispatchMonitorWrite 本體已收斂進
+// lib/monitor-db/runtime.ts（demand pipeline 的長駐路徑複用同一份，見
+// demand-monitor-writes.ts 檔頭）；這裡沿用舊名重新匯出，本檔與呼叫端的
+// import 路徑、行為都不變。
+// ─────────────────────────────────────────────────────────────────────────
+
+export { dispatchMonitorWrite, __setMonitorTestOverrides, __resetMonitorTestOverrides } from '../monitor-db/runtime.ts'
 
 const LOG_DIR = '/Users/user/aladdin/telegram-dispatcher/logs'
 const SPAWN_ERROR_LOG = join(LOG_DIR, 'spawn-errors.log')
@@ -49,7 +71,21 @@ export function notifyQueueEvent(triggeredBy: QueueTriggeredBy, text: string): v
 export function spawnDetachedProcess(
   command: string,
   args: string[],
-  opts: { cwd: string; stdoutPath: string; stderrPath: string; env?: NodeJS.ProcessEnv; onExit?: () => void },
+  opts: {
+    cwd: string
+    stdoutPath: string
+    stderrPath: string
+    env?: NodeJS.ProcessEnv
+    onExit?: () => void
+    /** 【plan-db-as-truth-v3.2.md §9 Phase2】非同步 'error' 事件專用（不是
+     * onExit 的替代品，兩者都會被呼叫，見下方 'error' handler）：呼叫端用
+     * 這個 hook 分辨「這次 onExit 是因為 spawn 從未真正開始執行」，藉此把
+     * 監控 DB 已寫的 running 列改寫成 spawn_error（tier2）——單純用 onExit
+     * 分不出這個情況（'exit' 也會呼叫 onExit）。可選：不傳就跟舊行為完全
+     * 一樣，不影響 spawn-demand-pipeline.ts / trigger-auto-sync.ts 這兩個
+     * 既有呼叫端。 */
+    onSpawnError?: (err: Error) => void
+  },
 ): number | undefined {
   // stdout/stderr 分開兩個檔案（不是同一個檔案輪流寫）：--output-format json
   // 的 stdout 保證是單一乾淨的 JSON 陣列（實測驗證過），跟 stderr 雜訊混在
@@ -95,6 +131,11 @@ export function spawnDetachedProcess(
   child.on('error', err => {
     mkdirSync(dirname(SPAWN_ERROR_LOG), { recursive: true })
     appendFileSync(SPAWN_ERROR_LOG, `${new Date().toISOString()} spawn 失敗: ${command} ${args.join(' ')} -> ${err}\n`)
+    try {
+      opts.onSpawnError?.(err)
+    } catch (hookErr) {
+      console.error(`spawnDetachedProcess: onSpawnError hook 失敗（不影響既有收尾）: ${hookErr}`)
+    }
     callOnExitOnce()
   })
   child.on('exit', () => callOnExitOnce())
@@ -196,7 +237,7 @@ trap '
 ' EXIT
 unset CLAUDE_EFFORT
 { echo "diag PATH=$PATH"; echo "diag which claude: $(which -a claude 2>&1 | tr '\\n' ' ')"; echo "diag version: $(${CLAUDE_BIN} --version 2>&1)"; } >&2
-timeout 7200 ${CLAUDE_BIN} -p "/create-mr:create-mr $1 $3" --model opus --permission-mode bypassPermissions --output-format stream-json --verbose
+timeout 10800 ${CLAUDE_BIN} -p "/create-mr:create-mr $1 $3" --model opus --permission-mode bypassPermissions --output-format stream-json --verbose
 `
 // --output-format 於 2026-08-26 由 json 改為 stream-json（+ -p 模式必帶的
 // --verbose）：舊格式整包 JSON 在行程結束那一刻才 flush，執行中 stdout 永遠
@@ -260,10 +301,23 @@ timeout 7200 ${CLAUDE_BIN} -p "/create-mr:create-mr $1 $3" --model opus --permis
 // 2026-08-28（使用者定案）：額滿改排隊。spawnCreateMrNow 是「真正起背景流程」
 // 的部分（不含額度檢查），額度與 FIFO 佇列交給 bugQueue 統一管理——排隊、
 // 遞補、重啟恢復的完整語意見 pipeline-queue.ts 檔頭註解。
-export type BugPayload = { resume: boolean }
+//
+// 【plan-db-as-truth-v3.2.md §5.2】runId／retryOfRunId 由 submitCreateMr 在
+// 呼叫 bugQueue.submit() 之前鑄好、放進 payload——不管這張單最後是直接 spawn
+// 還是先進 FIFO 佇列，同一次 submitCreateMr 呼叫只鑄一個 run_id，兩條路徑
+// 用的是同一個值（佇列的 onEnqueued 寫 queued/rank10，這裡的 spawn choke
+// point 寫 running/rank30，ODKU 的 GREATEST 語意讓寫入順序不影響最終結果）。
+// dispatchId（整合修補批次 item 6）：head 派工經 /jobs 帶來的 dispatch_id
+// （§5.3），worker 端鑄 run_id 時一併寫進 runs.dispatch_id（W1 COALESCE 補
+// 空欄），讓 dispatch_attempts.dispatch_id = runs.dispatch_id 可以精確 join。
+// 本機直接觸發（head 自己跑、CLI、reaper auto-retry）沒有這個值，恆為 null。
+export type BugPayload = { resume: boolean; runId: string; retryOfRunId: string | null; dispatchId: string | null }
+
+const BUG_RUN_KIND: RunKind = 'bug'
 
 function spawnCreateMrNow(entry: QueueEntry<BugPayload>, onExit: () => void): { ok: true; pid: number | undefined } | { ok: false } {
   const { ticket } = entry
+  const { runId, retryOfRunId, dispatchId } = entry.payload
   try {
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-')
     const base = `${ticket}.${timestamp}`
@@ -290,7 +344,16 @@ function spawnCreateMrNow(entry: QueueEntry<BugPayload>, onExit: () => void): { 
     // T26 review 修正：在真的 spawn 之前標記「這張單是 dispatcher 觸發的」
     // （見 active-pipeline-marker.ts 檔頭註解）——stale-lock-reaper.ts 只會
     // 對有這份標記的 ticket 動手，避免誤殺人工/批次跑的 pipeline 持有的鎖。
-    markPipelineActive(ticket)
+    // 【v3.2 §6.4(4) R2】標記內容一併帶上 runId/kind，供 cancel 五段解析與
+    // reaper 的自動重試血緣（§5.7）本機讀取，不需要碰監控 DB。
+    markPipelineActive(ticket, { runId, kind: BUG_RUN_KIND })
+
+    // 【plan-db-as-truth-v3.2.md §9 Phase2】spawn 是唯一 choke point：拿到
+    // pid 才寫 running（W1），拿不到 pid 一律視同 spawn 失敗、寫權威終態
+    // spawn_error（tier2，W2）——見下方 onSpawnError（非同步 'error' 事件的
+    // 對應分支）與 catch 區塊（同步例外的對應分支）。三個分支共用同一個
+    // runId，寫入哪一種終態互斥於「有沒有真的拿到 pid」，不會重複寫。
+    const legacyKey = base
 
     // 第三個位置參數（$3）固定只有兩個可能值：'resume' 或 ''——見 WRAPPER_SCRIPT
     // 尾註解，不把呼叫端任意字串放進 prompt。
@@ -302,7 +365,28 @@ function spawnCreateMrNow(entry: QueueEntry<BugPayload>, onExit: () => void): { 
       // 收到這個訊號後強制全部 repo 真隔離（見該腳本內對應註解），根除多人
       // 同時觸發時共用主 repo symlink 的 bootstrap 碰撞風險。單線 /create-mr、
       // /create-mrs 不會設這個環境變數，行為不受影響。
-      env: { DISPATCHER_TRIGGERED: '1' },
+      // MON_RUN_ID（v3.2 §5.2）：一律顯式覆寫成這次 spawn 鑄好的 run_id——
+      // post-run-notify.ts／auto-retry 沿這條 env 繼承鏈讀到的正是這個值。
+      env: { DISPATCHER_TRIGGERED: '1', MON_RUN_ID: runId },
+      // 【v3.2 §9 Phase2】非同步 'error' 事件：child 從未真正開始執行，若
+      // 上面已經（樂觀地）寫過 running，這裡要把它改寫成 spawn_error（W2 的
+      // 守衛允許覆寫 outcome IS NULL 的列，不會跟下面成功路徑衝突——二者
+      // 互斥，只有其中一個會真的執行到）。
+      onSpawnError: () => {
+        dispatchMonitorWrite(
+          'writeRunOutcomeAuthoritative',
+          { runId, ticket, kind: BUG_RUN_KIND, outcome: 'spawn_error', outcomeSource: 'spawn-detached-error', finishedAt: new Date().toISOString() },
+          pool =>
+            writeRunOutcomeAuthoritative(pool, {
+              runId,
+              ticket,
+              kind: BUG_RUN_KIND,
+              outcome: 'spawn_error',
+              outcomeSource: 'spawn-detached-error',
+              finishedAt: new Date().toISOString(),
+            }),
+        )
+      },
       // T26：不管背景流程最後是成功、失敗、被 timeout 殺、還是中途 crash，
       // 只要真的結束就釋放名額（onExit 由 bugQueue 傳入：release + 遞補下一張
       // 排隊的單）——見 spawnDetachedProcess 的 'exit'/'error' handler，兩者
@@ -318,11 +402,77 @@ function spawnCreateMrNow(entry: QueueEntry<BugPayload>, onExit: () => void): { 
         onExit()
       },
     })
+
+    if (pid === undefined) {
+      // 【MJ-C8(a)】拿不到 pid（罕見：fork 本身失敗但沒有走到上面
+      // catch/onSpawnError 那兩條路徑）：不寫 running，直接寫 spawn_error。
+      dispatchMonitorWrite(
+        'writeRunOutcomeAuthoritative',
+        { runId, ticket, kind: BUG_RUN_KIND, outcome: 'spawn_error', outcomeSource: 'spawn-no-pid', finishedAt: new Date().toISOString() },
+        pool =>
+          writeRunOutcomeAuthoritative(pool, {
+            runId,
+            ticket,
+            kind: BUG_RUN_KIND,
+            outcome: 'spawn_error',
+            outcomeSource: 'spawn-no-pid',
+            finishedAt: new Date().toISOString(),
+          }),
+      )
+    } else {
+      dispatchMonitorWrite(
+        'writeRunProgress',
+        {
+          runId,
+          ticket,
+          kind: BUG_RUN_KIND,
+          lifecycleRank: 30 as const,
+          startedAt: new Date().toISOString(),
+          pid,
+          stdoutPath,
+          triggerSource: entry.triggeredBy ? 'telegram' : 'cli',
+          retryOfRunId,
+          dispatchId,
+          legacyKey,
+        },
+        pool =>
+          writeRunProgress(pool, {
+            runId,
+            ticket,
+            kind: BUG_RUN_KIND,
+            lifecycleRank: 30,
+            startedAt: new Date().toISOString(),
+            pid,
+            stdoutPath,
+            triggerSource: entry.triggeredBy ? 'telegram' : 'cli',
+            retryOfRunId,
+            dispatchId,
+            legacyKey,
+          }),
+      )
+    }
+
     return { ok: true, pid }
   } catch (err) {
     clearPipelineActive(ticket)
     mkdirSync(dirname(SPAWN_ERROR_LOG), { recursive: true })
     appendFileSync(SPAWN_ERROR_LOG, `${new Date().toISOString()} spawnCreateMr 失敗（${ticket}）: ${err}\n`)
+    // 【MJ-C8(a)】同步例外（mkdirSync/openSync 失敗等）：這張單從未真正 spawn，
+    // 寫權威終態 spawn_error（tier2）——markPipelineActive 在更前面已執行過，
+    // runId 已鑄定，不會是空值。
+    dispatchMonitorWrite(
+      'writeRunOutcomeAuthoritative',
+      { runId, ticket, kind: BUG_RUN_KIND, outcome: 'spawn_error', outcomeSource: 'spawn-sync-exception', finishedAt: new Date().toISOString() },
+      pool =>
+        writeRunOutcomeAuthoritative(pool, {
+          runId,
+          ticket,
+          kind: BUG_RUN_KIND,
+          outcome: 'spawn_error',
+          outcomeSource: 'spawn-sync-exception',
+          finishedAt: new Date().toISOString(),
+        }),
+    )
     return { ok: false }
   }
 }
@@ -356,15 +506,65 @@ const bugQueue = createPipelineQueue<BugPayload>({
   ticketRe: TICKET_RE,
   spawnNow: spawnCreateMrNow,
   skipReason: makeQueueSkipReason<BugPayload>(),
+  // §5.6（BL-C5）：供 recoverFromDisk() 回傳 run_id 陣列。
+  getRunId: p => p.runId,
+  // 【plan-db-as-truth-v3.2.md §9 Phase2】enqueue/dequeue-skip 寫入點：
+  // 額滿真的進入 FIFO 佇列 → queued（W1 rank10）；出列/恢復前提重驗判定要
+  // skip → 對應的權威終態（tier2）。onEnqueued/onSkipped 是 pipeline-queue.ts
+  // 的通用 hook（純注入，2B 的 demand 佇列可直接複用同一組欄位），DB 寫入
+  // 邏輯全部留在這裡（bug 專屬），不寫進 pipeline-queue.ts 本身。
+  onEnqueued: entry =>
+    dispatchMonitorWrite(
+      'writeRunProgress',
+      {
+        runId: entry.payload.runId,
+        ticket: entry.ticket,
+        kind: BUG_RUN_KIND,
+        lifecycleRank: 10 as const,
+        retryOfRunId: entry.payload.retryOfRunId,
+        dispatchId: entry.payload.dispatchId,
+      },
+      pool =>
+        writeRunProgress(pool, {
+          runId: entry.payload.runId,
+          ticket: entry.ticket,
+          kind: BUG_RUN_KIND,
+          lifecycleRank: 10,
+          retryOfRunId: entry.payload.retryOfRunId,
+          dispatchId: entry.payload.dispatchId,
+        }),
+    ),
   // Bug 單被 skip 沒有死路問題：tracker 仍是 pending、Notion 指派未動，隨時
   // 可重新認領（locked 情況則根本不需要重新認領，執行中的流程會自行回報）。
-  onSkipped: (entry, reason) =>
+  onSkipped: (entry, reason) => {
+    // code 值域見 makeQueueSkipReason：'locked' → 別的流程正在跑，這裡完全
+    // 不動它的狀態（W2 的守衛只覆寫 outcome IS NULL 或 tier<2 的列，若那個
+    // 存活 run 已經寫過權威終態，這條 skipped_locked 也不會覆寫掉它）；
+    // 'expired' → 排隊逾時、沒有任何流程在跑，寫 skipped_expired。
+    const outcome = reason.code === 'locked' ? 'skipped_locked' : reason.code === 'expired' ? 'skipped_expired' : null
+    if (outcome) {
+      const finishedAt = new Date().toISOString()
+      dispatchMonitorWrite(
+        'writeRunOutcomeAuthoritative',
+        { runId: entry.payload.runId, ticket: entry.ticket, kind: BUG_RUN_KIND, outcome, outcomeSource: 'pipeline-queue-skip', finishedAt },
+        pool =>
+          writeRunOutcomeAuthoritative(pool, {
+            runId: entry.payload.runId,
+            ticket: entry.ticket,
+            kind: BUG_RUN_KIND,
+            outcome,
+            outcomeSource: 'pipeline-queue-skip',
+            finishedAt,
+          }),
+      )
+    }
     notifyQueueEvent(
       entry.triggeredBy,
       reason.code === 'locked'
         ? `ℹ️ ${entry.ticket} 已從等待佇列移除：${reason.text}。該流程會自行回報結果，不需要重新認領。`
         : `ℹ️ ${entry.ticket} 已從等待佇列移除：${reason.text}。若仍需要分析，請重新認領一次。`,
-    ),
+    )
+  },
   onDequeueStarted: entry =>
     notifyQueueEvent(entry.triggeredBy, `▶️ ${entry.ticket} 排隊結束，背景流程已自動開始處理，完成後會再通知你。`),
   onDequeueFailed: entry =>
@@ -413,21 +613,44 @@ export function tryDispatchBugQueueFront(attempt: (entry: QueueEntry<BugPayload>
   return bugQueue.tryDispatchFront(attempt)
 }
 
-/** 提交一張 Bug 單：有名額直接 spawn（started）、額滿排入 FIFO 佇列（queued，
- * 回覆順位讓認領人知道要等幾張）、已在排隊中則回 already_queued 不重複排。 */
-export function submitCreateMr(ticket: string, opts: { resume?: boolean; triggeredBy?: TechUser } = {}): SubmitResult {
+/**
+ * 提交一張 Bug 單：有名額直接 spawn（started）、額滿排入 FIFO 佇列（queued，
+ * 回覆順位讓認領人知道要等幾張）、已在排隊中則回 already_queued 不重複排。
+ *
+ * 【plan-db-as-truth-v3.2.md §5.2】run_id 鑄造機＝執行機，鑄造時機是「這次
+ * submitCreateMr 呼叫本身」（不管最後走 started 還是 queued，同一次呼叫只
+ * 鑄一個 run_id，見 BugPayload 型別註解）。
+ *
+ * retry 血緣（§5.2 的「繼承值改作血緣」）：`opts.retryOf` 顯式指定時優先
+ * （stale-lock-reaper.ts 的常駐行程用這條——它的 `process.env.MON_RUN_ID`
+ * 恆空，見該檔案對應註解）；否則讀 `process.env.MON_RUN_ID`——這正是
+ * post-run-notify.ts 觸發 auto-retry 時的機制：post-run-notify.ts 是
+ * WRAPPER_SCRIPT 的 EXIT trap 子行程，繼承了「這一輪 run」spawn 時被顯式
+ * 覆寫的 `MON_RUN_ID`（見 spawnCreateMrNow 的 env），此處讀到的正是「上一輪
+ * run 的 id」，天然成為新 run 的 `retry_of_run_id`，不需要額外傳遞。
+ */
+export function submitCreateMr(
+  ticket: string,
+  opts: { resume?: boolean; triggeredBy?: TechUser; retryOf?: string; dispatchId?: string } = {},
+): SubmitResult {
   if (!TICKET_RE.test(ticket)) {
     throw new Error(`拒絕 spawn：ticket 格式不對（${ticket}），可能是注入嘗試`)
   }
   const triggeredBy: QueueTriggeredBy = opts.triggeredBy
     ? { name: opts.triggeredBy.notion_user_name, email: opts.triggeredBy.email }
     : null
-  return bugQueue.submit(ticket, triggeredBy, { resume: !!opts.resume })
+  const runId = randomUUID()
+  const retryOfRunId = opts.retryOf ?? ((process.env.MON_RUN_ID ?? '').trim() || null)
+  const result = bugQueue.submit(ticket, triggeredBy, { resume: !!opts.resume, runId, retryOfRunId, dispatchId: opts.dispatchId ?? null })
+  if (result.ok && (result.status === 'started' || result.status === 'queued')) {
+    return { ...result, runId }
+  }
+  return result
 }
 
 /** 只給 server.ts 啟動時呼叫一次（CLI 短命行程絕不能呼叫，見 pipeline-queue.ts
  * recoverFromDisk 註解）。 */
-export function recoverBugQueue(): { started: number; requeued: number; skipped: number } {
+export function recoverBugQueue(): RecoverFromDiskResult {
   return bugQueue.recoverFromDisk()
 }
 

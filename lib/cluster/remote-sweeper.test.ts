@@ -21,6 +21,7 @@ function makeHarness(opts: {
   const operatorNotes: string[] = []
   const userNotes: { email: string | null; text: string }[] = []
   const resets: string[] = []
+  const dispatchAttemptCalls: { fn: 'create' | 'advance'; input: Record<string, unknown> }[] = []
   const now = opts.now ?? Date.now()
   const sweeper = createRemoteSweeper({
     registry,
@@ -35,6 +36,10 @@ function makeHarness(opts: {
       resets.push(ticket)
       return true
     },
+    dispatchAttempts: {
+      create: input => dispatchAttemptCalls.push({ fn: 'create', input }),
+      advance: input => dispatchAttemptCalls.push({ fn: 'advance', input }),
+    },
     now: () => now,
   })
   /** 建一筆 confirmed 登記，dispatchedAt 距 now 為 ageMs。 */
@@ -48,7 +53,17 @@ function makeHarness(opts: {
     registry.markDispatching(ticket, kind, { name: 'A', email: 'a@x.tw' })
     registry.get(ticket)!.dispatchedAt = new Date(now - ageMs).toISOString()
   }
-  return { registry, sweeper, operatorNotes, userNotes, resets, addConfirmed, addDispatching, cleanup: () => rmSync(dir, { recursive: true, force: true }) }
+  return {
+    registry,
+    sweeper,
+    operatorNotes,
+    userNotes,
+    resets,
+    dispatchAttemptCalls,
+    addConfirmed,
+    addDispatching,
+    cleanup: () => rmSync(dir, { recursive: true, force: true }),
+  }
 }
 
 describe('createRemoteSweeper — 基本判定', () => {
@@ -182,6 +197,67 @@ describe('createRemoteSweeper — dispatching 殘留求證（M-1）', () => {
     expect(h.registry.get('FAQ-1')?.status).toBe('dispatching')
     expect(h.userNotes).toEqual([])
     h.cleanup()
+  })
+})
+
+describe('createRemoteSweeper — dispatch_attempts 觀察面寫入（plan §5.3；SWEEP_MAX_AGE_MS 27h）', () => {
+  test('27 小時絕對上限：advance(lost_27h, terminal)', async () => {
+    const h = makeHarness({})
+    h.addConfirmed('FAQ-1', SWEEP_MAX_AGE_MS + 60_000)
+    await h.sweeper.sweep()
+    expect(h.dispatchAttemptCalls).toHaveLength(1)
+    expect(h.dispatchAttemptCalls[0]).toMatchObject({ fn: 'advance', input: { status: 'lost_27h', statusRank: 100, clearReason: 'sweep_max_age' } })
+    h.cleanup()
+  })
+
+  test('dispatching 求證回填為某台 worker：advance(dispatched)', async () => {
+    const w1: WorkerInfo = { name: 'w1', url: 'http://10.0.0.2:8801', registeredAt: 'x' }
+    const h = makeHarness({ workers: [w1], statuses: { 'http://10.0.0.2:8801|FAQ-1': RUNNING } })
+    h.addDispatching('FAQ-1', SWEEP_GRACE_MS + 60_000)
+    await h.sweeper.sweep()
+    expect(h.dispatchAttemptCalls).toHaveLength(1)
+    expect(h.dispatchAttemptCalls[0]).toMatchObject({ fn: 'advance', input: { status: 'dispatched', statusRank: 20 } })
+    h.cleanup()
+  })
+
+  test('dispatching 求證全部無活動：advance(never_started)', async () => {
+    const w1: WorkerInfo = { name: 'w1', url: 'http://10.0.0.2:8801', registeredAt: 'x' }
+    const h = makeHarness({ workers: [w1], statuses: { 'http://10.0.0.2:8801|FAQ-1': GONE } })
+    h.addDispatching('FAQ-1', SWEEP_GRACE_MS + 60_000)
+    await h.sweeper.sweep()
+    expect(h.dispatchAttemptCalls).toHaveLength(1)
+    expect(h.dispatchAttemptCalls[0]).toMatchObject({ fn: 'advance', input: { status: 'never_started', statusRank: 100, clearReason: 'sweep_no_activity' } })
+    h.cleanup()
+  })
+
+  test('vanished（可達但無活動）：advance(vanished)', async () => {
+    const h = makeHarness({ statuses: { 'http://10.0.0.2:8801|FAQ-1': GONE } })
+    h.addConfirmed('FAQ-1', SWEEP_GRACE_MS + 60_000)
+    await h.sweeper.sweep()
+    expect(h.dispatchAttemptCalls).toHaveLength(1)
+    expect(h.dispatchAttemptCalls[0]).toMatchObject({ fn: 'advance', input: { status: 'vanished', statusRank: 100, clearReason: 'vanished_no_activity' } })
+    h.cleanup()
+  })
+
+  test('沒有 dispatchAttempts deps（省略）：不拋例外，清理行為不變', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'sweeper-test-'))
+    const registry = createDispatchRegistry(join(dir, 'dispatched.json'))
+    const now = Date.now()
+    const sweeper = createRemoteSweeper({
+      registry,
+      listWorkers: () => [],
+      fetchStatus: async () => null,
+      notifyOperator: () => {},
+      notifyUser: () => {},
+      resetDemand: () => true,
+      now: () => now,
+    })
+    registry.markDispatching('FAQ-1', 'bug', null)
+    registry.confirmDispatched('FAQ-1', 'w1', 'http://10.0.0.2:8801')
+    registry.get('FAQ-1')!.dispatchedAt = new Date(now - (SWEEP_MAX_AGE_MS + 60_000)).toISOString()
+    await sweeper.sweep()
+    expect(registry.list()).toEqual([])
+    rmSync(dir, { recursive: true, force: true })
   })
 })
 

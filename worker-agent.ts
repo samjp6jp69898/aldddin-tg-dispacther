@@ -47,6 +47,8 @@ import { createLocalActivity } from './lib/cluster/local-activity.ts'
 import { isTicketLocked, describeTicketProgress, getTicketProgressStages } from './lib/pipeline-runner/ticket-progress.ts'
 import { ensureTrackerPending } from './lib/pipeline-runner/tracker-sync.ts'
 import { startStaleLockReaper } from './lib/pipeline-runner/stale-lock-reaper.ts'
+import { startMonitorMaintenance, runRestartSweep } from './lib/monitor-db/maintenance.ts'
+import type { SubmitResult } from './lib/pipeline-runner/pipeline-queue.ts'
 import type { TechUser } from './lib/user-resolution/tech-user.ts'
 
 const BUG_TICKET_RE = /^FAQ-\d+$/
@@ -131,11 +133,33 @@ setInterval(() => void registerWithHead(), 30 * 60_000)
 startStaleLockReaper()
 const bugRecovered = recoverBugQueue()
 const demandRecovered = recoverDemandQueue()
-if (bugRecovered.started + bugRecovered.requeued + bugRecovered.skipped + demandRecovered.started + demandRecovered.requeued + demandRecovered.skipped > 0) {
+if (
+  bugRecovered.started.length + bugRecovered.requeued.length + bugRecovered.skipped.length + demandRecovered.started.length + demandRecovered.requeued.length + demandRecovered.skipped.length >
+  0
+) {
   console.error(
-    `worker-agent: 排隊恢復 bug(started=${bugRecovered.started}, requeued=${bugRecovered.requeued}, skipped=${bugRecovered.skipped}) demand(started=${demandRecovered.started}, requeued=${demandRecovered.requeued}, skipped=${demandRecovered.skipped})`,
+    `worker-agent: 排隊恢復 bug(started=${bugRecovered.started.length}, requeued=${bugRecovered.requeued.length}, skipped=${bugRecovered.skipped.length}) demand(started=${demandRecovered.started.length}, requeued=${demandRecovered.requeued.length}, skipped=${demandRecovered.skipped.length})`,
   )
 }
+
+// 【plan-db-as-truth-v3.md §5.6，BL-C5】seen = 六組 run_id 陣列的聯集，只跑
+// 一次（不是週期 tick），理由與 server.ts 同位置註解相同。
+void runRestartSweep(
+  new Set([
+    ...bugRecovered.started,
+    ...bugRecovered.requeued,
+    ...bugRecovered.skipped,
+    ...demandRecovered.started,
+    ...demandRecovered.requeued,
+    ...demandRecovered.skipped,
+  ]),
+)
+
+// 監控 DB 週期維護（整合修補批次 item 2 + item 8）：同一 tick 內重放本機
+// spool（worker 是自己 spool 目錄唯一的重放者，§6.5(d)）+ §6.6 本機
+// sweeper。直接複用上面已建好的 localActivity（queue ∪ 鎖目錄 ∪ ps 三合一，
+// 不重建第二份）。isMonitorDbEnabled()=false 時內部直接 no-op。
+startMonitorMaintenance({ isTicketActive: ticket => localActivity.isActive(ticket) })
 
 // ---- HTTP 介面 ----
 
@@ -184,19 +208,45 @@ function sanitizeTriggeredBy(raw: unknown): TechUser | undefined {
   }
 }
 
+/** monitor DB `dispatch_attempts.dispatch_id`（UUIDv4，head 端鑄造，見
+ * lib/cluster/worker-client.ts 的 JobRequest.dispatchId 註解）的格式檢查。 */
+const DISPATCH_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+/** body 帶的 dispatchId 格式不對就當沒帶——這欄目前只是協定層佔位（見下方
+ * /jobs handler 註解），格式錯誤不該擋接單。 */
+function sanitizeDispatchId(raw: unknown): string | null {
+  return typeof raw === 'string' && DISPATCH_ID_RE.test(raw) ? raw : null
+}
+
+/** SubmitResult 的 `runId` 只在 started/queued 兩個變體上存在（見
+ * lib/pipeline-runner/pipeline-queue.ts 的型別註解），其餘變體（already_running、
+ * ok:false）完全沒有這個欄位——用 `in` 窄化而不是直接存取，避免對 union
+ * 的非共同屬性硬存取。demand 路徑（submitDemandPipeline）目前還沒有鑄
+ * run_id，這裡會自然回 null，跟「還沒有」的協定語意一致。 */
+function extractRunId(result: SubmitResult): string | null {
+  return 'runId' in result && typeof result.runId === 'string' ? result.runId : null
+}
+
 app.post('/jobs', guard, async c => {
   const body = (await c.req.json().catch(() => null)) as
-    | { kind?: string; ticket?: string; resume?: boolean; triggeredBy?: unknown; assigneeEmail?: string }
+    | { kind?: string; ticket?: string; resume?: boolean; triggeredBy?: unknown; assigneeEmail?: string; dispatchId?: unknown }
     | null
   if (!body || typeof body.ticket !== 'string') return c.json({ ok: false, reason: 'bad_request' }, 400)
   const triggeredBy = sanitizeTriggeredBy(body.triggeredBy)
+  // §5.3：head 隨請求帶 dispatch_id，本機鑄 run_id 時把它一併寫進
+  // runs.dispatch_id（形狀 A COALESCE 補空欄），讓
+  // dispatch_attempts.dispatch_id = runs.dispatch_id 可以精確 join（整合修補
+  // 批次 item 6：submitCreateMr/submitDemandPipeline 已開放接受這個參數）。
+  const dispatchId = sanitizeDispatchId(body.dispatchId)
 
   // C-1 修正：這張單在本機已有任何活動（含 out-of-band run）→ 不接單、
   // 不 spawn，回 already_running 讓 head 把登記表回填指向本機。絕不能讓
   // 新 run 撞上活 run（新 run 早退時的 EXIT trap 會 release 活 run 的鎖並
   // 清它的 worktree）。
   if (localActivity.isActive(body.ticket)) {
-    return c.json({ ok: true, status: 'already_running' })
+    // out-of-band run：這張單本機已有活動，不是這次 /jobs 呼叫鑄的 run，
+    // 依 §5.4 回應註解「已在跑」不附這次呼叫的 run_id。
+    return c.json({ ok: true, status: 'already_running', run_id: null })
   }
 
   if (body.kind === 'bug') {
@@ -206,8 +256,11 @@ app.post('/jobs', guard, async c => {
     // 比照 head 端 claim.ts：spawn 前先確保本機 tracker 有這張單（/create-mr
     // Step 0 的存在性檢查讀的是「執行機」的 tracker，不是 head 的）。
     ensureTrackerPending(body.ticket)
-    const result = submitCreateMr(body.ticket, { resume: body.resume === true, triggeredBy })
-    return c.json(result, result.ok ? 200 : 500)
+    const result = submitCreateMr(body.ticket, { resume: body.resume === true, triggeredBy, dispatchId: dispatchId ?? undefined })
+    // §5.4：submitCreateMr 現在會在 started/queued 兩種狀態鑄 run_id 並疊加進
+    // SubmitResult（見 pipeline-queue.ts 的 SubmitResult.runId 註解）——直接
+    // 透傳給 head，不需要另外維護 in-process Map<ticket, runId>。
+    return c.json({ ...result, run_id: extractRunId(result) }, result.ok ? 200 : 500)
   }
 
   if (body.kind === 'demand') {
@@ -215,8 +268,10 @@ app.post('/jobs', guard, async c => {
     if (typeof body.assigneeEmail !== 'string' || !EMAIL_RE.test(body.assigneeEmail)) return c.json({ ok: false, reason: 'bad_request' }, 400)
     const stats = effectiveStats('demand')
     if (stats.queued > 0 || stats.running >= stats.limit) return c.json({ ok: false, reason: 'full' }, 409)
-    const result = submitDemandPipeline(body.ticket, body.assigneeEmail, triggeredBy)
-    return c.json(result, result.ok ? 200 : 500)
+    const result = submitDemandPipeline(body.ticket, body.assigneeEmail, triggeredBy, dispatchId ?? undefined)
+    // demand 路徑（submitDemandPipeline）目前尚未鑄 run_id（見該檔案），
+    // extractRunId 會自然回 null；等它補上就自動生效，這裡不需要再改。
+    return c.json({ ...result, run_id: extractRunId(result) }, result.ok ? 200 : 500)
   }
 
   return c.json({ ok: false, reason: 'bad_request' }, 400)

@@ -1,5 +1,5 @@
 import type { SubmitResult } from '../pipeline-runner/pipeline-queue.ts'
-import type { DispatchRegistry } from './dispatch-registry.ts'
+import { DISPATCH_STATUS_RANK, type DispatchRegistry } from './dispatch-registry.ts'
 import type { WorkerInfo } from './worker-registry.ts'
 import type { CapacityReport, JobRequest, PostJobResult, QueueStats } from './worker-client.ts'
 import type { TechUser } from '../user-resolution/tech-user.ts'
@@ -45,6 +45,47 @@ export type DispatchResult =
   | { ok: true; status: 'remote_started'; worker: string }
   | { ok: true; status: 'already_running_remote'; worker: string }
 
+/**
+ * monitor DB `dispatch_attempts` 的觀察面寫入（plan-db-as-truth-v3.md §5.3）。
+ * 純 fire-and-forget：呼叫端（dispatch.ts/backlog-dispatcher.ts/remote-sweeper.ts）
+ * 一律不 await，也不管成功失敗——這張表只給 tg-monitor 面板觀察用，真正的派工
+ * 正確性完全由 DispatchRegistry 的磁碟持久化 + registry 的同步佔位保證（R1：
+ * head 對遠端 run 一律只寫 dispatch_attempts，絕不碰 runs）。production 端
+ * 實作（cluster-head.ts）負責 isMonitorDbEnabled() 判斷與錯誤吞噬；測試/單機
+ * 模式可以整組省略（optional）。
+ */
+export type DispatchAttemptWriteDeps = {
+  /** §5.3（MJ-C6 後半）：markDispatching 鑄新 dispatchId 後，對同
+   * (ticket, kind) 的所有未終結（status_rank<100）舊列一併寫 superseded。
+   * Optional：舊測試/單機模式可省略，行為等同不寫觀察面（不影響正確性）。 */
+  supersedeOthers?: (input: { ticket: string; kind: 'bug' | 'demand'; excludeDispatchId: string }) => void
+  /** 第一次一定是建立列，dispatchId 由 DispatchRegistry.markDispatching 鑄好。 */
+  create: (input: {
+    dispatchId: string
+    ticket: string
+    kind: 'bug' | 'demand'
+    status: string
+    statusRank: number
+    dispatchedAt: string
+    triggeredByEmail?: string | null
+  }) => void
+  /** status_rank 單調前進（見 dispatch-registry.ts 的 DISPATCH_STATUS_RANK）。
+   * workerName/workerUrl：worker 在 create() 當下（'dispatching'）還不知道，
+   * 第一次 advance 到 'dispatched' 才選定——寫入端用 COALESCE 補空，這裡未帶
+   * 值時不會清掉已寫好的 worker 資訊（見 writes.ts advanceDispatchAttempt）。 */
+  advance: (input: {
+    dispatchId: string
+    status: string
+    statusRank: number
+    confirmedAt?: string | null
+    clearedAt?: string | null
+    clearReason?: string | null
+    remoteRunId?: string | null
+    workerName?: string | null
+    workerUrl?: string | null
+  }) => void
+}
+
 export type DispatchDeps = {
   registry: DispatchRegistry
   listWorkers: () => WorkerInfo[]
@@ -63,6 +104,7 @@ export type DispatchDeps = {
       submit: (ticket: string, assigneeEmail: string, triggeredBy: TechUser) => SubmitResult
     }
   }
+  dispatchAttempts?: DispatchAttemptWriteDeps
 }
 
 /** 剩餘名額判斷：有單在排隊代表名額實際上已滿（排隊者優先於新單），不論
@@ -90,7 +132,11 @@ export function createDispatcher(deps: DispatchDeps) {
     const workers = deps.listWorkers()
     if (workers.length === 0) return submitLocal() // 單機模式：完全等同既有行為
 
-    deps.registry.markDispatching(ticket, kind, { name: techUser.notion_user_name, email: techUser.email })
+    const attempts = deps.dispatchAttempts
+    const dispatchId = deps.registry.markDispatching(ticket, kind, { name: techUser.notion_user_name, email: techUser.email })
+    const dispatchedAt = new Date().toISOString()
+    attempts?.supersedeOthers?.({ ticket, kind, excludeDispatchId: dispatchId })
+    attempts?.create({ dispatchId, ticket, kind, status: 'dispatching', statusRank: DISPATCH_STATUS_RANK.dispatching, dispatchedAt, triggeredByEmail: techUser.email })
     try {
       // (4) 並行探測：名額 + 這張單在各 worker 的本機活動。
       const capacities = await Promise.all(workers.map(async w => ({ worker: w, cap: await deps.fetchCapacity(w, ticket) })))
@@ -100,6 +146,14 @@ export function createDispatcher(deps: DispatchDeps) {
         // C-1 healing：這張單其實已在某台 worker 上跑（out-of-band run，
         // 登記表先前被 job-done 清掉）——回填登記，不起新 run。
         deps.registry.confirmDispatched(ticket, activeOn.worker.name, activeOn.worker.url)
+        attempts?.advance({
+          dispatchId,
+          status: 'dispatched',
+          statusRank: DISPATCH_STATUS_RANK.dispatched,
+          confirmedAt: new Date().toISOString(),
+          workerName: activeOn.worker.name,
+          workerUrl: activeOn.worker.url,
+        })
         return { ok: true, status: 'already_running_remote', worker: activeOn.worker.name }
       }
 
@@ -114,14 +168,33 @@ export function createDispatcher(deps: DispatchDeps) {
       if (!best || localFree >= best.free) {
         // 平手本機優先；candidates 為空（全滿/全失聯）也落到這裡走本機佇列。
         deps.registry.clear(ticket)
+        attempts?.advance({
+          dispatchId,
+          status: 'cleared',
+          statusRank: DISPATCH_STATUS_RANK.terminal,
+          clearedAt: new Date().toISOString(),
+          clearReason: 'no_remote_capacity',
+        })
         return submitLocal()
       }
 
-      // (6) 只試最佳一台（M-2 預算約束）。
-      const job: JobRequest = kind === 'bug' ? { kind, ticket, triggeredBy: techUser } : { kind, ticket, triggeredBy: techUser, assigneeEmail }
+      // (6) 只試最佳一台（M-2 預算約束）。dispatchId 隨請求一併送出（§5.3）：
+      // 即使 postJob 逾時拿不到回應 body，worker 端把它寫進自己鑄的 runs.dispatch_id
+      // 欄，事後仍能用 runs.dispatch_id = dispatch_attempts.dispatch_id 精確 join。
+      const job: JobRequest =
+        kind === 'bug' ? { kind, ticket, triggeredBy: techUser, dispatchId } : { kind, ticket, triggeredBy: techUser, assigneeEmail, dispatchId }
       const r = await deps.postJob(best.worker, job)
       if (r.accepted) {
         deps.registry.confirmDispatched(ticket, best.worker.name, best.worker.url)
+        attempts?.advance({
+          dispatchId,
+          status: 'dispatched',
+          statusRank: DISPATCH_STATUS_RANK.dispatched,
+          confirmedAt: new Date().toISOString(),
+          remoteRunId: r.runId,
+          workerName: best.worker.name,
+          workerUrl: best.worker.url,
+        })
         // worker 端自己發現這張單已有本機活動（探測與接單之間的視窗）→
         // 一樣回填登記，但回報語意是「已在跑」而非「已開始」。
         if (r.result.ok && r.result.status === 'already_running') {
@@ -132,17 +205,39 @@ export function createDispatcher(deps: DispatchDeps) {
       if (r.reason === 'ambiguous') {
         // 見檔頭：逾時不明＝保守當已接單，交給 sweeper 校正。
         deps.registry.confirmDispatched(ticket, best.worker.name, best.worker.url)
+        attempts?.advance({
+          dispatchId,
+          status: 'dispatched',
+          statusRank: DISPATCH_STATUS_RANK.dispatched,
+          confirmedAt: new Date().toISOString(),
+          workerName: best.worker.name,
+          workerUrl: best.worker.url,
+        })
         return { ok: true, status: 'remote_started', worker: best.worker.name }
       }
 
       // full / rejected / unreachable：確定沒接單，退回本機。
       deps.registry.clear(ticket)
+      attempts?.advance({
+        dispatchId,
+        status: 'cleared',
+        statusRank: DISPATCH_STATUS_RANK.terminal,
+        clearedAt: new Date().toISOString(),
+        clearReason: r.reason,
+      })
       return submitLocal()
     } catch (err) {
       // 防禦性收尾：探測/選擇過程任何未預期例外都不能留下永久佔位（那會讓
       // 這張單直到 sweeper 清理前都無法認領），清掉並退回本機路徑。
       console.error(`cluster-dispatch: ${ticket} 派工過程例外，退回本機執行: ${err}`)
       deps.registry.clear(ticket)
+      attempts?.advance({
+        dispatchId,
+        status: 'cleared',
+        statusRank: DISPATCH_STATUS_RANK.terminal,
+        clearedAt: new Date().toISOString(),
+        clearReason: 'exception',
+      })
       return submitLocal()
     }
   }

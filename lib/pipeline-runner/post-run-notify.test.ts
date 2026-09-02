@@ -1,5 +1,86 @@
 import { describe, expect, mock, test } from 'bun:test'
-import { checkPushMismatch, shouldNotify, parseRunningBugTickets } from './post-run-notify.ts'
+import { checkPushMismatch, shouldNotify, parseRunningBugTickets, writeAuthoritativeOutcome } from './post-run-notify.ts'
+import { FakeRunsDb } from '../monitor-db/test-support/fake-runs-db.ts'
+import type { SpoolEntry } from '../monitor-db/spool/types.ts'
+
+/** 假 spool writer：只記錄 append 呼叫，不碰真的檔案系統。 */
+function makeFakeSpool() {
+  const appended: Array<Omit<SpoolEntry, 'seq'>> = []
+  return {
+    appended,
+    append: (e: Omit<SpoolEntry, 'seq'>) => appended.push(e),
+    appendBatch: (es: Array<Omit<SpoolEntry, 'seq'>>) => appended.push(...es),
+    filePath: () => '/tmp/fake-spool-test.jsonl',
+    close: () => {},
+  }
+}
+
+describe('writeAuthoritativeOutcome — v3.2 §9 Phase2 bug 終態（權威）寫入點', () => {
+  test('process.env.MON_RUN_ID 為空 → 完全不寫、不落 spool（即使帶了假 deps）', async () => {
+    const prev = process.env.MON_RUN_ID
+    delete process.env.MON_RUN_ID
+    try {
+      const fakeDb = new FakeRunsDb()
+      const fakeSpool = makeFakeSpool()
+      await writeAuthoritativeOutcome('FAQ-9001', 'success', 0, { pool: fakeDb, spool: fakeSpool })
+      expect(fakeDb.calls.length).toBe(0)
+      expect(fakeSpool.appended.length).toBe(0)
+    } finally {
+      if (prev === undefined) delete process.env.MON_RUN_ID
+      else process.env.MON_RUN_ID = prev
+    }
+  })
+
+  test('有 run_id、pool 正常 → 直接寫入 W2（不落 spool）', async () => {
+    const prev = process.env.MON_RUN_ID
+    process.env.MON_RUN_ID = '11111111-1111-1111-1111-111111111111'
+    try {
+      const fakeDb = new FakeRunsDb()
+      const fakeSpool = makeFakeSpool()
+      await writeAuthoritativeOutcome('FAQ-9002', 'infra_failure', 1, { pool: fakeDb, spool: fakeSpool })
+      const row = fakeDb.rows.get('11111111-1111-1111-1111-111111111111')
+      expect(row).not.toBeUndefined()
+      expect(row!.outcome).toBe('infra_failure')
+      expect(row!.outcome_tier).toBe(2)
+      expect(row!.exit_code).toBe(1)
+      expect(fakeSpool.appended.length).toBe(0)
+    } finally {
+      if (prev === undefined) delete process.env.MON_RUN_ID
+      else process.env.MON_RUN_ID = prev
+    }
+  })
+
+  test('pool 為 null（模擬連線建立失敗）→ 落 spool，條目帶正確的 run_id/fn', async () => {
+    const prev = process.env.MON_RUN_ID
+    process.env.MON_RUN_ID = '22222222-2222-2222-2222-222222222222'
+    try {
+      const fakeSpool = makeFakeSpool()
+      await writeAuthoritativeOutcome('FAQ-9003', 'timeout', 124, { pool: null, spool: fakeSpool })
+      expect(fakeSpool.appended.length).toBe(1)
+      expect(fakeSpool.appended[0]!.run_id).toBe('22222222-2222-2222-2222-222222222222')
+      expect(fakeSpool.appended[0]!.fn).toBe('writeRunOutcomeAuthoritative')
+      expect((fakeSpool.appended[0]!.args[0] as { outcome: string }).outcome).toBe('timeout')
+    } finally {
+      if (prev === undefined) delete process.env.MON_RUN_ID
+      else process.env.MON_RUN_ID = prev
+    }
+  })
+
+  test('pool.execute 丟例外 → 落 spool（不是直接讓例外往外拋，best-effort）', async () => {
+    const prev = process.env.MON_RUN_ID
+    process.env.MON_RUN_ID = '33333333-3333-3333-3333-333333333333'
+    try {
+      const throwingPool = { execute: async () => Promise.reject(new Error('連線斷了')) }
+      const fakeSpool = makeFakeSpool()
+      await expect(writeAuthoritativeOutcome('FAQ-9004', 'cli_failure', 1, { pool: throwingPool, spool: fakeSpool })).resolves.toBeUndefined()
+      expect(fakeSpool.appended.length).toBe(1)
+      expect(fakeSpool.appended[0]!.run_id).toBe('33333333-3333-3333-3333-333333333333')
+    } finally {
+      if (prev === undefined) delete process.env.MON_RUN_ID
+      else process.env.MON_RUN_ID = prev
+    }
+  })
+})
 
 describe('shouldNotify — T13 補發通知範圍（2026-08-14 使用者定案，見 tasks.json changelog）', () => {
   test('create-mr 自己已通知/已留言過的三類，不重複發', () => {

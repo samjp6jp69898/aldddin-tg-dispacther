@@ -5,7 +5,15 @@ import { fetchDemandTicketContent, checkSpecSufficiencyFromContent } from './spe
 import { detectRepoScope } from './repo-scope-gate.ts'
 import { getDemandTicketNotionUrl } from '../notion-integration/demand-pool-tickets.ts'
 import { runDemandPlanPipeline } from './demand-plan-pipeline.ts'
-import { classifyAiAnalysis, shouldUploadPlan, buildNotionCommentText, buildTelegramText, type DemandOutcome } from './demand-finalize.ts'
+import {
+  classifyAiAnalysis,
+  shouldUploadPlan,
+  buildNotionCommentText,
+  buildTelegramText,
+  demandOutcomeToRunsOutcome,
+  type DemandOutcome,
+} from './demand-finalize.ts'
+import { writeDemandOutcomeAuthoritative } from './demand-monitor-writes.ts'
 
 const BUG_LOCK_SH = '/Users/user/aladdin/scripts/bug-lock.sh'
 const TG_NOTIFY_SH = '/Users/user/aladdin/scripts/tg-notify.sh'
@@ -107,7 +115,7 @@ function uploadPlanToDrive(ticket: string, planPath: string): string {
  * 其他步驟（比照 drive-uploader.md『無論如何都要嘗試更新 AI分析欄位』的
  * 既有原則），但都會記進 demand-pipeline.log 供事後排查。
  */
-function finalize(ticket: string, email: string, outcome: DemandOutcome): void {
+async function finalize(ticket: string, email: string, outcome: DemandOutcome): Promise<void> {
   const aiAnalysis = classifyAiAnalysis(outcome)
   log(`${ticket} finalize：${outcome.kind}${outcome.kind === 'plan' ? `/${outcome.status}` : ''} → AI分析=${aiAnalysis}`)
 
@@ -142,6 +150,34 @@ function finalize(ticket: string, email: string, outcome: DemandOutcome): void {
 
   const text = buildTelegramText(ticket, outcome, { driveLink, notionUrl: notionUrl ?? undefined })
   notify(ticket, email, text)
+
+  // 監控 DB 化（plan-db-as-truth-v3.md §9 Phase 2「demand 結構化 outcome」
+  // 列）：demand pipeline 的結構化終態權威寫入（W2，tier 2）。這是本次改動
+  // 對現況（舊軌 runs.outcome 只有截斷 80 字的 log 字串）的核心改善——見
+  // demand-finalize.ts 的 demandOutcomeToRunsOutcome() 映射。best-effort：
+  // 上面的 Notion/Telegram 收尾已經完成，這裡失敗只記 log，不倒流影響使用者
+  // 已經收到的通知。§6.7：短命行程要 await，writeDemandOutcomeAuthoritative
+  // 內部自帶 3 秒預算與 spool 落地，全程不拋出，這裡的 try/catch 只是多一層
+  // 防禦（不依賴它才是正確性的保證）。
+  const runId = (process.env.MON_RUN_ID ?? '').trim()
+  if (runId) {
+    try {
+      await writeDemandOutcomeAuthoritative(
+        {
+          runId,
+          ticket,
+          outcome: demandOutcomeToRunsOutcome(outcome),
+          outcomeSource: 'run-demand-pipeline-finalize',
+          finishedAt: new Date().toISOString(),
+        },
+        { writerName: 'cli' },
+      )
+    } catch (err) {
+      log(`${ticket} finalize：監控 DB 結構化終態寫入失敗: ${err}`)
+    }
+  } else {
+    log(`${ticket} finalize：MON_RUN_ID 未設定（監控 DB 未啟用，或非經 spawn-demand-pipeline.ts 啟動），略過監控 DB 寫入`)
+  }
 }
 
 async function main(): Promise<void> {
@@ -169,7 +205,7 @@ async function main(): Promise<void> {
     const sufficiency = await checkSpecSufficiencyFromContent(ticket, bodyText, comments)
     if (!sufficiency.sufficient) {
       log(`${ticket} 規格不足：${sufficiency.missing}`)
-      finalize(ticket, assigneeEmail, { kind: 'insufficient-spec', missing: sufficiency.missing })
+      await finalize(ticket, assigneeEmail, { kind: 'insufficient-spec', missing: sufficiency.missing })
       return
     }
 
@@ -179,10 +215,10 @@ async function main(): Promise<void> {
     log(`${ticket} 開始 plan pipeline（repos=${repos.join(', ')}）`)
     const outcome = await runDemandPlanPipeline(ticket, bodyText, comments, repos)
     log(`${ticket} plan pipeline 結束，分類=${outcome.kind}${outcome.kind === 'plan' ? `/${outcome.status}` : ''}`)
-    finalize(ticket, assigneeEmail, outcome)
+    await finalize(ticket, assigneeEmail, outcome)
   } catch (err) {
     log(`${ticket} pipeline 未預期例外：${err}`)
-    finalize(ticket, assigneeEmail, { kind: 'unexpected-error', detail: String(err).slice(0, 300) })
+    await finalize(ticket, assigneeEmail, { kind: 'unexpected-error', detail: String(err).slice(0, 300) })
   } finally {
     releaseLock(ticket)
   }

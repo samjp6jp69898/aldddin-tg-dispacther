@@ -33,10 +33,21 @@ export type JobRequest = {
   resume?: boolean
   triggeredBy?: TechUser
   assigneeEmail?: string
+  /** head 端 dispatch-registry.ts 鑄的 monitor DB `dispatch_attempts.dispatch_id`
+   * （plan-db-as-truth-v3.md §5.3）。worker 收到後把它寫進自己鑄的 `runs.dispatch_id`
+   * 欄——即使 postJob 逾時（ambiguous）拿不到回應 body，事後仍能用
+   * `runs.dispatch_id = dispatch_attempts.dispatch_id` 精確 join。目前 worker 側
+   * 的 submitCreateMr/submitDemandPipeline（lib/pipeline-runner/）尚未開放接受
+   * 這個參數並寫入 runs——本欄位先在協定層落地，等該介面補上即可串接。 */
+  dispatchId?: string
 }
 
 export type PostJobResult =
-  | { accepted: true; result: SubmitResult }
+  /** runId：worker `/jobs` 回應目前固定帶 `run_id: null`（見
+   * worker-agent.ts §5.4 的註解——run_id 尚無管道取得，等 pipeline-runner
+   * 開放介面後這裡會拿到真值）。型別先留好，呼叫端（dispatch.ts）可以直接
+   * 塞進 dispatch_attempts.remote_run_id，值是 null 時就是「暫時還沒有」。 */
+  | { accepted: true; result: SubmitResult; runId: string | null }
   | { accepted: false; reason: 'full' | 'rejected' | 'unreachable' }
   /** 逾時＝結果不明：worker 可能已接單只是回應沒回來。呼叫端（dispatch.ts）
    * 對這種情況絕不能改派其他機器（會造成兩台跑同一張單），只能保守當作
@@ -79,9 +90,10 @@ export async function postWorkerJob(url: string, secret: string, job: JobRequest
     })
     if (res.status === 409) return { accepted: false, reason: 'full' }
     if (!res.ok) return { accepted: false, reason: 'rejected' }
-    const result = (await res.json()) as SubmitResult
-    if (result?.ok !== true) return { accepted: false, reason: 'rejected' }
-    return { accepted: true, result }
+    const body = (await res.json()) as SubmitResult & { run_id?: string | null }
+    if (body?.ok !== true) return { accepted: false, reason: 'rejected' }
+    const { run_id, ...result } = body
+    return { accepted: true, result: result as SubmitResult, runId: run_id ?? null }
   } catch (err) {
     // 連線層立即失敗（refused/DNS）＝確定沒送達，可以安全改派；逾時＝不明。
     return { accepted: false, reason: isTimeoutLike(err) ? 'ambiguous' : 'unreachable' }

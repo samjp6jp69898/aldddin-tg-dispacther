@@ -1,4 +1,5 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { randomUUID } from 'node:crypto'
 import { dirname } from 'node:path'
 import { CLUSTER_TICKET_RE } from './cluster-env.ts'
 import type { QueueTriggeredBy } from '../pipeline-runner/pipeline-queue.ts'
@@ -22,10 +23,25 @@ import type { QueueTriggeredBy } from '../pipeline-runner/pipeline-queue.ts'
 //
 // 持久化（tmp+rename）：head 重啟後 recoverFromDisk 撿回，否則重啟瞬間所有
 // 遠端執行中的單都會「消失」而變回可認領。壞掉/被竄改的條目逐筆驗格式丟棄。
+//
+// dispatchId（plan-db-as-truth-v3.md §5.3，MJ-C2/MJ-C6）：head 在
+// markDispatching 之前鑄的 UUIDv4，是 monitor DB `dispatch_attempts` 表的
+// PK——比照 QueueEntry.runId 的持久化方式，寫進磁碟快照；head 重啟後
+// recoverFromDisk() 撿回，讀到舊格式（無 dispatchId）就鑄新的並在 log 標明
+// （不影響派工正確性，dispatchId 純粹是監控 DB 觀察面的鍵）。
+
+/** dispatch_attempts.status_rank（§5.3 MAJOR-D4）：dispatching=10 <
+ * dispatched=20 < 終態（cleared/lost_27h/vanished/never_started/superseded）=100。
+ * 純資料常數，供 dispatch.ts / backlog-dispatcher.ts / remote-sweeper.ts /
+ * cluster-head.ts 共用，避免各處各自硬編數字漂移。 */
+export const DISPATCH_STATUS_RANK = { dispatching: 10, dispatched: 20, terminal: 100 } as const
 
 export type DispatchEntry = {
   ticket: string
   kind: 'bug' | 'demand'
+  /** monitor DB `dispatch_attempts.dispatch_id`（PK）。純觀察面用途，不參與
+   * 任何派工正確性判斷（那仍由本表的 ticket 鍵 + 磁碟持久化保證）。 */
+  dispatchId: string
   /** dispatching = 已同步佔位、還在跟 worker 交涉；confirmed = worker 已接單。 */
   status: 'dispatching' | 'confirmed'
   worker: string
@@ -35,7 +51,9 @@ export type DispatchEntry = {
 }
 
 export type DispatchRegistry = {
-  markDispatching: (ticket: string, kind: 'bug' | 'demand', triggeredBy: QueueTriggeredBy) => void
+  /** 回傳新鑄的 dispatchId（呼叫端用它寫 monitor DB `dispatch_attempts` 的
+   * 建立列、並放進 /jobs 請求 body，見 §5.3）。 */
+  markDispatching: (ticket: string, kind: 'bug' | 'demand', triggeredBy: QueueTriggeredBy) => string
   confirmDispatched: (ticket: string, worker: string, workerUrl: string) => void
   clear: (ticket: string) => void
   get: (ticket: string) => DispatchEntry | null
@@ -64,8 +82,10 @@ export function createDispatchRegistry(stateFile: string): DispatchRegistry {
 
   return {
     markDispatching(ticket, kind, triggeredBy) {
-      entries.set(ticket, { ticket, kind, status: 'dispatching', worker: '', workerUrl: '', dispatchedAt: new Date().toISOString(), triggeredBy })
+      const dispatchId = randomUUID()
+      entries.set(ticket, { ticket, kind, dispatchId, status: 'dispatching', worker: '', workerUrl: '', dispatchedAt: new Date().toISOString(), triggeredBy })
       persist()
+      return dispatchId
     },
     confirmDispatched(ticket, worker, workerUrl) {
       const e = entries.get(ticket)
@@ -93,6 +113,12 @@ export function createDispatchRegistry(stateFile: string): DispatchRegistry {
             // 等於「worker 沒接到」，直接丟棄會讓單子變回可認領而雙跑。保留
             // 後交給 remote sweeper 向全部 worker 求證再決定轉 confirmed 或
             // 清除（寧可暫時卡住不可認領，不可雙跑）。
+            if (typeof e.dispatchId !== 'string' || e.dispatchId === '') {
+              // 舊格式（v3.2 §5.3 新增欄位之前寫的快照）：鑄新的並標明，純觀察面
+              // 用途，不影響上面已判定過的派工正確性欄位。
+              e.dispatchId = randomUUID()
+              console.error(`dispatch-registry: ${e.ticket} 的持久化條目缺 dispatchId（舊格式），已鑄新的：${e.dispatchId}`)
+            }
             entries.set(e.ticket, e)
           }
         }

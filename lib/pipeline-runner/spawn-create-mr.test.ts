@@ -1,8 +1,11 @@
-import { describe, expect, test } from 'bun:test'
+import { afterEach, describe, expect, test } from 'bun:test'
 import { mkdtempSync, readFileSync, rmSync, watch, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { spawnDetachedProcess, WRAPPER_SCRIPT } from './spawn-create-mr.ts'
+import { spawnDetachedProcess, WRAPPER_SCRIPT, dispatchMonitorWrite, __setMonitorTestOverrides, __resetMonitorTestOverrides } from './spawn-create-mr.ts'
+import { FakeRunsDb } from '../monitor-db/test-support/fake-runs-db.ts'
+import { writeRunProgress } from '../monitor-db/writes.ts'
+import type { SpoolEntry } from '../monitor-db/spool/types.ts'
 
 // review-integration 發現的真實缺口（E）：trap 裡 release/cleanup/notify 三行
 // 的順序完全沒有測試守護，未來有人改動時很容易在不自覺間打亂順序或漏掉一行
@@ -259,5 +262,191 @@ describe('spawnDetachedProcess — opts.onExit（T26 依賴的機制）', () => 
     ).toThrow()
 
     rmSync(dir, { recursive: true, force: true })
+  })
+})
+
+describe('spawnDetachedProcess — opts.onSpawnError（plan-db-as-truth-v3.2.md §9 Phase2：非同步 error 事件專用，區別於 onExit）', () => {
+  test('spawn 本身失敗（指令不存在）：onSpawnError 與 onExit 都被呼叫恰好一次', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'spawn-onerror-test-'))
+    const stdoutPath = join(dir, 'out.log')
+    const stderrPath = join(dir, 'err.log')
+    let onSpawnErrorCalls = 0
+    let onExitCalls = 0
+
+    await waitForOnExit(onExit =>
+      spawnDetachedProcess('this-command-definitely-does-not-exist-xyz', [], {
+        cwd: dir,
+        stdoutPath,
+        stderrPath,
+        onSpawnError: () => {
+          onSpawnErrorCalls++
+        },
+        onExit: () => {
+          onExitCalls++
+          onExit()
+        },
+      }),
+    )
+
+    expect(onSpawnErrorCalls).toBe(1)
+    expect(onExitCalls).toBe(1)
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  test('process 正常結束（exit 0）：onSpawnError 完全不被呼叫', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'spawn-onerror-test-'))
+    const stdoutPath = join(dir, 'out.log')
+    const stderrPath = join(dir, 'err.log')
+    let onSpawnErrorCalls = 0
+
+    await waitForOnExit(onExit =>
+      spawnDetachedProcess('bash', ['-c', 'exit 0'], {
+        cwd: dir,
+        stdoutPath,
+        stderrPath,
+        onSpawnError: () => {
+          onSpawnErrorCalls++
+        },
+        onExit,
+      }),
+    )
+
+    expect(onSpawnErrorCalls).toBe(0)
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  test('不傳 onSpawnError（既有呼叫端 spawn-demand-pipeline.ts／trigger-auto-sync.ts）：完全不受影響，不拋例外', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'spawn-onerror-test-'))
+    const stdoutPath = join(dir, 'out.log')
+    const stderrPath = join(dir, 'err.log')
+
+    await waitForOnExit(onExit =>
+      spawnDetachedProcess('this-command-definitely-does-not-exist-xyz', [], {
+        cwd: dir,
+        stdoutPath,
+        stderrPath,
+        onExit,
+      }),
+    )
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  test('onSpawnError 自己丟例外：吞掉並記 log，不影響既有的 onExit 呼叫', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'spawn-onerror-test-'))
+    const stdoutPath = join(dir, 'out.log')
+    const stderrPath = join(dir, 'err.log')
+    let onExitCalls = 0
+
+    await waitForOnExit(onExit =>
+      spawnDetachedProcess('this-command-definitely-does-not-exist-xyz', [], {
+        cwd: dir,
+        stdoutPath,
+        stderrPath,
+        onSpawnError: () => {
+          throw new Error('監控 DB 寫入掛了')
+        },
+        onExit: () => {
+          onExitCalls++
+          onExit()
+        },
+      }),
+    )
+
+    expect(onExitCalls).toBe(1)
+    rmSync(dir, { recursive: true, force: true })
+  })
+})
+
+/** 假 spool writer：只記錄 append 呼叫，不碰真的檔案系統。 */
+function makeFakeSpool() {
+  const appended: Array<Omit<SpoolEntry, 'seq'>> = []
+  return {
+    appended,
+    append: (e: Omit<SpoolEntry, 'seq'>) => appended.push(e),
+    appendBatch: (es: Array<Omit<SpoolEntry, 'seq'>>) => appended.push(...es),
+    filePath: () => '/tmp/fake-spool-test.jsonl',
+    close: () => {},
+  }
+}
+
+describe('dispatchMonitorWrite — plan-db-as-truth-v3.2.md §6.7 非阻斷派送：逾時/失敗落 spool，flag 關閉時零行為', () => {
+  afterEach(() => {
+    __resetMonitorTestOverrides()
+  })
+
+  test('寫入成功 → 直接落地，不落 spool', async () => {
+    const fakeDb = new FakeRunsDb()
+    const fakeSpool = makeFakeSpool()
+    __setMonitorTestOverrides({ pool: fakeDb, spool: fakeSpool })
+
+    const input = { runId: 'r-1', ticket: 'FAQ-1', kind: 'bug' as const, lifecycleRank: 30 as const, pid: 111 }
+    await dispatchMonitorWrite('writeRunProgress', input, pool => writeRunProgress(pool, input))
+
+    expect(fakeDb.rows.get('r-1')).not.toBeUndefined()
+    expect(fakeSpool.appended.length).toBe(0)
+  })
+
+  test('call() 丟例外（模擬連線中斷）→ 落 spool，條目帶正確 run_id/fn/args', async () => {
+    const throwingPool = { execute: async () => Promise.reject(new Error('連線斷了')) }
+    const fakeSpool = makeFakeSpool()
+    __setMonitorTestOverrides({ pool: throwingPool, spool: fakeSpool })
+
+    const input = { runId: 'r-2', ticket: 'FAQ-2', kind: 'bug' as const, lifecycleRank: 30 as const, pid: 222 }
+    await dispatchMonitorWrite('writeRunProgress', input, pool => writeRunProgress(pool, input))
+
+    expect(fakeSpool.appended.length).toBe(1)
+    expect(fakeSpool.appended[0]!.run_id).toBe('r-2')
+    expect(fakeSpool.appended[0]!.fn).toBe('writeRunProgress')
+    expect(fakeSpool.appended[0]!.args).toEqual([input])
+  })
+
+  test('pool 為 null（模擬 createMonitorPool 失敗）→ 落 spool', async () => {
+    const fakeSpool = makeFakeSpool()
+    __setMonitorTestOverrides({ pool: null, spool: fakeSpool })
+
+    const input = { runId: 'r-3', ticket: 'FAQ-3', kind: 'bug' as const, lifecycleRank: 30 as const }
+    await dispatchMonitorWrite('writeRunProgress', input, pool => writeRunProgress(pool, input))
+
+    expect(fakeSpool.appended.length).toBe(1)
+    expect(fakeSpool.appended[0]!.run_id).toBe('r-3')
+  })
+
+  test('spool.append 本身也丟例外 → 吞掉，不讓呼叫端連坐（best-effort，只記 log）', async () => {
+    const throwingPool = { execute: async () => Promise.reject(new Error('連線斷了')) }
+    const throwingSpool = {
+      append: () => {
+        throw new Error('磁碟滿了')
+      },
+      appendBatch: () => {
+        throw new Error('磁碟滿了')
+      },
+      filePath: () => '/tmp/x',
+      close: () => {},
+    }
+    __setMonitorTestOverrides({ pool: throwingPool, spool: throwingSpool })
+
+    const input = { runId: 'r-4', ticket: 'FAQ-4', kind: 'bug' as const, lifecycleRank: 30 as const }
+    await expect(dispatchMonitorWrite('writeRunProgress', input, pool => writeRunProgress(pool, input))).resolves.toBeUndefined()
+  })
+
+  test('MON_DB_ENABLED 未設、無覆寫 → 不拋例外、不觸碰真的 logs/spool 目錄（§9.0(B) 零行為變化）', async () => {
+    __resetMonitorTestOverrides()
+    const prevFlag = process.env.MON_DB_ENABLED
+    delete process.env.MON_DB_ENABLED
+    try {
+      const { SPOOL_DIR } = await import('../monitor-db/spool/types.ts')
+      const { existsSync } = await import('node:fs')
+      const existedBefore = existsSync(SPOOL_DIR)
+      // 刻意完全不呼叫 __setMonitorTestOverrides：驗證的正是「一旦真的沒有
+      // 任何覆寫、旗標也關著」這個最真實的關閉情境——getMonitorPool() 應在
+      // isMonitorDbEnabled() 為 false 時直接回 null，連 getMonitorSpoolWriter()
+      // 都不會被呼叫，所以連 SPOOL_DIR 都不該被建立出來。
+      const input = { runId: 'r-5', ticket: 'FAQ-5', kind: 'bug' as const, lifecycleRank: 30 as const }
+      await expect(dispatchMonitorWrite('writeRunProgress', input, pool => writeRunProgress(pool, input))).resolves.toBeUndefined()
+      if (!existedBefore) expect(existsSync(SPOOL_DIR)).toBe(false)
+    } finally {
+      if (prevFlag === undefined) delete process.env.MON_DB_ENABLED
+      else process.env.MON_DB_ENABLED = prevFlag
+    }
   })
 })

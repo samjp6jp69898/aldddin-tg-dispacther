@@ -421,7 +421,8 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(3))
 
 export const DISPATCH_ATTEMPT_ADVANCE_SQL = `
 UPDATE dispatch_attempts
-   SET status = ?, status_rank = ?, confirmed_at = ?, cleared_at = ?, clear_reason = ?, remote_run_id = ?
+   SET status = ?, status_rank = ?, confirmed_at = ?, cleared_at = ?, clear_reason = ?, remote_run_id = ?,
+       worker_name = COALESCE(worker_name, ?), worker_url = COALESCE(worker_url, ?)
  WHERE dispatch_id = ? AND status_rank < ?
 `.trim()
 
@@ -463,6 +464,13 @@ export interface AdvanceDispatchAttemptInput {
   clearedAt?: string | null
   clearReason?: string | null
   remoteRunId?: string | null
+  /** worker 在 create() 當下（status='dispatching'）還沒選出，第一次 advance
+   * 到 'dispatched'/'already_running_remote' 才知道是哪一台——`COALESCE`
+   * 只在首次寫入生效（worker 選定後不會再變），未提供時傳 null 不清空既有值
+   * （否則 2C 回報的缺口：cleared/exception 等後續 advance 沒帶 worker 資訊，
+   * 會把已經寫好的 worker_name/worker_url 覆蓋回 NULL）。 */
+  workerName?: string | null
+  workerUrl?: string | null
 }
 
 /** `status_rank` 只能單調前進：`WHERE dispatch_id=? AND status_rank < ?`。 */
@@ -474,6 +482,8 @@ export async function advanceDispatchAttempt(pool: MonitorDbExecutor, input: Adv
     dt(input.clearedAt),
     input.clearReason ?? null,
     input.remoteRunId ?? null,
+    input.workerName ?? null,
+    input.workerUrl ?? null,
     input.dispatchId,
     input.statusRank,
   ])
@@ -481,17 +491,64 @@ export async function advanceDispatchAttempt(pool: MonitorDbExecutor, input: Adv
   return { kind: 'guarded', guardedReason: 'guarded_rank' }
 }
 
+export const DISPATCH_ATTEMPT_SUPERSEDE_SQL = `
+UPDATE dispatch_attempts
+   SET status = 'superseded', status_rank = 100
+ WHERE ticket = ? AND kind = ? AND status_rank < 100 AND dispatch_id != ?
+`.trim()
+
+export interface SupersedeDispatchAttemptsInput {
+  ticket: string
+  kind: RunKind
+  /** 新鑄的 dispatch_id；此刻通常還沒有列（markDispatching 剛鑄好，
+   * create() 尚未落地），排除它只是防禦性寫法，不依賴呼叫順序。 */
+  excludeDispatchId: string
+}
+
+/**
+ * §5.3（MJ-C6 後半）：`markDispatching` 鑄新 `dispatch_id` 時，對同
+ * `(ticket, kind)` 的所有 `status_rank < 100`（尚未終結）舊列一併寫
+ * `superseded`——單一 UPDATE，守衛與 `advanceDispatchAttempt` 相同的
+ * `status_rank < 100`。純觀察面 best-effort，`matched=0`（沒有舊列，第一次
+ * 派工這張票）是正常情況，不是錯誤。
+ */
+export async function supersedeOtherDispatchAttempts(pool: MonitorDbExecutor, input: SupersedeDispatchAttemptsInput): Promise<WriteOutcome> {
+  const r = await execUpdate(pool, DISPATCH_ATTEMPT_SUPERSEDE_SQL, [input.ticket, input.kind, input.excludeDispatchId])
+  return r.matched > 0 ? { kind: 'applied' } : { kind: 'guarded', guardedReason: 'guarded_other' }
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // agent_runs（形狀 A：純 additive，PK=(run_id, path)）
 // ─────────────────────────────────────────────────────────────────────────
 
+// migration 003（migration-003-proposal.md，已採納）：補 10 個 payload 欄，
+// 對齊 tg-monitor 既有 sqlite agent_runs 表與 api-inventory 的 AgentSummary
+// 形狀。刻意不搬 ticket/kind（可由 run_id → runs join 得到，不反正規化）與
+// file_mtime（collector 私有再解析游標，行程私有狀態不進權威表）。
+// first-write-wins（COALESCE 補空）取捨見提案 §4：Phase 4 collector 建議只在
+// trace 終態（ended_at 已知）時才帶 payload 欄寫入，未終態先寫 NULL——
+// 與既有 §6.2.2「finished_at 一次寫定」同構，不需要為此破例改守衛形狀。
 export const AGENT_RUN_UPSERT_SQL = `
-INSERT INTO agent_runs (run_id, path, host, agent_name, started_at, finished_at)
-VALUES (?,?,?,?,?,?) AS new
+INSERT INTO agent_runs (
+  run_id, path, host, agent_name, started_at, finished_at,
+  model, input_tokens, output_tokens, cache_read_tokens, cache_create_tokens,
+  cost_usd, num_turns, tool_calls, is_error, result_preview
+)
+VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) AS new
 ON DUPLICATE KEY UPDATE
-  agent_name  = COALESCE(agent_runs.agent_name,  new.agent_name),
-  started_at  = COALESCE(agent_runs.started_at,  new.started_at),
-  finished_at = COALESCE(agent_runs.finished_at, new.finished_at)
+  agent_name          = COALESCE(agent_runs.agent_name,          new.agent_name),
+  started_at          = COALESCE(agent_runs.started_at,          new.started_at),
+  finished_at          = COALESCE(agent_runs.finished_at,          new.finished_at),
+  model                 = COALESCE(agent_runs.model,                 new.model),
+  input_tokens           = COALESCE(agent_runs.input_tokens,           new.input_tokens),
+  output_tokens            = COALESCE(agent_runs.output_tokens,            new.output_tokens),
+  cache_read_tokens          = COALESCE(agent_runs.cache_read_tokens,          new.cache_read_tokens),
+  cache_create_tokens          = COALESCE(agent_runs.cache_create_tokens,          new.cache_create_tokens),
+  cost_usd                       = COALESCE(agent_runs.cost_usd,                       new.cost_usd),
+  num_turns                        = COALESCE(agent_runs.num_turns,                        new.num_turns),
+  tool_calls                         = COALESCE(agent_runs.tool_calls,                         new.tool_calls),
+  is_error                             = COALESCE(agent_runs.is_error,                             new.is_error),
+  result_preview                         = COALESCE(agent_runs.result_preview,                         new.result_preview)
 `.trim()
 
 export interface UpsertAgentRunInput {
@@ -500,6 +557,17 @@ export interface UpsertAgentRunInput {
   agentName?: string | null
   startedAt?: string | null
   finishedAt?: string | null
+  model?: string | null
+  inputTokens?: number | null
+  outputTokens?: number | null
+  cacheReadTokens?: number | null
+  cacheCreateTokens?: number | null
+  costUsd?: number | null
+  numTurns?: number | null
+  toolCalls?: number | null
+  isError?: boolean | null
+  /** 呼叫端應截斷至 512 字元（result_preview 欄寬）；本函式仍防禦性截斷一次。 */
+  resultPreview?: string | null
 }
 
 /** 純 additive 合併（COALESCE 補空欄），`finished_at` 一次寫定後不會被後續呼叫改掉。 */
@@ -511,6 +579,16 @@ export async function upsertAgentRun(pool: MonitorDbExecutor, input: UpsertAgent
     input.agentName ?? null,
     dt(input.startedAt),
     dt(input.finishedAt),
+    input.model ?? null,
+    input.inputTokens ?? null,
+    input.outputTokens ?? null,
+    input.cacheReadTokens ?? null,
+    input.cacheCreateTokens ?? null,
+    input.costUsd ?? null,
+    input.numTurns ?? null,
+    input.toolCalls ?? null,
+    input.isError == null ? null : input.isError ? 1 : 0,
+    input.resultPreview == null ? null : input.resultPreview.slice(0, 512),
   ])
   const affected = (header as ResultSetHeader).affectedRows
   if (affected === 1) return { kind: 'inserted' }

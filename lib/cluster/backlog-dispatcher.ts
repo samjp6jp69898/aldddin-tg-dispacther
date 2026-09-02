@@ -1,8 +1,8 @@
 import type { QueueEntry } from '../pipeline-runner/pipeline-queue.ts'
 import type { BugPayload } from '../pipeline-runner/spawn-create-mr.ts'
 import type { DemandPayload } from '../pipeline-runner/spawn-demand-pipeline.ts'
-import { freeSlots } from './dispatch.ts'
-import type { DispatchRegistry } from './dispatch-registry.ts'
+import { freeSlots, type DispatchAttemptWriteDeps } from './dispatch.ts'
+import { DISPATCH_STATUS_RANK, type DispatchRegistry } from './dispatch-registry.ts'
 import type { WorkerInfo } from './worker-registry.ts'
 import type { CapacityReport, JobRequest, PostJobResult } from './worker-client.ts'
 import type { TechUser } from '../user-resolution/tech-user.ts'
@@ -38,6 +38,9 @@ export type BacklogDispatcherDeps = {
   listWorkers: () => WorkerInfo[]
   bug: { tryDispatchFront: (attempt: (entry: QueueEntry<BugPayload>) => Promise<boolean>) => Promise<'empty' | 'dispatched' | 'declined'> }
   demand: { tryDispatchFront: (attempt: (entry: QueueEntry<DemandPayload>) => Promise<boolean>) => Promise<'empty' | 'dispatched' | 'declined'> }
+  /** monitor DB `dispatch_attempts` 觀察面寫入，比照 dispatch.ts（§5.3）。optional：
+   * 省略時等同單機/測試模式，不寫入也不影響遞補正確性。 */
+  dispatchAttempts?: DispatchAttemptWriteDeps
 }
 
 export type BacklogDispatcher = {
@@ -53,16 +56,16 @@ function toTechUser(triggeredBy: QueueEntry<unknown>['triggeredBy']): TechUser |
   return triggeredBy ? { notion_user_id: '', notion_user_name: triggeredBy.name, email: triggeredBy.email } : undefined
 }
 
-function buildJobRequest(kind: 'bug', entry: QueueEntry<BugPayload>): JobRequest
-function buildJobRequest(kind: 'demand', entry: QueueEntry<DemandPayload>): JobRequest
-function buildJobRequest(kind: 'bug' | 'demand', entry: QueueEntry<BugPayload> | QueueEntry<DemandPayload>): JobRequest {
+function buildJobRequest(kind: 'bug', entry: QueueEntry<BugPayload>, dispatchId: string): JobRequest
+function buildJobRequest(kind: 'demand', entry: QueueEntry<DemandPayload>, dispatchId: string): JobRequest
+function buildJobRequest(kind: 'bug' | 'demand', entry: QueueEntry<BugPayload> | QueueEntry<DemandPayload>, dispatchId: string): JobRequest {
   const triggeredBy = toTechUser(entry.triggeredBy)
   if (kind === 'bug') {
     const e = entry as QueueEntry<BugPayload>
-    return { kind: 'bug', ticket: e.ticket, resume: e.payload.resume, triggeredBy }
+    return { kind: 'bug', ticket: e.ticket, resume: e.payload.resume, triggeredBy, dispatchId }
   }
   const e = entry as QueueEntry<DemandPayload>
-  return { kind: 'demand', ticket: e.ticket, assigneeEmail: e.payload.assigneeEmail, triggeredBy }
+  return { kind: 'demand', ticket: e.ticket, assigneeEmail: e.payload.assigneeEmail, triggeredBy, dispatchId }
 }
 
 export function createBacklogDispatcher(deps: BacklogDispatcherDeps): BacklogDispatcher {
@@ -70,6 +73,8 @@ export function createBacklogDispatcher(deps: BacklogDispatcherDeps): BacklogDis
   // 一輪要對每台 worker × 兩個 kind 各打一次網路，理論上可能拖過下一次
   // 10 分鐘 timer，避免疊加。
   let sweeping = false
+
+  const attempts = deps.dispatchAttempts
 
   async function fillFreedSlot(kind: 'bug' | 'demand', worker: WorkerInfo): Promise<void> {
     if (kind === 'bug') {
@@ -84,14 +89,32 @@ export function createBacklogDispatcher(deps: BacklogDispatcherDeps): BacklogDis
           return false
         }
         // 同步佔位：見檔頭註解，必須是 attempt 的第一行、postJob 的 await 之前。
-        deps.registry.markDispatching(entry.ticket, 'bug', entry.triggeredBy)
-        const r = await deps.postJob(worker, buildJobRequest('bug', entry))
+        const dispatchId = deps.registry.markDispatching(entry.ticket, 'bug', entry.triggeredBy)
+        const dispatchedAt = new Date().toISOString()
+        attempts?.create({
+          dispatchId,
+          ticket: entry.ticket,
+          kind: 'bug',
+          status: 'dispatching',
+          statusRank: DISPATCH_STATUS_RANK.dispatching,
+          dispatchedAt,
+          triggeredByEmail: entry.triggeredBy?.email ?? null,
+        })
+        const r = await deps.postJob(worker, buildJobRequest('bug', entry, dispatchId))
         if (r.accepted || r.reason === 'ambiguous') {
           deps.registry.confirmDispatched(entry.ticket, worker.name, worker.url)
+          attempts?.advance({
+            dispatchId,
+            status: 'dispatched',
+            statusRank: DISPATCH_STATUS_RANK.dispatched,
+            confirmedAt: new Date().toISOString(),
+            remoteRunId: r.accepted ? r.runId : null,
+          })
           return true
         }
         // full/rejected/unreachable：確定沒接單，撤掉佔位，讓單塞回隊頭。
         deps.registry.clear(entry.ticket)
+        attempts?.advance({ dispatchId, status: 'cleared', statusRank: DISPATCH_STATUS_RANK.terminal, clearedAt: new Date().toISOString(), clearReason: r.reason })
         return false
       })
       return
@@ -101,13 +124,31 @@ export function createBacklogDispatcher(deps: BacklogDispatcherDeps): BacklogDis
         console.error(`backlog-dispatcher: ${entry.ticket} 進佇列時已有登記表條目，跳過本次遞補（不應發生，需人工檢查）`)
         return false
       }
-      deps.registry.markDispatching(entry.ticket, 'demand', entry.triggeredBy)
-      const r = await deps.postJob(worker, buildJobRequest('demand', entry))
+      const dispatchId = deps.registry.markDispatching(entry.ticket, 'demand', entry.triggeredBy)
+      const dispatchedAt = new Date().toISOString()
+      attempts?.create({
+        dispatchId,
+        ticket: entry.ticket,
+        kind: 'demand',
+        status: 'dispatching',
+        statusRank: DISPATCH_STATUS_RANK.dispatching,
+        dispatchedAt,
+        triggeredByEmail: entry.triggeredBy?.email ?? null,
+      })
+      const r = await deps.postJob(worker, buildJobRequest('demand', entry, dispatchId))
       if (r.accepted || r.reason === 'ambiguous') {
         deps.registry.confirmDispatched(entry.ticket, worker.name, worker.url)
+        attempts?.advance({
+          dispatchId,
+          status: 'dispatched',
+          statusRank: DISPATCH_STATUS_RANK.dispatched,
+          confirmedAt: new Date().toISOString(),
+          remoteRunId: r.accepted ? r.runId : null,
+        })
         return true
       }
       deps.registry.clear(entry.ticket)
+      attempts?.advance({ dispatchId, status: 'cleared', statusRank: DISPATCH_STATUS_RANK.terminal, clearedAt: new Date().toISOString(), clearReason: r.reason })
       return false
     })
   }

@@ -37,6 +37,7 @@ function makeHarness(opts: {
   const localSubmits: string[] = []
   const postedJobs: { worker: string; job: JobRequest }[] = []
   const probedTickets: { worker: string; ticket: string }[] = []
+  const dispatchAttemptCalls: { fn: 'create' | 'advance' | 'supersedeOthers'; input: Record<string, unknown> }[] = []
   const deps: DispatchDeps = {
     registry,
     listWorkers: () => opts.workers ?? [],
@@ -48,7 +49,12 @@ function makeHarness(opts: {
     },
     postJob: async (w, job) => {
       postedJobs.push({ worker: w.name, job })
-      return opts.postResults?.[w.name] ?? { accepted: true, result: { ok: true, status: 'started', pid: 1 } }
+      return opts.postResults?.[w.name] ?? { accepted: true, result: { ok: true, status: 'started', pid: 1 }, runId: null }
+    },
+    dispatchAttempts: {
+      supersedeOthers: input => dispatchAttemptCalls.push({ fn: 'supersedeOthers', input }),
+      create: input => dispatchAttemptCalls.push({ fn: 'create', input }),
+      advance: input => dispatchAttemptCalls.push({ fn: 'advance', input }),
     },
     local: {
       bug: {
@@ -75,6 +81,7 @@ function makeHarness(opts: {
     localSubmits,
     postedJobs,
     probedTickets,
+    dispatchAttemptCalls,
     cleanup: () => rmSync(dir, { recursive: true, force: true }),
   }
 }
@@ -170,7 +177,7 @@ describe('createDispatcher — out-of-band healing（C-1）', () => {
     const h = makeHarness({
       workers: [worker('w1')],
       capacities: { w1: cap(stats(0)) },
-      postResults: { w1: { accepted: true, result: { ok: true, status: 'already_running' } } },
+      postResults: { w1: { accepted: true, result: { ok: true, status: 'already_running' }, runId: null } },
       localBugStats: full,
     })
     const r = await h.dispatcher.dispatchBug('FAQ-1', USER)
@@ -242,5 +249,81 @@ describe('createDispatcher — 失敗處理', () => {
     expect(remoteWins.postedJobs[0]!.job).toMatchObject({ kind: 'demand', ticket: 'ALDREQ-9', assigneeEmail: 'a@x.tw', triggeredBy: USER })
     expect(remoteWins.registry.get('ALDREQ-9')?.kind).toBe('demand')
     remoteWins.cleanup()
+  })
+})
+
+describe('createDispatcher — dispatch_attempts 觀察面寫入（plan §5.3）', () => {
+  test('遠端派工成功：create(dispatching) 先於 advance(dispatched)，dispatchId 前後一致，job body 帶 dispatchId', async () => {
+    const h = makeHarness({
+      workers: [worker('w1')],
+      capacities: { w1: cap(stats(2)) },
+      localBugStats: full,
+    })
+    await h.dispatcher.dispatchBug('FAQ-1', USER)
+    expect(h.dispatchAttemptCalls.map(c => c.fn)).toEqual(['supersedeOthers', 'create', 'advance'])
+    const dispatchId = h.dispatchAttemptCalls[1]!.input.dispatchId
+    expect(dispatchId).toMatch(/^[0-9a-f-]{36}$/)
+    expect(h.dispatchAttemptCalls[1]!.input).toMatchObject({ ticket: 'FAQ-1', kind: 'bug', status: 'dispatching', statusRank: 10, triggeredByEmail: 't@x.tw' })
+    expect(h.dispatchAttemptCalls[2]!.input).toMatchObject({ dispatchId, status: 'dispatched', statusRank: 20 })
+    // 整合修補：advance(dispatched) 必須帶 worker 資訊，否則 writes.ts 的
+    // COALESCE 永遠補不到值、dispatch_attempts.worker_name/worker_url 永遠 NULL。
+    expect(h.dispatchAttemptCalls[2]!.input).toMatchObject({ workerName: 'w1', workerUrl: worker('w1').url })
+    expect(h.postedJobs[0]!.job.dispatchId).toBe(dispatchId as string)
+    h.cleanup()
+  })
+
+  test('退回本機（本機名額 ≥ worker）：create(dispatching) 之後緊接 advance(cleared, no_remote_capacity)', async () => {
+    const h = makeHarness({
+      workers: [worker('w1')],
+      capacities: { w1: cap(stats(2)) },
+      localBugStats: stats(2), // 平手本機優先
+    })
+    await h.dispatcher.dispatchBug('FAQ-1', USER)
+    expect(h.dispatchAttemptCalls.map(c => c.fn)).toEqual(['supersedeOthers', 'create', 'advance'])
+    expect(h.dispatchAttemptCalls[2]!.input).toMatchObject({ status: 'cleared', statusRank: 100, clearReason: 'no_remote_capacity' })
+    h.cleanup()
+  })
+
+  test('worker 拒絕（full）：advance(cleared) 的 clearReason 帶原始拒絕原因', async () => {
+    const h = makeHarness({
+      workers: [worker('w1')],
+      capacities: { w1: cap(stats(2)) },
+      postResults: { w1: { accepted: false, reason: 'full' } },
+      localBugStats: full,
+    })
+    await h.dispatcher.dispatchBug('FAQ-1', USER)
+    expect(h.dispatchAttemptCalls[2]!.input).toMatchObject({ status: 'cleared', statusRank: 100, clearReason: 'full' })
+    h.cleanup()
+  })
+
+  test('§5.3：markDispatching 之後、create 之前呼叫 supersedeOthers（若 deps 有提供）', async () => {
+    const h = makeHarness({
+      workers: [worker('w1')],
+      capacities: { w1: cap(stats(2)) },
+      localBugStats: full,
+    })
+    await h.dispatcher.dispatchBug('FAQ-1', USER)
+    expect(h.dispatchAttemptCalls.map(c => c.fn)).toEqual(['supersedeOthers', 'create', 'advance'])
+    const dispatchId = h.dispatchAttemptCalls[1]!.input.dispatchId
+    expect(h.dispatchAttemptCalls[0]!.input).toMatchObject({ ticket: 'FAQ-1', kind: 'bug', excludeDispatchId: dispatchId })
+    h.cleanup()
+  })
+
+  test('沒有 dispatchAttempts deps（單機/舊測試相容）：不拋例外，行為不變', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dispatch-test-'))
+    const registry = createDispatchRegistry(join(dir, 'dispatched.json'))
+    const deps: DispatchDeps = {
+      registry,
+      listWorkers: () => [worker('w1')],
+      fetchCapacity: async () => cap(stats(2)),
+      postJob: async () => ({ accepted: true, result: { ok: true, status: 'started', pid: 1 }, runId: null }),
+      local: {
+        bug: { stats: () => full, has: () => null, submit: () => ({ ok: true, status: 'started', pid: 99 }) },
+        demand: { stats: () => idle, has: () => null, submit: () => ({ ok: true, status: 'started', pid: 99 }) },
+      },
+    }
+    const r = await createDispatcher(deps).dispatchBug('FAQ-1', USER)
+    expect(r).toEqual({ ok: true, status: 'remote_started', worker: 'w1' })
+    rmSync(dir, { recursive: true, force: true })
   })
 })

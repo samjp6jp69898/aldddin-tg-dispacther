@@ -1,5 +1,12 @@
 import { describe, expect, test } from 'bun:test'
-import { classifyAiAnalysis, buildNotionCommentText, buildTelegramText, shouldUploadPlan, type DemandOutcome } from './demand-finalize.ts'
+import {
+  classifyAiAnalysis,
+  buildNotionCommentText,
+  buildTelegramText,
+  shouldUploadPlan,
+  demandOutcomeToRunsOutcome,
+  type DemandOutcome,
+} from './demand-finalize.ts'
 
 describe('classifyAiAnalysis', () => {
   test('plan/success → 分析成功', () => {
@@ -22,6 +29,43 @@ describe('classifyAiAnalysis', () => {
   })
   test('unexpected-error → 分析失敗', () => {
     expect(classifyAiAnalysis({ kind: 'unexpected-error', detail: 'boom' })).toBe('分析失敗')
+  })
+})
+
+describe('demandOutcomeToRunsOutcome（監控 DB 化：runs.outcome 結構化值域）', () => {
+  test('plan/success → success', () => {
+    expect(demandOutcomeToRunsOutcome({ kind: 'plan', status: 'success', planPath: '/x', summary: 's' })).toBe('success')
+  })
+  test('plan/already-satisfied → already_satisfied', () => {
+    expect(demandOutcomeToRunsOutcome({ kind: 'plan', status: 'already-satisfied', planPath: '/x', summary: 's' })).toBe('already_satisfied')
+  })
+  test('plan/needs-clarification → needs_clarification', () => {
+    expect(demandOutcomeToRunsOutcome({ kind: 'plan', status: 'needs-clarification', planPath: '/x', summary: 's' })).toBe('needs_clarification')
+  })
+  test('insufficient-spec → insufficient_spec', () => {
+    expect(demandOutcomeToRunsOutcome({ kind: 'insufficient-spec', missing: 'x' })).toBe('insufficient_spec')
+  })
+  test('setup-failed → setup_failed', () => {
+    expect(demandOutcomeToRunsOutcome({ kind: 'setup-failed', reason: 'x' })).toBe('setup_failed')
+  })
+  test('implementer-error → implementer_error', () => {
+    expect(demandOutcomeToRunsOutcome({ kind: 'implementer-error', detail: 'x' })).toBe('implementer_error')
+  })
+  test('unexpected-error → unexpected_error', () => {
+    expect(demandOutcomeToRunsOutcome({ kind: 'unexpected-error', detail: 'x' })).toBe('unexpected_error')
+  })
+  test('值域彼此互異（不允許兩個 DemandOutcome 分支對映到同一個 runs.outcome 字串）', () => {
+    const outcomes: DemandOutcome[] = [
+      { kind: 'plan', status: 'success', planPath: '/x', summary: 's' },
+      { kind: 'plan', status: 'already-satisfied', planPath: '/x', summary: 's' },
+      { kind: 'plan', status: 'needs-clarification', planPath: '/x', summary: 's' },
+      { kind: 'insufficient-spec', missing: 'x' },
+      { kind: 'setup-failed', reason: 'x' },
+      { kind: 'implementer-error', detail: 'x' },
+      { kind: 'unexpected-error', detail: 'x' },
+    ]
+    const mapped = outcomes.map(demandOutcomeToRunsOutcome)
+    expect(new Set(mapped).size).toBe(mapped.length)
   })
 })
 

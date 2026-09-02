@@ -36,14 +36,13 @@ describe('Phase 1.4 關門測試索引（見上方註解，逐條對照到各模
 // markCancelled 以 run_id 定位，§6.4(4)）與 DB client（lib/monitor-db/writes.ts）
 // 的所有權範圍，兩者在本次派工都不屬於本檔負責人。
 //
-// 依派工指示「若屬 cancel 解析範圍（Phase 2）就在測試檔留 TODO 標記與情境
-// 描述，不硬湊」——這裡只留描述性佔位，不在 spool 模組內假造一個不對題的
-// cancel-resolution 測試。
-test.todo(
-  'MJ-H1（cancel run_id 解析）：同票 auto-retry 交疊時 R2 marker 被覆寫 + R1（host 不符）失效 → ' +
-    '確定性 R3（legacy_key/stdout_path 對位）優先於 R2；R2 命中時需通過 marker.runId 對應列的 ' +
-    'ticket/kind 一致性自我驗證，不一致則降級並計 cancel_marker_mismatch。' +
-    '這是 cancel 解析（Phase 2 / lib/monitor-db/writes.ts 所有權範圍）的測試，不在 spool 模組職責內，此處僅佔位。',
-  // bun-types 的 test.todo 簽名要求帶 fn（執行期單參數其實合法）；空 fn 讓嚴格 tsc 過。
-  () => {},
-)
+// 已落實成真測試（不再是佔位）：
+//   lib/monitor-db/cancel-resolve.test.ts
+//   → describe('resolveRunId — MJ-H1：同票 auto-retry 交疊 + R1 失效（可證偽關卡，impl-errata-g2.md 指名）')
+// 兩條測試：(1) R1 失效、R3 對位成功時必須贏過已被覆寫的 R2 marker（核心關卡）；
+// (2) R3 也失效時才退到 R2，且如實回報（不計 mismatch，因為 kind 本身一致，
+// 只是 marker 指向錯誤的 run——這是裁定明文承認的殘餘風險，見該檔檔頭）。
+// R2 的 ticket/kind 自我驗證不一致 → 降級並計 markerMismatch 由另一組獨立測試
+// 覆蓋（同檔 describe('resolveRunId — 五段解析次序…')）。
+// 這是 cancel 解析（Phase 2 / lib/monitor-db/cancel-resolve.ts 所有權範圍）的
+// 測試，不在 spool 模組職責內，此處不重複邏輯，只留索引指向。

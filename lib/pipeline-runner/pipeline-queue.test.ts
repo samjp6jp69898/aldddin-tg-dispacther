@@ -23,6 +23,7 @@ function makeHarness(
   const dequeueStarted: string[] = []
   const dequeueFailed: string[] = []
   const skipped: { ticket: string; reason: string }[] = []
+  const enqueued: string[] = []
   const queue = createPipelineQueue<{ tag: string }>({
     limiter: createConcurrencyLimiter(limit),
     stateFile,
@@ -37,9 +38,13 @@ function makeHarness(
       const text = opts.skipTickets?.get(entry.ticket)
       return text ? { code: 'test', text } : null
     },
+    onEnqueued: e => enqueued.push(e.ticket),
     onSkipped: (e, reason) => skipped.push({ ticket: e.ticket, reason: reason.text }),
     onDequeueStarted: e => dequeueStarted.push(e.ticket),
     onDequeueFailed: e => dequeueFailed.push(e.ticket),
+    // §5.6：泛型測試佇列沒有真的監控 DB run_id，借用 payload.tag 當 stand-in，
+    // 讓 recoverFromDisk() 的三組陣列在測試裡可觀察。
+    getRunId: p => p.tag,
   })
   if (opts.enablePersist) queue.recoverFromDisk()
   const finish = (ticket: string) => {
@@ -50,7 +55,7 @@ function makeHarness(
   }
   const readState = () => JSON.parse(readFileSync(stateFile, 'utf8')) as { updatedAt: string; entries: QueueEntry<{ tag: string }>[] }
   const cleanup = () => rmSync(dir, { recursive: true, force: true })
-  return { queue, stateFile, spawned, dequeueStarted, dequeueFailed, skipped, finish, readState, cleanup }
+  return { queue, stateFile, spawned, dequeueStarted, dequeueFailed, skipped, enqueued, finish, readState, cleanup }
 }
 
 describe('createPipelineQueue — 額度內直接啟動、額滿 FIFO 排隊', () => {
@@ -93,7 +98,7 @@ describe('createPipelineQueue — 額度內直接啟動、額滿 FIFO 排隊', (
       JSON.stringify({ updatedAt: new Date().toISOString(), entries: [{ ticket: 'FAQ-3', enqueuedAt: new Date().toISOString(), triggeredBy: null, payload: { tag: 'dup' } }] }),
     )
     const r = h.queue.recoverFromDisk()
-    expect(r.skipped).toBe(1)
+    expect(r.skipped).toEqual(['dup'])
     expect(h.skipped[h.skipped.length - 1]!.reason).toContain('不重複觸發')
     expect(h.spawned).toEqual(['FAQ-1', 'FAQ-2', 'FAQ-3']) // FAQ-3 只 spawn 過一次
     h.cleanup()
@@ -241,7 +246,7 @@ describe('createPipelineQueue — 持久化與重啟恢復', () => {
       }),
     )
     const r = h.queue.recoverFromDisk()
-    expect(r).toEqual({ started: 1, requeued: 1, skipped: 0 })
+    expect(r).toEqual({ started: ['a'], requeued: ['b'], skipped: [] })
     expect(h.spawned).toEqual(['FAQ-10'])
     const state = h.readState()
     expect(state.entries.map(e => e.ticket)).toEqual(['FAQ-11'])
@@ -262,7 +267,7 @@ describe('createPipelineQueue — 持久化與重啟恢復', () => {
       }),
     )
     const r = h.queue.recoverFromDisk()
-    expect(r).toEqual({ started: 1, requeued: 0, skipped: 0 })
+    expect(r).toEqual({ started: ['b'], requeued: [], skipped: [] })
     expect(h.spawned).toEqual(['FAQ-11'])
     h.cleanup()
   })
@@ -280,7 +285,7 @@ describe('createPipelineQueue — 持久化與重啟恢復', () => {
       }),
     )
     const r = h.queue.recoverFromDisk()
-    expect(r).toEqual({ started: 1, requeued: 0, skipped: 1 })
+    expect(r).toEqual({ started: ['b'], requeued: [], skipped: ['a'] })
     expect(h.skipped).toEqual([{ ticket: 'FAQ-10', reason: '排隊已超過 24 小時' }])
     expect(h.spawned).toEqual(['FAQ-11'])
     h.cleanup()
@@ -288,9 +293,9 @@ describe('createPipelineQueue — 持久化與重啟恢復', () => {
 
   test('recoverFromDisk：檔案不存在或內容壞掉都當空佇列，不丟例外', () => {
     const h = makeHarness(1)
-    expect(h.queue.recoverFromDisk()).toEqual({ started: 0, requeued: 0, skipped: 0 })
+    expect(h.queue.recoverFromDisk()).toEqual({ started: [], requeued: [], skipped: [] })
     writeFileSync(h.stateFile, 'not-json{{{')
-    expect(h.queue.recoverFromDisk()).toEqual({ started: 0, requeued: 0, skipped: 0 })
+    expect(h.queue.recoverFromDisk()).toEqual({ started: [], requeued: [], skipped: [] })
     // 恢復後 stateFile 被重寫成合法的空佇列快照
     expect(existsSync(h.stateFile)).toBe(true)
     expect(h.readState().entries).toEqual([])
@@ -494,5 +499,61 @@ describe('createPipelineQueue — tryDispatchFront（cluster-wide 遞補，給 l
       expect(state.entries.map(e => e.ticket)).toEqual(['FAQ-1'])
       h.cleanup()
     })
+  })
+})
+
+describe('createPipelineQueue — onEnqueued hook（plan-db-as-truth-v3.2.md §9 Phase2：queued 監控 DB 寫入點的注入介面）', () => {
+  test('額度內直接 spawn（started）不觸發 onEnqueued——沒有中繼 queued 狀態需要記錄', () => {
+    const h = makeHarness(2)
+    h.queue.submit('FAQ-1', null, { tag: 'a' })
+    expect(h.enqueued).toEqual([])
+    h.cleanup()
+  })
+
+  test('額滿真的進入 FIFO 佇列 → onEnqueued 觸發恰好一次，帶正確 entry', () => {
+    const h = makeHarness(1)
+    h.queue.submit('FAQ-1', null, { tag: 'a' }) // 額度內，直接 spawn
+    h.queue.submit('FAQ-2', null, { tag: 'b' }) // 額滿，進佇列
+    expect(h.enqueued).toEqual(['FAQ-2'])
+    h.cleanup()
+  })
+
+  test('already_queued（同票重複 submit）不會再觸發一次 onEnqueued', () => {
+    const h = makeHarness(1)
+    h.queue.submit('FAQ-1', null, { tag: 'a' })
+    h.queue.submit('FAQ-2', null, { tag: 'b' })
+    h.queue.submit('FAQ-2', null, { tag: 'b' }) // 已在佇列中，重複 submit
+    expect(h.enqueued).toEqual(['FAQ-2'])
+    h.cleanup()
+  })
+
+  test('onEnqueued 丟例外不影響 submit() 本身的回傳（跟其他 hook 一樣經 safeHook 包住）', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pipeline-queue-test-'))
+    const stateFile = join(dir, 'queue.json')
+    const queue = createPipelineQueue<{ tag: string }>({
+      limiter: createConcurrencyLimiter(0),
+      stateFile,
+      ticketRe: /^FAQ-\d+$/,
+      spawnNow: () => ({ ok: true, pid: 1 }),
+      onEnqueued: () => {
+        throw new Error('DB 寫入掛了')
+      },
+    })
+    expect(() => queue.submit('FAQ-1', null, { tag: 'a' })).not.toThrow()
+    expect(queue.submit('FAQ-1', null, { tag: 'a' })).toEqual({ ok: true, status: 'already_queued', position: 1, ahead: 0 })
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  test('沒有提供 onEnqueued（未升級的呼叫端，例如尚未接線監控 DB 的情境）→ submit() 行為不變', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pipeline-queue-test-'))
+    const stateFile = join(dir, 'queue.json')
+    const queue = createPipelineQueue<{ tag: string }>({
+      limiter: createConcurrencyLimiter(0),
+      stateFile,
+      ticketRe: /^FAQ-\d+$/,
+      spawnNow: () => ({ ok: true, pid: 1 }),
+    })
+    expect(queue.submit('FAQ-1', null, { tag: 'a' })).toEqual({ ok: true, status: 'queued', position: 1, ahead: 0 })
+    rmSync(dir, { recursive: true, force: true })
   })
 })

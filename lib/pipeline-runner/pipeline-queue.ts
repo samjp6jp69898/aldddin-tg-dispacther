@@ -43,9 +43,14 @@ export type QueueEntry<P> = {
 }
 
 export type SubmitResult =
-  | { ok: true; status: 'started'; pid: number | undefined }
+  /** runId：【plan-db-as-truth-v3.2.md §5.2】這次 submit 呼叫鑄好的監控 DB
+   * run_id，由呼叫端（submitCreateMr 等，本檔不知道 payload 內部結構）事後
+   * 疊加進回傳值——本檔的 submit() 本身不產生這個欄位。只在「這次呼叫真的
+   * 鑄了一個新 run」的兩種狀態上有意義（started／queued）；already_running／
+   * already_queued 沿用既有 entry，不是這次呼叫新鑄的，不附這個欄位。 */
+  | { ok: true; status: 'started'; pid: number | undefined; runId?: string }
   /** position = 1-based 排隊順位；ahead = 前面還有幾張單在排隊（= position - 1）。 */
-  | { ok: true; status: 'queued'; position: number; ahead: number }
+  | { ok: true; status: 'queued'; position: number; ahead: number; runId?: string }
   | { ok: true; status: 'already_queued'; position: number; ahead: number }
   /** 這張單有一條本 process spawn 的背景流程還在跑（2026-08-28 實測踩到的
    * 洞：TG 連點兩次同一張單，第二次落在「run#1 已 spawn、但 claude 冷啟動
@@ -62,12 +67,20 @@ export type SubmitResult =
  * 可認領），text 是給發起人看的人話。 */
 export type SkipReason = { code: string; text: string }
 
+/** recoverFromDisk 的回傳形狀（【plan-db-as-truth-v3.md §5.6，BL-C5】）：
+ * 三組 run_id 陣列，不再只是計數——呼叫端把三者的聯集交給
+ * lib/monitor-db/local-sweep.ts 的 sweepLostOnRestart() 當「seen」集合，
+ * 判準是集合成員資格，不看 lifecycle 當下值（見該函式與 pipeline-queue.ts
+ * 的 recoverFromDisk 註解）。沒有 getRunId（或它回 undefined）的條目不會
+ * 出現在任何陣列裡——舊格式條目視同「run_id 未知」，由呼叫端記 log。 */
+export type RecoverFromDiskResult = { started: string[]; requeued: string[]; skipped: string[] }
+
 export type PipelineQueue<P> = {
   submit: (ticket: string, triggeredBy: QueueTriggeredBy, payload: P) => SubmitResult
   /** 從 stateFile 撿回上次 process 結束前還在排隊的單，並啟用 persist（只在
    * server 啟動時呼叫一次；CLI 短命行程絕不能呼叫——會把別的 process 的
-   * 排隊單搶來 spawn）。回傳 { started, requeued, skipped } 供啟動 log。 */
-  recoverFromDisk: () => { started: number; requeued: number; skipped: number }
+   * 排隊單搶來 spawn）。回傳三組 run_id 陣列（見 RecoverFromDiskResult）。 */
+  recoverFromDisk: () => RecoverFromDiskResult
   size: () => number
   /** 這張單目前在本 process 的狀態：running（已 spawn、還沒收到 onExit）、
    * queued（在佇列中等名額）、null（本 process 不知道這張單）。給多機派工
@@ -114,6 +127,15 @@ export function createPipelineQueue<P>(cfg: {
   /** 排隊中的單被 skipReason 移除時呼叫（TG 通知發起人＋依 reason.code 做
    * 對應收尾，例如把 Notion 狀態改回可認領）。 */
   onSkipped?: (entry: QueueEntry<P>, reason: SkipReason) => void
+  /** 【v3.2 §9 Phase2】一張單真的進入 FIFO 佇列（額滿、submit() 把它 push
+   * 進 queue）時呼叫恰好一次——監控 DB 化的「queued（rank 10）」寫入點掛在
+   * 這裡（見 spawn-create-mr.ts 的 bugQueue 設定），純注入、本檔不知道也不
+   * 依賴監控 DB 的存在，2B 的 demand 佇列可直接複用同一個 hook 欄位，不需要
+   * 另外改本檔。額度內直接 spawn（沒進佇列）不會觸發這個 hook——那張單直接
+   * 從 spawnNow 寫 running，不需要一個 queued 中繼狀態（見 spawn-create-mr.ts
+   * 對應註解）。跟其他 hook 一樣經 safeHook 包住，例外不外洩、不擋住
+   * submit() 本身的既有回傳。 */
+  onEnqueued?: (entry: QueueEntry<P>) => void
   /** 排隊中的單輪到並成功啟動時呼叫（用來 TG 通知發起人）。 */
   onDequeueStarted?: (entry: QueueEntry<P>) => void
   /** 排隊中的單輪到但 spawn 失敗時呼叫（通知發起人需重新認領）；佇列會跳過
@@ -123,6 +145,14 @@ export function createPipelineQueue<P>(cfg: {
    * （drain）之後——遞補優先，事件通知（worker 回報 head 完成，見
    * lib/cluster/）是旁路。跟其他 hook 一樣經 safeHook 包住，例外不外洩。 */
   onExited?: (ticket: string) => void
+  /** 【plan-db-as-truth-v3.md §5.6，BL-C5】從 payload 取出這個條目的監控 DB
+   * run_id，供 recoverFromDisk() 回傳三組 run_id 陣列用。本檔是泛型佇列，
+   * 不知道 payload 內部結構——BugPayload/DemandPayload 都有非 optional 的
+   * `runId` 欄，呼叫端傳 `p => p.runId` 即可。不提供時 recoverFromDisk()
+   * 回傳的三個陣列永遠是空的（呼叫端等於沒有 seen 集合可用，§5.6 的 sweep
+   * 會照跑，只是保護力等於沒有這個機制——不提供純粹是相容舊測試，正式
+   * 佇列都應該提供）。 */
+  getRunId?: (payload: P) => string | undefined
 }): PipelineQueue<P> {
   const queue: QueueEntry<P>[] = []
   // 本 process 經由這個佇列 spawn、還沒收到 onExit 的 ticket 集合——見
@@ -245,10 +275,23 @@ export function createPipelineQueue<P>(cfg: {
     }
     queue.push(entry)
     persist()
+    safeHook('onEnqueued', () => cfg.onEnqueued?.(entry))
     return { ok: true, status: 'queued', position: queue.length, ahead: queue.length - 1 }
   }
 
-  function recoverFromDisk(): { started: number; requeued: number; skipped: number } {
+  /** 【§5.6】從一個條目的 payload 取出 run_id；沒有 cfg.getRunId 或它丟例外/
+   * 回 undefined 時回 undefined（呼叫端只是少一個 seen 集合成員，不是硬錯誤——
+   * evalSkipReason 同一種「防護網壞掉不擋主流程」的態度）。 */
+  function runIdOf(entry: QueueEntry<P>): string | undefined {
+    try {
+      return cfg.getRunId?.(entry.payload)
+    } catch (err) {
+      console.error(`pipeline-queue: getRunId 執行失敗（${entry.ticket}，視為未知 run_id）: ${err}`)
+      return undefined
+    }
+  }
+
+  function recoverFromDisk(): RecoverFromDiskResult {
     persistEnabled = true
     let entries: QueueEntry<P>[] = []
     try {
@@ -261,25 +304,32 @@ export function createPipelineQueue<P>(cfg: {
     } catch {
       // 檔案不存在或壞掉都當空佇列；下面 persist 會把檔案重寫成目前實況。
     }
-    let started = 0
-    let skipped = 0
+    const started: string[] = []
+    const skipped: string[] = []
     for (const entry of entries) {
       if (queue.some(e => e.ticket === entry.ticket)) continue
       const reason = evalDequeueSkip(entry)
       if (reason !== null) {
-        skipped++
+        const runId = runIdOf(entry)
+        if (runId) skipped.push(runId)
         safeHook('onSkipped', () => cfg.onSkipped?.(entry, reason))
         continue
       }
       if (cfg.limiter.tryAcquire()) {
         if (startEntry(entry) === 'failed') cfg.limiter.release()
-        else started++
+        else {
+          const runId = runIdOf(entry)
+          if (runId) started.push(runId)
+        }
       } else {
         queue.push(entry) // 保留原始 enqueuedAt，維持先進先出
       }
     }
     persist()
-    return { started, requeued: queue.length, skipped }
+    // requeued：recover 結束時整條佇列的現況（不是只有這批新恢復的條目），
+    // 與舊版 `requeued: queue.length` 語意一致，只是從計數改成 run_id 陣列。
+    const requeued = queue.map(runIdOf).filter((id): id is string => !!id)
+    return { started, requeued, skipped }
   }
 
   async function tryDispatchFront(attempt: (entry: QueueEntry<P>) => Promise<boolean>): Promise<'empty' | 'dispatched' | 'declined'> {

@@ -4,11 +4,11 @@
 // .dead.jsonl 內的條目——成功即從檔案移除、失敗保留並記錄原因，可重跑（多次
 // 呼叫同一份殘餘 dead 檔，結果與只呼叫一次相同）。
 //
-// deploy/monitor-db/replay-dead.sh 會呼叫本檔的 CLI 入口；那支 shell 腳本與
-// 「真正的 applyEntry 怎麼建」屬於整合階段（lib/monitor-db/writes.ts 尚未
-// 存在，是 DB client 負責人的檔案），不在本檔案的所有權範圍內——這裡只故意
-// 不對它做靜態 import，避免它還不存在時讓 bun test 整批連 collect 都失敗。
-// replayDeadFile() 這個核心函式本身是完全可測試、與 DB client 無關的。
+// deploy/monitor-db/replay-dead.sh 會呼叫本檔的 CLI 入口。真正的 applyEntry
+// 由 lib/monitor-db/apply-entry.ts（DB client 負責人的檔案）提供，見檔尾
+// CLI 入口的動態 import——刻意用動態 import 而非靜態，維持
+// replayDeadFile() 這個核心函式完全可測試、與 DB client 無關（bun test
+// 收集本檔時不需要真的連得到 DB）。
 
 import { existsSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
 import type { SpoolEntry } from './types.ts'
@@ -62,13 +62,29 @@ export async function replayDeadFile(filePath: string, deps: DeadReplayDeps): Pr
   return { succeeded, remaining: remaining.length, failures }
 }
 
-// CLI 入口（整合時使用）：bun lib/monitor-db/spool/replay-dead.ts <dead-file>
-// 真正的 applyEntry 由整合階段注入（deploy/monitor-db/replay-dead.sh，不在
-// 本檔所有權內）。這裡故意不 import 任何 lib/monitor-db/writes.ts。
+// CLI 入口：bun lib/monitor-db/spool/replay-dead.ts <dead-file> [--worker]
+// 整合修補批次（item 2）接上真正的 applyEntry（lib/monitor-db/apply-entry.ts）。
+// 動態 import：本檔的核心函式 replayDeadFile() 完全與 DB client 無關、可獨立
+// 測試，CLI 入口才需要真的連 DB，維持「import 這個模組本身零副作用」的既有
+// 紀律（只有真的執行 CLI 時才載入 mysql2）。
 if (import.meta.main) {
-  console.error(
-    'replay-dead.ts CLI 尚待整合：需注入真正的 applyEntry（來自 lib/monitor-db/writes.ts，尚未建立）。' +
-      '請改用 replayDeadFile(filePath, { applyEntry }) 由整合腳本呼叫。',
-  )
-  process.exit(1)
+  const filePath = process.argv[2]
+  if (!filePath) {
+    console.error('用法：bun lib/monitor-db/spool/replay-dead.ts <dead-file> [--worker]')
+    process.exit(1)
+  }
+  const isWorker = process.argv.includes('--worker')
+  const { createMonitorPool } = await import('./../pool.ts')
+  const { createDeadReplayDeps } = await import('./../apply-entry.ts')
+  const pool = createMonitorPool(isWorker ? 'mon_exec' : 'mon_head', { connectionLimit: 1 })
+  try {
+    const result = await replayDeadFile(filePath, createDeadReplayDeps(pool))
+    console.log(`replay-dead: succeeded=${result.succeeded} remaining=${result.remaining}`)
+    if (result.failures.length > 0) {
+      for (const f of result.failures) console.log(`  seq=${f.seq} reason=${f.reason ?? '(無)'}`)
+    }
+    process.exit(result.remaining > 0 ? 1 : 0)
+  } finally {
+    await pool.end()
+  }
 }

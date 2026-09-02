@@ -5,6 +5,11 @@ import { classifyPipelineResult, type Classification } from './classify-result.t
 import { getTicketNotionUrl, getTicketAiAnalysisStatus } from '../notion-integration/candidate-tickets.ts'
 import { notifyOperator } from '../notify/operator.ts'
 import { submitCreateMr } from './spawn-create-mr.ts'
+import { isMonitorDbEnabled, MON_HOST } from '../monitor-db/env.ts'
+import { writeRunOutcomeAuthoritative, type MonitorDbExecutor } from '../monitor-db/writes.ts'
+import { createSpoolWriter, type SpoolWriterHandle } from '../monitor-db/spool/writer.ts'
+import { SHORT_LIVED_WRITE_BUDGET_MS, tryWriteOrSpool } from '../monitor-db/runtime.ts'
+import type { RunKind } from '../monitor-db/types.ts'
 
 const RESOLVE_REVIEWER_SH = '/Users/user/aladdin/scripts/resolve-reviewer.sh'
 const TG_NOTIFY_SH = '/Users/user/aladdin/scripts/tg-notify.sh'
@@ -25,7 +30,7 @@ const TIMEOUT_ESCALATION_EMAIL = 'pkh_samjp6jp69898@photons.com.tw'
 const TRACKER_SH = '/Users/user/aladdin/scripts/tracker.sh'
 // 2026-08-26 使用者定案：timeout 分類不能只發通知乾等人工，要能自己重試——
 // 但「resume 模式重跑」本身也可能再度 timeout（例如這張票本來就結構性偏
-// 大，任何一輪都跑不完 120 分鐘），沒有上限會對同一張票無限燒 opus。跟
+// 大，任何一輪都跑不完 180 分鐘），沒有上限會對同一張票無限燒 opus。跟
 // aladdin-05（同時在做 tg-monitor 手動重試按鈕，兩邊共用 spawnCreateMr 的
 // opts.resume 介面，見 2026-08-26 對齊訊息）講好的分工：resume 偵測/續跑本身
 // 是 create-mr.md Step 0.2 + resume-inventory.sh 的職責，這裡只負責「要不要
@@ -108,7 +113,7 @@ function resolveAssigneeEmail(ticket: string): string | null {
 function buildNotifyText(ticket: string, classification: Classification, stdoutPath: string, stderrPath: string, retryNote: string): string {
   if (classification === 'timeout') {
     return `⚠️ [需人工檢查] ${ticket}
-/create-mr 背景流程逾時（超過 spawn-create-mr.ts 設定的 120 分鐘上限）被強制中止，沒有進入正常的成功/失敗/待釐清出口。${retryNote}請人工檢查 log：
+/create-mr 背景流程逾時（超過 spawn-create-mr.ts 設定的 180 分鐘上限）被強制中止，沒有進入正常的成功/失敗/待釐清出口。${retryNote}請人工檢查 log：
 ${stdoutPath}
 ${stderrPath}`
   }
@@ -160,6 +165,93 @@ ${stderrPath}`
     log(`${ticket} 已通知 Landon（push mismatch）`)
   } else {
     log(`${ticket} 通知 Landon 失敗（push mismatch）`)
+  }
+}
+
+const MONITOR_WRITE_BUDGET_MS = SHORT_LIVED_WRITE_BUDGET_MS // §6.7：短命行程總預算（await，不是 fire-and-forget）
+const BUG_RUN_KIND: RunKind = 'bug'
+
+/**
+ * 【plan-db-as-truth-v3.2.md §9 Phase2】bug 終態（權威，tier2）：本檔是
+ * WRAPPER_SCRIPT 的 EXIT trap 子行程，`process.env.MON_RUN_ID` 繼承自
+ * spawn 時顯式覆寫的值（見 spawn-create-mr.ts 的 spawnCreateMrNow），正是
+ * 這一輪 run 自己的 run_id——不需要碰 DB／讀 marker 檔就能拿到。
+ *
+ * 短命行程紀律（§6.7）：await（不是 fire-and-forget），總預算 3 秒，逾時或
+ * 失敗落 spool；退出前明確關閉本函式自己建立的連線／spool fd（不是等待，
+ * 是確定性地釋放資源，讓行程能乾淨結束，不留著 socket 卡住 event loop）。
+ * `deps` 只給測試注入假 pool/spool，production 呼叫端一律不傳。
+ */
+export async function writeAuthoritativeOutcome(
+  ticket: string,
+  classification: Classification,
+  exitCode: number,
+  deps: { pool?: MonitorDbExecutor | null; spool?: SpoolWriterHandle } = {},
+): Promise<void> {
+  const testMode = 'pool' in deps || 'spool' in deps
+  if (!isMonitorDbEnabled() && !testMode) return
+
+  const runId = (process.env.MON_RUN_ID ?? '').trim()
+  if (!runId) {
+    log(`${ticket} 監控 DB 寫入略過：process.env.MON_RUN_ID 為空（非本次 v3.2 spawn 鏈觸發，或環境變數遺失）`)
+    return
+  }
+
+  const finishedAt = new Date().toISOString()
+  const input = { runId, ticket, kind: BUG_RUN_KIND, outcome: classification, outcomeSource: 'post-run-notify', finishedAt, exitCode }
+
+  let pool: MonitorDbExecutor | null = null
+  let ownsPool = false
+  try {
+    if ('pool' in deps) {
+      pool = deps.pool ?? null
+    } else {
+      const { createMonitorPool } = await import('../monitor-db/pool.ts')
+      const isWorker = !!(process.env.CLUSTER_WORKER_NAME ?? '').trim()
+      pool = createMonitorPool(isWorker ? 'mon_exec' : 'mon_head', { connectionLimit: 1 })
+      ownsPool = true
+    }
+  } catch (err) {
+    log(`${ticket} 監控 DB 連線建立失敗: ${err}`)
+  }
+
+  // 整合修補批次 item 7：「預算內嘗試寫入，逾時/失敗落 spool」的核心邏輯
+  // 已收斂進 lib/monitor-db/runtime.ts 的 tryWriteOrSpool（與 demand pipeline
+  // 的短命行程共用同一份實作）。pool 一開始就是 null（連線建立失敗，或測試
+  // 注入 `{pool:null}` 模擬）時完全不必試寫，直接落 spool——這一層判斷留在
+  // 本檔（tryWriteOrSpool 的介面要求 pool 一定存在），行為與重構前逐位元組
+  // 相同。
+  if (pool) {
+    const spoolForWrite = deps.spool ?? createSpoolWriter({ writer: 'post-run-notify' })
+    await tryWriteOrSpool({
+      budgetMs: MONITOR_WRITE_BUDGET_MS,
+      pool,
+      spool: spoolForWrite,
+      runId,
+      fn: 'writeRunOutcomeAuthoritative',
+      args: [input],
+      attempt: p => writeRunOutcomeAuthoritative(p, input),
+      onFailLabel: `${ticket} 監控 DB 寫入`,
+    })
+    if (!deps.spool) spoolForWrite.close()
+  } else {
+    try {
+      const spool = deps.spool ?? createSpoolWriter({ writer: 'post-run-notify' })
+      spool.append({ ts: new Date().toISOString(), host: MON_HOST, run_id: runId, fn: 'writeRunOutcomeAuthoritative', args: [input] })
+      if (!deps.spool) spool.close()
+    } catch (spoolErr) {
+      log(`${ticket} 監控 DB 寫入與落 spool 都失敗，本次終態遺失: ${spoolErr}`)
+    }
+  }
+
+  // 退出前明確釋放本函式自己建立的連線（注入的假 pool 由呼叫端自己管理生命
+  // 週期，不在這裡關）；短命行程不留著連線讓 process 掛在 event loop 上。
+  if (ownsPool && pool && 'end' in pool && typeof (pool as unknown as { end: unknown }).end === 'function') {
+    try {
+      await (pool as unknown as { end: () => Promise<void> }).end()
+    } catch (err) {
+      log(`${ticket} 監控 DB 連線關閉失敗（不影響已完成的寫入/落 spool）: ${err}`)
+    }
   }
 }
 
@@ -276,7 +368,7 @@ function executeAutoRetry(ticket: string): void {
  * 全程 best-effort：任何一步失敗只記 log，不丟例外（呼叫端的 trap 不會接
  * 任何錯誤處理）。
  */
-function main(): void {
+async function main(): Promise<void> {
   const [ticket, exitCodeRaw, stdoutPath] = process.argv.slice(2)
   if (!ticket || !exitCodeRaw || !stdoutPath) {
     log(`參數不足，略過：${process.argv.slice(2).join(' ')}`)
@@ -293,6 +385,16 @@ function main(): void {
 
   const classification = classifyPipelineResult(Number(exitCodeRaw), stdoutContent)
   log(`${ticket} classification=${classification} exitCode=${exitCodeRaw}`)
+
+  // 【plan-db-as-truth-v3.2.md §9 Phase2】權威終態寫入：不管要不要補發 TG
+  // 通知都要寫（跟下面的 NEEDS_NOTIFY 分支完全獨立），這是每一輪 run 的
+  // 監控 DB 生命週期收尾，不是「需要通知」才做的事。獨立包一層 try/catch：
+  // 這裡失敗不能連坐擋掉下面既有的通知邏輯（該保證從遷移前就存在）。
+  try {
+    await writeAuthoritativeOutcome(ticket, classification, Number(exitCodeRaw))
+  } catch (err) {
+    log(`${ticket} writeAuthoritativeOutcome 例外（不影響既有通知邏輯）: ${err}`)
+  }
 
   const stderrPath = stdoutPath.replace(/\.stdout\.log$/, '.stderr.log')
   checkPushMismatch(ticket, classification, stdoutPath, stderrPath)
@@ -355,5 +457,9 @@ function main(): void {
 }
 
 if (import.meta.main) {
-  main()
+  main().catch(err => {
+    // main() 內部各段已各自 try/catch（best-effort 紀律，見檔頭註解），這裡
+    // 只是最後一道安全網，避免萬一有漏接的例外變成 unhandled rejection。
+    console.error(`post-run-notify: main() 未預期例外: ${err}`)
+  })
 }

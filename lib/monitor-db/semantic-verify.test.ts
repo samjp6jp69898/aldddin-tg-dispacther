@@ -21,6 +21,7 @@ import type { MonitorDbExecutor } from './writes.ts'
 import {
   W2_UPDATE_SQL,
   insertMcpUsage,
+  upsertAgentRun,
   upsertFileOffset,
   upsertMonitorHeartbeat,
   writeRunOutcomeAuthoritative,
@@ -44,6 +45,7 @@ const HEARTBEAT_TEST_WRITER = 'log-intake' // 值域固定四選一，借用最�
 const FILE_OFFSET_TEST_PATH_PREFIX = 's-verify-path-'
 
 async function cleanup() {
+  await root.execute(`DELETE FROM agent_runs WHERE path LIKE ?`, [`${TICKET_PREFIX}%`])
   await root.execute(`DELETE FROM runs WHERE ticket LIKE ?`, [`${TICKET_PREFIX}%`])
   await root.execute(`DELETE FROM mcp_usage WHERE service = ?`, ['s_verify_test'])
   await root.execute(`DELETE FROM monitor_heartbeat WHERE host = ? AND writer = ?`, [MON_HOST, HEARTBEAT_TEST_WRITER])
@@ -426,6 +428,49 @@ describe('migration 002：file_offsets 的 event_seq 守衛（對真實已套用
     const [rows] = await root.execute<any[]>('SELECT inode, `offset` FROM file_offsets WHERE host=? AND path=?', [MON_HOST, path])
     expect(rows[0].inode).toBe(444)
     expect(rows[0].offset).toBe(0)
+  })
+})
+
+describe('migration 003：agent_runs 10 個 payload 欄位（ODKU COALESCE 對真實 MySQL 8.4 實測）', () => {
+  test('首次 INSERT 帶部分欄位，第二次 upsert 補齊其餘欄位，COALESCE 不覆寫已有值', async () => {
+    const runId = tRunId()
+    const path = `${TICKET_PREFIX}agent-runs-a`
+    const r1 = await upsertAgentRun(pool, { runId, path, agentName: 'bug-tracer', model: 'claude-sonnet-5', inputTokens: 100, isError: false })
+    expect(r1.kind).toBe('inserted')
+
+    // 第二次呼叫改帶不同的 model（模擬重放/晚到訊號）與新欄位（cost/tool_calls），
+    // 已有值（model/inputTokens/isError）必須維持第一次寫的，新欄位補上。
+    const r2 = await upsertAgentRun(pool, {
+      runId,
+      path,
+      model: 'claude-opus-5',
+      inputTokens: 999,
+      isError: true,
+      costUsd: 1.234567,
+      toolCalls: 12,
+      numTurns: 3,
+      resultPreview: 'ok',
+    })
+    expect(r2.kind).toBe('applied')
+
+    const [rows] = await root.execute<any[]>('SELECT * FROM agent_runs WHERE run_id=? AND path=?', [runId, path])
+    const row = rows[0]
+    expect(row.model).toBe('claude-sonnet-5') // 第一次寫的值不被覆蓋
+    expect(row.input_tokens).toBe(100)
+    expect(row.is_error).toBe(0)
+    expect(Number(row.cost_usd)).toBeCloseTo(1.234567, 6) // 第二次才補上的欄位
+    expect(row.tool_calls).toBe(12)
+    expect(row.num_turns).toBe(3)
+    expect(row.result_preview).toBe('ok')
+  })
+
+  test('result_preview 超過 512 字元由呼叫端函式防禦性截斷', async () => {
+    const runId = tRunId()
+    const path = `${TICKET_PREFIX}agent-runs-b`
+    const long = 'x'.repeat(600)
+    await upsertAgentRun(pool, { runId, path, resultPreview: long })
+    const [rows] = await root.execute<any[]>('SELECT result_preview FROM agent_runs WHERE run_id=? AND path=?', [runId, path])
+    expect(rows[0].result_preview.length).toBe(512)
   })
 })
 
