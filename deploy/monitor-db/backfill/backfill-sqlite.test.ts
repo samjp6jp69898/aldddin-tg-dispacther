@@ -50,6 +50,8 @@ function pipelineRun(overrides: Partial<SqlitePipelineRun> = {}): SqlitePipeline
     outcome: 'success',
     cancelled_at: null,
     triggered_by: 'KHH Landon Lo',
+    review_rounds: null,
+    final_review_rounds: null,
     ...overrides,
   }
 }
@@ -78,9 +80,13 @@ function createFixtureDb(dir: string, name = 'source.sqlite'): string {
   db.run(`CREATE TABLE file_offsets (path TEXT PRIMARY KEY, inode INTEGER NOT NULL, offset INTEGER NOT NULL)`)
 
   db.run(
-    `INSERT INTO pipeline_runs (key, kind, ticket, started_at, stdout_path, finished_at, outcome, triggered_by)
+    `INSERT INTO pipeline_runs
+       (key, kind, ticket, started_at, stdout_path, stderr_path, finished_at, outcome, triggered_by,
+        review_rounds, final_review_rounds)
      VALUES ('FAQ-1.2026-08-25T01-00-00-000Z','bug','FAQ-1','2026-08-25T01:00:00.000Z',
-             '/logs/FAQ-1.2026-08-25T01-00-00-000Z.stdout.log','2026-08-25T01:10:00.000Z','success','洋蔥')`,
+             '/logs/FAQ-1.2026-08-25T01-00-00-000Z.stdout.log',
+             '/logs/FAQ-1.2026-08-25T01-00-00-000Z.stderr.log',
+             '2026-08-25T01:10:00.000Z','success','洋蔥',2,3)`,
   )
   db.run(
     `INSERT INTO agent_runs (path, ticket, kind, stage, started_at, ended_at, file_mtime)
@@ -238,6 +244,22 @@ describe('mapPipelineRunToRunsRow', () => {
     expect(r.row!.cancel_requested_at).toBe('2026-08-25 01:05:00.000')
     expect(r.row!.triggered_by_email).toBe('KHH Landon Lo')
     expect(r.row!.host).toBe('unknown_pre_migration')
+  })
+
+  test('stderr_path/review_rounds/final_review_rounds：來源有值 → 直接映射（migration 004 補欄）', () => {
+    const r = mapPipelineRunToRunsRow(
+      pipelineRun({ stderr_path: '/logs/FAQ-2.2026-08-25T01-00-00-000Z.stderr.log', review_rounds: 2, final_review_rounds: 3 }),
+    )
+    expect(r.row!.stderr_path).toBe('/logs/FAQ-2.2026-08-25T01-00-00-000Z.stderr.log')
+    expect(r.row!.review_rounds).toBe(2)
+    expect(r.row!.final_review_rounds).toBe(3)
+  })
+
+  test('stderr_path/review_rounds/final_review_rounds：來源缺值 → NULL，不造數', () => {
+    const r = mapPipelineRunToRunsRow(pipelineRun({ stderr_path: null, review_rounds: null, final_review_rounds: null }))
+    expect(r.row!.stderr_path).toBeNull()
+    expect(r.row!.review_rounds).toBeNull()
+    expect(r.row!.final_review_rounds).toBeNull()
   })
 })
 

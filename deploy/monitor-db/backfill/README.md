@@ -63,3 +63,25 @@ WAL 踩坑（impl-constraints-addendum §4）：讀 `monitor.sqlite` **禁止 cp
   `triggered_by_email`——照存並回報語意不符。
 - sqlite `file_offsets` 不回填（行程私有游標，新管線自行重建）。
 - `outcome IS NULL` 且 `finished_at IS NULL` 的列（快照當下可能仍在跑）跳過不回填。
+- `runs.stderr_path` / `review_rounds` / `final_review_rounds`（migration 004，2026-09-02）：
+  sqlite `pipeline_runs` 同名欄位直接映射；來源缺值（含 migration 004 之前建立、
+  rounds 欄位還不存在時期的舊列）→ NULL，不造數。
+- **冪等機制不擴充 UPDATE 補欄路徑**：`runs`/`agent_runs`/`mcp_usage` 全線只用
+  `insertIgnoreRow`（`INSERT IGNORE`），`service_status_log` 用 `insertIfNotExists`
+  （`WHERE NOT EXISTS` 守衛）——`lib/db.ts` 沒有、也不新增任何 UPDATE 路徑，這是本目錄
+  三支回填腳本一貫的冪等哲學（見上表「冪等機制」欄）。新增 `stderr_path` 等三欄後，
+  對「已經回填過的舊列」重跑 `INSERT IGNORE` 命中唯一鍵即整列略過、不會補上新欄位值；
+  這與 `mcp_tokens` env 命名那條既有取捨（若計畫定案不同，需另外手動 UPDATE 回填列）
+  是同一類已知限制，不在本腳本自動化範圍內。Phase 6 回填在指揮官核准前只在
+  `--dry-run` / 臨時測試 schema 跑過（見檔頭「先開發＋測試，後執行」），尚未對正式
+  `pipeline_monitor.runs` 寫過任何一列，因此「重跑補齊舊列」目前不是實際問題；
+  若之後需要對已回填過的正式列補新欄，屬於一次性人工 UPDATE，不建議塞進這支
+  設計上「只插入、不更新」的冪等腳本。
+
+## §10.2 對數備註（雙軌對照）
+
+- `runs.started_at` 兩軌語意不同：sqlite 由 log 檔名（`<ticket>.<ISO毫秒>`）反推，
+  MySQL 由 W1 spawn 當下實際寫入，兩者存在 1ms 級的落點差（同一支 plan §10.2 已知的
+  「時戳寫入時機不同」類別，比照 `finished_at` 的 <5s 容忍度處理）。對回填列與線上列
+  做雙軌對照時，一律以 `legacy_key`（§10.2 的對位鍵）為主要對位依據，時間欄位
+  （`started_at`/`finished_at`）用容差比較，不能拿來當對位鍵或要求逐毫秒相等。

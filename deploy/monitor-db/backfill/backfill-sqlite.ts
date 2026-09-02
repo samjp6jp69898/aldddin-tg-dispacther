@@ -94,6 +94,8 @@ export interface SqlitePipelineRun {
   outcome: string | null
   cancelled_at: string | null
   triggered_by: string | null
+  review_rounds: number | null
+  final_review_rounds: number | null
 }
 
 export interface SqliteAgentRun {
@@ -134,6 +136,7 @@ export interface RunsInsertRow {
   started_at: string | null
   finished_at: string | null
   stdout_path: string | null
+  stderr_path: string | null
   legacy_key: string
   outcome: string | null
   outcome_source: string | null
@@ -141,6 +144,8 @@ export interface RunsInsertRow {
   legacy_outcome_raw: string | null
   cancel_requested_at: string | null
   triggered_by_email: string | null
+  review_rounds: number | null
+  final_review_rounds: number | null
 }
 
 export interface AgentRunsInsertRow {
@@ -250,6 +255,7 @@ export function mapPipelineRunToRunsRow(r: SqlitePipelineRun): MapPipelineRunRes
     started_at: isoToMysqlDatetime3OrNull(r.started_at),
     finished_at: isoToMysqlDatetime3OrNull(finishedAtIso),
     stdout_path: r.stdout_path,
+    stderr_path: r.stderr_path,
     legacy_key: r.key,
     outcome,
     outcome_source: outcomeSource,
@@ -257,6 +263,8 @@ export function mapPipelineRunToRunsRow(r: SqlitePipelineRun): MapPipelineRunRes
     legacy_outcome_raw: legacyOutcomeRaw,
     cancel_requested_at: isoToMysqlDatetime3OrNull(r.cancelled_at),
     triggered_by_email: r.triggered_by,
+    review_rounds: r.review_rounds,
+    final_review_rounds: r.final_review_rounds,
   }
 
   return { skip: false, row, note, timeoutRecompute }
@@ -381,6 +389,7 @@ async function writeRunsRow(pool: Pool, row: RunsInsertRow): Promise<boolean> {
       'started_at',
       'finished_at',
       'stdout_path',
+      'stderr_path',
       'legacy_key',
       'outcome',
       'outcome_source',
@@ -388,6 +397,8 @@ async function writeRunsRow(pool: Pool, row: RunsInsertRow): Promise<boolean> {
       'legacy_outcome_raw',
       'cancel_requested_at',
       'triggered_by_email',
+      'review_rounds',
+      'final_review_rounds',
     ],
     [
       row.run_id,
@@ -398,6 +409,7 @@ async function writeRunsRow(pool: Pool, row: RunsInsertRow): Promise<boolean> {
       row.started_at,
       row.finished_at,
       row.stdout_path,
+      row.stderr_path,
       row.legacy_key,
       row.outcome,
       row.outcome_source,
@@ -405,6 +417,8 @@ async function writeRunsRow(pool: Pool, row: RunsInsertRow): Promise<boolean> {
       row.legacy_outcome_raw,
       row.cancel_requested_at,
       row.triggered_by_email,
+      row.review_rounds,
+      row.final_review_rounds,
     ],
   )
 }
@@ -461,7 +475,8 @@ export async function runBackfill(opts: RunBackfillOptions, deps: RunBackfillDep
   try {
     const pipelineRuns = db
       .query(
-        `SELECT key, kind, ticket, started_at, stdout_path, stderr_path, finished_at, outcome, cancelled_at, triggered_by
+        `SELECT key, kind, ticket, started_at, stdout_path, stderr_path, finished_at, outcome, cancelled_at, triggered_by,
+                review_rounds, final_review_rounds
          FROM pipeline_runs`,
       )
       .all() as SqlitePipelineRun[]
