@@ -109,13 +109,14 @@ WAL 踩坑（impl-constraints-addendum §4）：讀 `monitor.sqlite` **禁止 cp
 
 ## 回填對讀取端點的已知影響（b5 查證，2026-09-02）
 
-- **`/api/events` 顯示順序（未修，a7 裁定中）**：`queryEvents`（tg-monitor lib/read/mysql.ts:588）
-  以 `ORDER BY e.id DESC` 排序且 `e.id` 兼分頁游標——`mcp_usage` 的 AUTO_INCREMENT id 是
-  寫入序非事件時間序，回填 `events`（本腳本 `BACKFILL_TABLES` 含之）會讓歷史事件的 id
-  大於全部 collector 現有列 → 該端點把最老的回填事件排在最前面當成最新。
-  status_log 的同型問題已由讀取層修復（tg-monitor c71b88c 改 ORDER BY ts,id），但 events
-  **不能照抄**（id 兼游標，需複合游標 (ts,id)，動前端契約）。**回填 events 前確認 a7
-  對此條的裁定**；回填不只是資料量問題，會改變既有端點的顯示語意。
+- **`/api/events` 顯示順序（mysql 軌現況即錯序，非回填造成；b5 實測更正 2026-09-02）**：
+  `queryEvents`（tg-monitor lib/read/mysql.ts:588）以 `ORDER BY e.id DESC` 排序且 `e.id`
+  兼分頁游標，而 `mcp_usage` 的 id 是寫入序非事件時間序——b5 實測**回填前**mysql 軌
+  首筆已比內容最新筆舊約 19 小時（違序相鄰對 mysql=8、sqlite 側自身也有 333，
+  「sqlite id 序 ≡ ts 序」只對 status_log 成立、對 events 不成立）。回填會**加劇**
+  （歷史事件以更大 id 進來）但**不是成因，也不是修它的觸發點**——該問題擋的是
+  `MON_READ_SOURCE=mysql` 切換，不擋回填（b5 已上呈 a7）。修法不能照抄 status_log
+  （id 兼游標，需複合游標 (ts,id)，動前端契約），歸讀取面。
 - `service_status_log` 排序鍵（D43）：讀取層已修（c71b88c）；回填仍以 D44 聯合組合驗證
   （造資料：本側；讀取檢查：b5）通過為前置。
 
