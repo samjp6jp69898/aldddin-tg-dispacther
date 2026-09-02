@@ -50,6 +50,7 @@ import { startStaleLockReaper } from './lib/pipeline-runner/stale-lock-reaper.ts
 import { startMonitorMaintenance, runRestartSweep } from './lib/monitor-db/maintenance.ts'
 import { declareMonitorRole } from './lib/monitor-db/env.ts'
 import { startMonitorCollectors } from './lib/monitor-db/collectors/index.ts'
+import { startMonitorHeartbeat } from './lib/monitor-db/heartbeat.ts'
 import type { SubmitResult } from './lib/pipeline-runner/pipeline-queue.ts'
 import type { TechUser } from './lib/user-resolution/tech-user.ts'
 
@@ -173,6 +174,11 @@ startMonitorMaintenance({ isTicketActive: ticket => localActivity.isActive(ticke
 // 只掛這一個——`mcp_usage` 的稽核 jsonl 只在 head 上，且 mon_exec 沒有那張表
 // 的權限（§11.1 授權對映）。isMonitorDbEnabled()=false 時內部整段 no-op。
 startMonitorCollectors({ role: 'mon_exec' })
+
+// 【plan §6.8(1)(2)】monitor_heartbeat：啟動時打一拍 + 每 60 秒一拍
+// （writer='worker-agent'，PK 是 (host, writer)，每台 worker 自己一列）。
+// 失敗只 WARN + 落 spool；isMonitorDbEnabled()=false 時整段 no-op。
+startMonitorHeartbeat({ writer: 'worker-agent' })
 
 // ---- HTTP 介面 ----
 

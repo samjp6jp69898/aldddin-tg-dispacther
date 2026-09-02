@@ -18,6 +18,7 @@ import { registerClusterRoutes, initClusterHead } from './lib/cluster/cluster-he
 import { startMonitorMaintenance, runRestartSweep } from './lib/monitor-db/maintenance.ts'
 import { declareMonitorRole } from './lib/monitor-db/env.ts'
 import { startMonitorCollectors } from './lib/monitor-db/collectors/index.ts'
+import { startMonitorHeartbeat } from './lib/monitor-db/heartbeat.ts'
 
 registerHandlers(bot)
 
@@ -257,6 +258,12 @@ startMonitorMaintenance({
 // 對映：mon_exec 碰不到 mcp_usage）。isMonitorDbEnabled()=false 時內部整段
 // no-op（不建 timer、不取 pool、不碰 logs/spool/），啟動失敗只 WARN 不外拋。
 startMonitorCollectors({ role: 'mon_head' })
+
+// 【plan §6.8(1)(2)】monitor_heartbeat：啟動時打一拍 + 每 60 秒一拍
+// （writer='server'）。在此之前 upsertMonitorHeartbeat 沒有任何生產呼叫者、
+// 表恆空，「head 自己 DB 不可寫」的告警因此永遠不會觸發。失敗只 WARN + 落
+// spool，絕不影響本行程；isMonitorDbEnabled()=false 時整段 no-op。
+startMonitorHeartbeat({ writer: 'server' })
 
 const port = Number(process.env.PORT ?? 8787)
 

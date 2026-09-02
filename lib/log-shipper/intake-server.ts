@@ -28,6 +28,7 @@ import { createClusterAuthGuard } from '../cluster/cluster-auth.ts'
 import { createWorkerRegistry } from '../cluster/worker-registry.ts'
 import { respondUniform401 } from '../security/uniform-401.ts'
 import { MON_HOST } from '../monitor-db/env.ts'
+import { startMonitorHeartbeat } from '../monitor-db/heartbeat.ts'
 
 const IDENTITY = 'com.aladdin.monitor-log-intake'
 const LOG_DIR = '/Users/user/aladdin/telegram-dispatcher/logs'
@@ -330,6 +331,13 @@ app.post(
 // POST /cluster/logs 以外的一律 uniform 401（與其餘未知路徑無法區分，維持
 // 既有拒絕不變式，比照 worker-agent.ts）。
 app.all('*', c => respondUniform401(c))
+
+// 【plan §6.8(1)(2)】monitor_heartbeat：writer='log-intake'（migration 002 的
+// PK 是 (host, writer)——head 上三個監控寫入行程各自一列，server.ts 還活著時
+// 也看得出 log-intake 死了）。啟動打一拍 + 每 60 秒一拍，pool/spool 的取得與
+// 失敗處置（只 WARN + 落 spool，絕不影響本行程）全部封在 heartbeat.ts 內；
+// isMonitorDbEnabled()=false 時整段 no-op。本檔僅此一處改動。
+startMonitorHeartbeat({ writer: 'log-intake' })
 
 export default {
   fetch: app.fetch,
