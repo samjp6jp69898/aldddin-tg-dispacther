@@ -1,6 +1,7 @@
-import { describe, expect, test } from 'bun:test'
+import { afterAll, describe, expect, test } from 'bun:test'
 import {
   evaluateMonitorDbAlerts,
+  probeReadSource,
   HEARTBEAT_STALE_MS,
   NEW_WORKER_GRACE_MS,
   SPOOL_DEPTH_THRESHOLD,
@@ -10,7 +11,8 @@ import {
   type MonitorAlertDeps,
 } from './alerts.ts'
 
-// §6.8(3) a–f 的六條件判定。全部用注入的假讀取器，不碰真 DB／真 ssh／真檔案。
+// §6.8(3) a–f ＋ 追加的 (g) 讀取面降級，共七條件的判定。全部用注入的假讀取器，
+// 不碰真 DB／真 ssh／真名冊檔；只有 probeReadSource 那一組打一個本機假 server。
 
 const NOW = Date.parse('2026-09-02T12:00:00.000Z')
 
@@ -33,6 +35,7 @@ function healthyDeps(over: MonitorAlertDeps = {}): MonitorAlertDeps {
     probeTunnel: async () => true,
     readWorkerStatuses: () => [{ worker: 'w1', spoolDepth: 3, oldestAgeS: 5, dbWritable: true, receivedAt: NOW - 1000 }],
     readR1Violations: () => 0,
+    readReadSource: async () => ({ requested: 'mysql', effective: 'mysql', degraded: false }),
     ...over,
   }
 }
@@ -54,6 +57,7 @@ describe('全部正常', () => {
       'monitor-db:worker-heartbeat:w1',
       'monitor-db:worker-spool:w1',
       'monitor-db:r1-violation',
+      'monitor-db:read-source-degraded',
     ]) {
       expect(byKey(alerts, key)).toBeDefined()
     }
@@ -191,6 +195,7 @@ describe('(c) tunnel 探測', () => {
       'monitor-db:head-heartbeat:tg-monitor',
       'monitor-db:head-spool',
       'monitor-db:r1-violation',
+      'monitor-db:read-source-degraded',
     ])
   })
 })
@@ -283,5 +288,97 @@ describe('(f) r1_violation', () => {
 
   test('= 0 → 不告警', async () => {
     expect(byKey(await evaluateMonitorDbAlerts(healthyDeps()), 'monitor-db:r1-violation')!.tripped).toBe(false)
+  })
+})
+
+describe('(g) 讀取面靜默降級', () => {
+  test('degraded=true → tripped（面板數字看起來正常，來源已經不是要求的那個）', async () => {
+    const alerts = await evaluateMonitorDbAlerts(
+      healthyDeps({ readReadSource: async () => ({ requested: 'mysql', effective: 'sqlite', degraded: true }) }),
+    )
+    const a = byKey(alerts, 'monitor-db:read-source-degraded')!
+    expect(a.tripped).toBe(true)
+    expect(a.level).toBe('error')
+    expect(a.detail).toContain('sqlite')
+  })
+
+  test('degraded 旗標忘了設，但 effective ≠ requested → 一樣 tripped（不依賴那個旗標的正確性）', async () => {
+    const alerts = await evaluateMonitorDbAlerts(
+      healthyDeps({ readReadSource: async () => ({ requested: 'mysql', effective: 'sqlite', degraded: false }) }),
+    )
+    expect(byKey(alerts, 'monitor-db:read-source-degraded')!.tripped).toBe(true)
+  })
+
+  test('requested === effective 且 degraded=false → 不告警', async () => {
+    const alerts = await evaluateMonitorDbAlerts(
+      healthyDeps({ readReadSource: async () => ({ requested: 'sqlite', effective: 'sqlite', degraded: false }) }),
+    )
+    expect(byKey(alerts, 'monitor-db:read-source-degraded')!.tripped).toBe(false)
+  })
+
+  test('unknown（讀取器回 null）→ 這條完全不出現，呼叫端因此保留前一狀態、不誤翻轉', async () => {
+    const alerts = await evaluateMonitorDbAlerts(healthyDeps({ readReadSource: async () => null }))
+    expect(byKey(alerts, 'monitor-db:read-source-degraded')).toBeUndefined()
+    // 其他條件照跑
+    expect(byKey(alerts, 'monitor-db:r1-violation')).toBeDefined()
+  })
+
+  test('讀取器拋錯 → 同樣只省略這一條', async () => {
+    const alerts = await evaluateMonitorDbAlerts(
+      healthyDeps({
+        readReadSource: async () => {
+          throw new Error('fetch 爆了')
+        },
+      }),
+    )
+    expect(byKey(alerts, 'monitor-db:read-source-degraded')).toBeUndefined()
+    expect(byKey(alerts, 'monitor-db:r1-violation')).toBeDefined()
+  })
+})
+
+// probeReadSource 的 HTTP 層：用真的最小 Bun.serve 當 tg-monitor 的替身，
+// 驗「什麼情況回 null（unknown）」——這是 (g) 不誤翻轉的唯一結構保證。
+describe('probeReadSource — 只有拿到合法回應才不是 unknown', () => {
+  let mode = 'ok'
+  const server = Bun.serve({
+    port: 0,
+    fetch(req) {
+      const path = new URL(req.url).pathname
+      if (path !== '/api/read-source') return new Response('not found', { status: 404 })
+      if (mode === 'ok') return Response.json({ requested: 'mysql', effective: 'sqlite', degraded: true })
+      if (mode === 'shape') return Response.json({ requested: 'mysql' })
+      if (mode === 'notjson') return new Response('<html>hi</html>', { headers: { 'content-type': 'text/html' } })
+      return new Response('boom', { status: 500 })
+    },
+  })
+  const base = `http://127.0.0.1:${server.port}`
+  afterAll(() => server.stop(true))
+
+  test('200 + 合法形狀 → 回實際內容', async () => {
+    mode = 'ok'
+    expect(await probeReadSource(`${base}/api/read-source`)).toEqual({ requested: 'mysql', effective: 'sqlite', degraded: true })
+  })
+
+  test('404（tg-monitor 還沒載入 Phase 8 的碼）→ null，不告警', async () => {
+    expect(await probeReadSource(`${base}/api/not-there`)).toBeNull()
+  })
+
+  test('500 → null', async () => {
+    mode = '500'
+    expect(await probeReadSource(`${base}/api/read-source`)).toBeNull()
+  })
+
+  test('200 但欄位缺／型別不對 → null', async () => {
+    mode = 'shape'
+    expect(await probeReadSource(`${base}/api/read-source`)).toBeNull()
+  })
+
+  test('200 但 body 不是 JSON → null', async () => {
+    mode = 'notjson'
+    expect(await probeReadSource(`${base}/api/read-source`)).toBeNull()
+  })
+
+  test('連線拒絕（沒人聽的 port）→ null', async () => {
+    expect(await probeReadSource('http://127.0.0.1:1/api/read-source')).toBeNull()
   })
 })

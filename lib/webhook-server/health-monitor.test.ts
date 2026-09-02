@@ -256,6 +256,7 @@ describe('createHealthMonitor — 監控 DB 告警（§6.8(3) a–f）', () => {
     probeTunnel: async () => true,
     readWorkerStatuses: () => [],
     readR1Violations: () => 0,
+    readReadSource: async () => ({ requested: 'mysql', effective: 'mysql', degraded: false }),
     ...over,
   })
 
@@ -288,6 +289,10 @@ describe('createHealthMonitor — 監控 DB 告警（§6.8(3) a–f）', () => {
         listWorkers: () => {
           touched++
           return []
+        },
+        readReadSource: async () => {
+          touched++
+          return null
         },
       }),
     })
@@ -419,5 +424,99 @@ describe('createHealthMonitor — 監控 DB 告警（§6.8(3) a–f）', () => {
     await monitor.runOnce()
     expect(notify).toHaveBeenCalledTimes(1)
     expect(notify.mock.calls[0]![0]).toContain('Cloudflare tunnel 已恢復')
+  })
+})
+
+describe('createHealthMonitor — (g) 讀取面靜默降級（2026-09-02 追加）', () => {
+  const prevFlag = process.env.MON_DB_ENABLED
+  afterEach(() => {
+    if (prevFlag === undefined) delete process.env.MON_DB_ENABLED
+    else process.env.MON_DB_ENABLED = prevFlag
+  })
+
+  const deps = (over: Record<string, unknown> = {}) => ({
+    now: () => Date.parse('2026-09-02T12:00:00.000Z'),
+    readHeartbeats: async () => [
+      { host: 'head', writer: 'server', ts: '2026-09-02T11:59:30.000Z' },
+      { host: 'head', writer: 'tg-monitor', ts: '2026-09-02T11:59:30.000Z' },
+      { host: 'head', writer: 'log-intake', ts: '2026-09-02T11:59:30.000Z' },
+    ],
+    readSpool: () => ({ depth: 0, oldestTs: null }),
+    listWorkers: () => [],
+    probeTunnel: async () => true,
+    readWorkerStatuses: () => [],
+    readR1Violations: () => 0,
+    readReadSource: async () => ({ requested: 'mysql', effective: 'mysql', degraded: false }),
+    ...over,
+  })
+
+  test('degraded → 翻轉告警一次；持續 degraded 不重複；恢復報恢復', async () => {
+    process.env.MON_DB_ENABLED = '1'
+    readyConnections = 1
+    const notify = mock((_t: string) => {})
+    let degraded = false
+    const monitor = createHealthMonitor({
+      apiUrl: `${BASE}/ready`,
+      notify,
+      registryPaths: [],
+      monitorAlerts: deps({
+        readReadSource: async () => (degraded ? { requested: 'mysql', effective: 'sqlite', degraded: true } : { requested: 'mysql', effective: 'mysql', degraded: false }),
+      }),
+    })
+
+    await monitor.runOnce()
+    expect(notify).not.toHaveBeenCalled()
+
+    degraded = true
+    await monitor.runOnce()
+    expect(notify).toHaveBeenCalledTimes(1)
+    expect(notify.mock.calls[0]![0]).toContain('靜默降級')
+
+    await monitor.runOnce() // 同狀態
+    expect(notify).toHaveBeenCalledTimes(1)
+
+    degraded = false
+    await monitor.runOnce()
+    expect(notify).toHaveBeenCalledTimes(2)
+    expect(notify.mock.calls[1]![0]).toContain('已恢復正常')
+  })
+
+  test('端點 404／打不到（讀取器回 null＝unknown）→ 完全不告警，也不會把先前的告警誤翻成恢復', async () => {
+    process.env.MON_DB_ENABLED = '1'
+    readyConnections = 1
+    const notify = mock((_t: string) => {})
+    let result: unknown = { requested: 'mysql', effective: 'sqlite', degraded: true }
+    const monitor = createHealthMonitor({
+      apiUrl: `${BASE}/ready`,
+      notify,
+      registryPaths: [],
+      monitorAlerts: deps({ readReadSource: async () => result }),
+    })
+
+    // 先讓它處在 degraded 告警狀態
+    await monitor.runOnce()
+    expect(notify).toHaveBeenCalledTimes(1)
+
+    // tg-monitor 重啟成還沒有這條端點的版本 → 404 → unknown
+    result = null
+    await monitor.runOnce()
+    await monitor.runOnce()
+    expect(notify).toHaveBeenCalledTimes(1) // 沒有「已恢復」的誤報
+  })
+
+  test('tg-monitor 全程沒有這條端點（一直 unknown）→ 一則告警都不發', async () => {
+    process.env.MON_DB_ENABLED = '1'
+    readyConnections = 1
+    const notify = mock((_t: string) => {})
+    const monitor = createHealthMonitor({
+      apiUrl: `${BASE}/ready`,
+      notify,
+      registryPaths: [],
+      monitorAlerts: deps({ readReadSource: async () => null }),
+    })
+
+    await monitor.runOnce()
+    await monitor.runOnce()
+    expect(notify).not.toHaveBeenCalled()
   })
 })

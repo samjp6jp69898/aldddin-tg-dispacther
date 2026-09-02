@@ -1,11 +1,13 @@
-// lib/monitor-db/alerts.ts — §6.8(3) 的六條營運告警判定（a–f）。
+// lib/monitor-db/alerts.ts — §6.8(3) 的營運告警判定（a–f ＋ 追加的 g）。
 //
-// 背景：計畫 §6.8(3) 列了七條告警（a–g），本模組實作 a–f；(g)「投影閘門中止」
-// 屬 §5.9 的投影閘門本身，不在這裡。判定結果由
-// `lib/webhook-server/health-monitor.ts` 既有的 60 秒 timer 消費，**翻轉才發
-// TG 給 OPERATOR**（比照該檔既有的 tunnel／token 名冊兩套告警慣例）。
+// 背景：計畫 §6.8(3) 列了七條告警 a–g，本模組實作 **a–f**；計畫原本的
+// (g)「投影閘門中止」屬 §5.9 的投影閘門本身，**不在這裡**（由該閘門自己負責）。
+// 本檔的 (g) 是 **2026-09-02 指揮官追加的另一條**（讀取面靜默降級），與計畫
+// 原文的 (g) 是不同的東西，只是恰好也排在第七——不要混淆。
+// 判定結果由 `lib/webhook-server/health-monitor.ts` 既有的 60 秒 timer 消費，
+// **翻轉才發 TG 給 OPERATOR**（比照該檔既有的 tunnel／token 名冊兩套告警慣例）。
 //
-// 六條（v3.2 修訂後的版本，不是 v3 原文）：
+// 條件（v3.2 修訂後的版本，不是 v3 原文）：
 //   a. head 的 `(head,'server')` 心跳列不可寫或落後 > 5 分鐘；
 //      `(head,'tg-monitor')`、`(head,'log-intake')` 各一條同型告警
 //      （§11.1 修訂：`monitor_heartbeat` PK 改 `(host, writer)`，三個 head
@@ -19,6 +21,13 @@
 //   e. 任一 worker 主動回報的 spool 深度 > 200；回報本身缺席或落後 > 5 分鐘
 //      視為「未知」，WARN 級（§6.8(e) 改為主動回報，MJ-E4）。
 //   f. `r1_violation` 計數器 > 0（§6.3；計數來源見 counters.ts，含其範圍限制）。
+//   g. **讀取面靜默降級**（2026-09-02 指揮官追加）：tg-monitor 的
+//      `GET 127.0.0.1:8799/api/read-source` 回 `{requested, effective, degraded}`；
+//      `degraded === true` 或 `effective !== requested` 即告警——語意是
+//      「`MON_READ_SOURCE=mysql` 但探針失敗、面板靜默退回 sqlite」，這種降級
+//      在畫面上完全看不出來（數字還是有，只是來源變了）。
+//      **端點 404／連線拒絕／逾時／回應形狀不對一律判 unknown、跳過不告警**：
+//      tg-monitor 尚未載入 Phase 8 的碼之前這條端點根本不存在，不得誤翻轉。
 //
 // 三條紀律（全部來自本工項的硬約束）：
 //   1. **整組只在 `isMonitorDbEnabled()` 為真時評估**——呼叫端負責這道閘。
@@ -54,6 +63,11 @@ export const NEW_WORKER_GRACE_MS = 30 * 60_000
 export const WORKER_REPORT_STALE_MS = 5 * 60_000
 /** 單台 worker 的 SSH tunnel 探測上界（本工項自訂；失敗＝翻轉條件）。 */
 export const SSH_PROBE_TIMEOUT_MS = 5000
+/** (g) 讀取面探測的 HTTP 上界（與 SSH 探測、health-monitor 既有 fetch 同值）。 */
+export const READ_SOURCE_PROBE_TIMEOUT_MS = 5000
+
+/** tg-monitor 的讀取面自況端點（Phase 8）。只走 loopback。 */
+export const READ_SOURCE_URL = 'http://127.0.0.1:8799/api/read-source'
 
 /** head 上三個監控寫入行程，各自一條 §6.8(a) 同型告警。 */
 const HEAD_WRITERS: readonly MonitorHeartbeatWriter[] = ['server', 'tg-monitor', 'log-intake']
@@ -90,6 +104,14 @@ export interface RosterWorker {
   disabled: boolean
 }
 
+/** (g) `GET /api/read-source` 的回應。`null` ＝ unknown（端點不存在／打不到／
+ * 形狀不對），呼叫端一律跳過不告警。 */
+export interface ReadSourceStatus {
+  requested: string
+  effective: string
+  degraded: boolean
+}
+
 export interface MonitorAlertDeps {
   now?: () => number
   /** 讀 `monitor_heartbeat` 全表；拋例外＝DB 不可讀（(a) 三條一起 tripped）。 */
@@ -104,6 +126,8 @@ export interface MonitorAlertDeps {
   readWorkerStatuses?: () => WorkerMonitorStatus[]
   /** §6.3 計數器讀取。 */
   readR1Violations?: () => number
+  /** (g) tg-monitor 的讀取面自況；`null` ＝ unknown（跳過不告警）。 */
+  readReadSource?: () => Promise<ReadSourceStatus | null>
 }
 
 function tsToMs(ts: string | Date | null): number | null {
@@ -161,6 +185,28 @@ function defaultProbeTunnel(worker: string): Promise<boolean> {
       err => resolve(err === null),
     )
   })
+}
+
+/**
+ * (g)：打 tg-monitor 的 `GET /api/read-source`。
+ *
+ * **fail-open**：任何「問不到答案」的情況（連線拒絕、逾時、非 2xx 含 404、
+ * body 不是 JSON、欄位缺或型別不對）一律回 `null` ＝ unknown，呼叫端跳過、
+ * 不產生任何告警。理由是明確的：tg-monitor 尚未載入 Phase 8 的碼之前這條端點
+ * 根本不存在（404），若把它當成故障，這條告警在整個 Phase 8 上線前會**恆為
+ * tripped**，第一則就是誤報、之後又永遠不會翻轉——比沒有這條還糟。
+ * 真正的「面板讀不到資料」由 tg-monitor 自己的健康面負責，不是這一條的職責。
+ */
+export async function probeReadSource(url: string = READ_SOURCE_URL): Promise<ReadSourceStatus | null> {
+  try {
+    const res = await fetch(url, { signal: AbortSignal.timeout(READ_SOURCE_PROBE_TIMEOUT_MS) })
+    if (!res.ok) return null
+    const data = (await res.json()) as { requested?: unknown; effective?: unknown; degraded?: unknown }
+    if (typeof data.requested !== 'string' || typeof data.effective !== 'string' || typeof data.degraded !== 'boolean') return null
+    return { requested: data.requested, effective: data.effective, degraded: data.degraded }
+  } catch {
+    return null
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -349,6 +395,29 @@ export async function evaluateMonitorDbAlerts(deps: MonitorAlertDeps = {}): Prom
     })
   } catch (err) {
     console.error(`monitor-db alerts: (f) 計數器讀取失敗，本輪跳過: ${err}`)
+  }
+
+  // ── (g) 讀取面靜默降級 ──
+  try {
+    const rs = await (deps.readReadSource ?? probeReadSource)()
+    if (rs !== null) {
+      // 兩個判準都要：`degraded` 是 tg-monitor 自報的旗標，`effective !== requested`
+      // 是不依賴那個旗標正確性的獨立佐證——旗標忘了設也抓得到。
+      const degraded = rs.degraded || rs.effective !== rs.requested
+      alerts.push({
+        key: 'monitor-db:read-source-degraded',
+        label: 'tg-monitor 讀取面來源',
+        tripped: degraded,
+        level: 'error',
+        detail:
+          `tg-monitor 的讀取面已靜默降級：requested='${rs.requested}' 但 effective='${rs.effective}'` +
+          `（degraded=${rs.degraded}）——面板上的數字看起來正常，實際來源已不是要求的那一個`,
+      })
+    }
+    // rs === null ＝ unknown：**刻意不 push 任何條件**，呼叫端因此保留前一狀態，
+    // 不會在 tg-monitor 還沒上 Phase 8 的碼時誤翻轉（見 probeReadSource）。
+  } catch (err) {
+    console.error(`monitor-db alerts: (g) 讀取面探測失敗，本輪跳過: ${err}`)
   }
 
   return alerts
