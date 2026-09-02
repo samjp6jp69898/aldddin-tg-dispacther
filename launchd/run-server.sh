@@ -23,7 +23,12 @@ TG_BUG_REPORT_ADMIN_CHAT_ID=$(grep '^TG_BUG_REPORT_ADMIN_CHAT_ID=' "$ENV_FILE" |
 # 多機派工（lib/cluster/，2026-08-31）——不是必要變數，缺了只是 cluster
 # head 模式關閉（純單機，行為與加入 cluster 之前完全相同），不擋伺服器啟動。
 CLUSTER_SHARED_SECRET=$(grep '^CLUSTER_SHARED_SECRET=' "$ENV_FILE" | cut -d= -f2- | tr -d '\r\n')
-export TG_DISPATCH_BOT_TOKEN TG_WEBHOOK_PATH TG_WEBHOOK_SECRET TG_KIT_ADMIN_CHAT_ID TG_BUG_REPORT_ADMIN_CHAT_ID CLUSTER_SHARED_SECRET
+# pipeline 監控 DB 化（2026-09-02，Phase 0）——只匯出開關本身，不是必要變數，
+# 缺了／非 '1' 一律視同關閉（isMonitorDbEnabled()），行為與遷移前相同。
+# 其餘 MON_DB_*／MON_FIELD_KEY_*／MON_BIDX_KEY 等憑證要等 Phase 1/2 實際
+# 程式碼落地、真的需要時才加進本白名單（lazy import，見 plan §9.0(B)）。
+MON_DB_ENABLED=$(grep '^MON_DB_ENABLED=' "$ENV_FILE" | cut -d= -f2- | tr -d '\r\n')
+export TG_DISPATCH_BOT_TOKEN TG_WEBHOOK_PATH TG_WEBHOOK_SECRET TG_KIT_ADMIN_CHAT_ID TG_BUG_REPORT_ADMIN_CHAT_ID CLUSTER_SHARED_SECRET MON_DB_ENABLED
 # 跟 launchd/run-tunnel.sh 的 ngrok 目標 port 保持同一個明確值，不依賴
 # server.ts 自己的預設值（8787）——兩支獨立 wrapper 各自隱含同一個預設，
 # 未來任一邊改動容易悄悄漂移，這裡明講掉。

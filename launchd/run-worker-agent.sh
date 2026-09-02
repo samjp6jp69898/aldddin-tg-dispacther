@@ -23,7 +23,10 @@ DISPATCHER_DIR="$ALADDIN/telegram-dispatcher"
 ENV_FILE="$DISPATCHER_DIR/.env"
 BUN="/Users/user/.bun/bin/bun"
 
-for KEY in CLUSTER_SHARED_SECRET CLUSTER_HEAD_URL CLUSTER_WORKER_NAME CLUSTER_WORKER_URL CLUSTER_WORKER_PORT TG_DISPATCH_BOT_TOKEN; do
+# pipeline 監控 DB 化（2026-09-02，Phase 0）——MON_DB_ENABLED 只是開關本身，
+# 缺了／非 '1' 視同關閉；其餘 MON_DB_* worker 憑證要等 Phase 3 部署時才加入
+# （worker 帳號 mon_exec 的密碼另走 worker 自己的 .env，不在本檔白名單內）。
+for KEY in CLUSTER_SHARED_SECRET CLUSTER_HEAD_URL CLUSTER_WORKER_NAME CLUSTER_WORKER_URL CLUSTER_WORKER_PORT TG_DISPATCH_BOT_TOKEN MON_DB_ENABLED; do
   VALUE=$(grep "^${KEY}=" "$ENV_FILE" | cut -d= -f2- | tr -d '\r\n')
   export "${KEY}=${VALUE}"
 done

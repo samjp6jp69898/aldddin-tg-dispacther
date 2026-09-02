@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.aladdin.victorialogs</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/zsh</string>
+        <string>/Users/user/aladdin/telegram-dispatcher/launchd/run-victorialogs.sh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/user/aladdin/telegram-dispatcher</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>LANG</key>
+        <string>en_US.UTF-8</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/user/aladdin/telegram-dispatcher/logs/launchd-victorialogs.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/user/aladdin/telegram-dispatcher/logs/launchd-victorialogs.err.log</string>
+</dict>
+</plist>

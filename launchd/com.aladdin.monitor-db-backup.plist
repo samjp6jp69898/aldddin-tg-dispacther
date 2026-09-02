@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.aladdin.monitor-db-backup</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/zsh</string>
+        <string>/Users/user/aladdin/telegram-dispatcher/deploy/monitor-db/backup.sh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/user/aladdin/telegram-dispatcher</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>LANG</key>
+        <string>en_US.UTF-8</string>
+    </dict>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>3</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/user/aladdin/telegram-dispatcher/logs/launchd-monitor-db-backup.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/user/aladdin/telegram-dispatcher/logs/launchd-monitor-db-backup.err.log</string>
+</dict>
+</plist>
