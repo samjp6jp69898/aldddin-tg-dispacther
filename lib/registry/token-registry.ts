@@ -756,7 +756,14 @@ async function runRegistryOperation(intent: RegistryIntent, deps: RegistryDeps):
     return { written, issued }
   } catch (err) {
     // 單一告警點：整條流程任一步中止都在這裡 alert 恰一次（訊息不含 token 明文）。
-    d.alert(`[token-registry] op='${intent.op}' 中止：${(err as Error).message}`)
+    // 自癒指引（F-1，2026-09-02 dry-run 實證）：步驟 2 寫 DB 在步驟 4 閘門之前，
+    // 中止後 DB 可能已領先檔案，該 (server, env) 的後續任何 intent（含純
+    // reconcile）都會持續中止；唯一自癒方式是排除中止原因後**重放同一個 intent**
+    // （DB 側冪等，重放成功即重新收斂）。
+    d.alert(
+      `[token-registry] op='${intent.op}' 中止：${(err as Error).message}` +
+        `（若 DB 已領先檔案，該名冊後續操作將持續中止；排除原因後重放同一 intent 即自癒）`,
+    )
     throw err
   } finally {
     if (pool) await pool.end()
