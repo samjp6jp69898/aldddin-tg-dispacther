@@ -146,3 +146,14 @@ loopback，讓 worker 能像連本機一樣連監控 DB、把 log 經同一條�
   **未對任何 worker 建立實際連線**——`sync-tunnels.sh`（產生實體 plist 並
   `launchctl bootstrap` 的腳本）與對 worker 的實連驗收（`nc -z` + 身分驗收，見
   上方「Phase 3 部署順序」步驟 2）都待 Phase 3 實測。
+- **`sync-tunnels.sh` 用法（先行開發，尚未實際 bootstrap 過任何 job）**：
+  `deploy/sync-tunnels.sh [--dry-run] [--check] [--roster <path>]`。名冊
+  （`logs/cluster-workers.json`，`--roster` 可指向測試用 fixture）是唯一驅動
+  來源：enabled worker 逐台渲染 per-worker plist 到
+  `~/Library/LaunchAgents/com.aladdin.monitor-tunnel.<worker>.plist`（`plutil
+  -lint` 過才算成功；內容相同即跳過，冪等），不在名冊或已 `disabled` 的
+  worker 則把既有 plist `bootout` + 刪除（teardown）。`--dry-run` 只印將執行
+  的步驟，零副作用；`--check` 唯讀驗證每台 enabled worker 的 job 是否都存在
+  且已載入，供 `doctor-monitor.sh` 日後引用。名冊 JSON parse 失敗時直接
+  `exit 1`、不做任何 teardown，避免把所有現存 tunnel job 誤刪。部分失敗語意
+  與 `set-monitor-flag.sh` 一致：逐台續跑、結束時非 0 並列出失敗機、重跑冪等。
