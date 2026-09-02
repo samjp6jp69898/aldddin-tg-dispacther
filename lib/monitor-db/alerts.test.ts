@@ -1,6 +1,7 @@
 import { afterAll, describe, expect, test } from 'bun:test'
 import {
   evaluateMonitorDbAlerts,
+  normalizeReadSource,
   probeReadSource,
   HEARTBEAT_STALE_MS,
   NEW_WORKER_GRACE_MS,
@@ -292,8 +293,9 @@ describe('(f) r1_violation', () => {
   })
 })
 
-// 判準（2026-09-02 更正）：degraded === true || requestedValid === false。
-// **不再比對 effective !== requested**——那會對三種健康設定誤報。
+// 判準（總指揮終版裁定）＝三支 OR：
+//   degraded === true || requestedValid === false || normalize(requested) !== effective
+// 第三支是 head 側獨立正規化後的交叉驗證，補回「真降級但忘設 degraded」的盲區。
 describe('(g) 讀取面靜默降級', () => {
   const rs = (o: Partial<ReadSourceStatus>): MonitorAlertDeps =>
     healthyDeps({
@@ -318,9 +320,14 @@ describe('(g) 讀取面靜默降級', () => {
 
   // 這三種是**健康**設定，tg-monitor 端都正常解析（requestedValid=true）。
   // 舊判準（effective !== requested 裸字串比對）會對它們全部誤報。
-  describe('健康變體不得誤報（舊判準的三個誤報來源）', () => {
-    test('未設 MON_READ_SOURCE：requested 為空字串', async () => {
+  describe('健康變體不得誤報（裸字串比對的四個誤報來源）', () => {
+    test('未設 MON_READ_SOURCE（run-monitor.sh 匯出空字串）：requested = ""', async () => {
       expect(await trippedG({ requested: '', effective: 'sqlite', degraded: false, requestedValid: true })).toBe(false)
+    })
+
+    test('未設 MON_READ_SOURCE（行程根本沒這個變數）：requested = null', async () => {
+      // tg-monitor server.ts:1107 是 `requested: raw ?? null`，這種情況送出 JSON null。
+      expect(await trippedG({ requested: null, effective: 'sqlite', degraded: false, requestedValid: true })).toBe(false)
     })
 
     test('大小寫不同：requested = "MySQL"', async () => {
@@ -330,15 +337,46 @@ describe('(g) 讀取面靜默降級', () => {
     test('尾隨空白：requested = "mysql "', async () => {
       expect(await trippedG({ requested: 'mysql ', effective: 'mysql', degraded: false, requestedValid: true })).toBe(false)
     })
+
+    test('明確設 sqlite：requested = "sqlite"', async () => {
+      expect(await trippedG({ requested: 'sqlite', effective: 'sqlite', degraded: false, requestedValid: true })).toBe(false)
+    })
+  })
+
+  // 第三支存在的理由：前兩支都建立在「相信被監控者的自述」上。degraded 由
+  // tg-monitor server.ts:1113 單一處算出，那一處漏設／算錯，告警就跟著瞎掉。
+  describe('第三支交叉驗證：對方真降級卻漏設 degraded', () => {
+    test('{requested:"mysql", effective:"sqlite", degraded:false, requestedValid:true} → 必須翻轉', async () => {
+      const a = byKey(
+        await evaluateMonitorDbAlerts(rs({ requested: 'mysql', effective: 'sqlite', degraded: false, requestedValid: true })),
+        'monitor-db:read-source-degraded',
+      )!
+      expect(a.tripped).toBe(true)
+      expect(a.detail).toContain('交叉驗證')
+      expect(a.detail).toContain("應得 'mysql'")
+    })
+
+    test('反向：要 sqlite 卻在跑 mysql（同樣是自報旗標抓不到的不一致）', async () => {
+      expect(await trippedG({ requested: 'sqlite', effective: 'mysql', degraded: false, requestedValid: true })).toBe(true)
+    })
+
+    test('第三支不依賴 requestedValid：舊版回應（無該欄）一樣抓得到', async () => {
+      expect(await trippedG({ requested: 'mysql', effective: 'sqlite', degraded: false, requestedValid: null })).toBe(true)
+    })
   })
 
   describe('對面還是舊版（回應沒有 requestedValid 欄位 ⇒ null）', () => {
-    test('degraded=false → 不翻轉（不得因為「這個問題答不出來」就告警）', async () => {
-      expect(await trippedG({ requested: 'mysq', effective: 'sqlite', degraded: false, requestedValid: null })).toBe(false)
+    test('健康設定 → 不翻轉（不得因為「這個問題答不出來」就告警）', async () => {
+      expect(await trippedG({ requested: 'mysql', effective: 'mysql', degraded: false, requestedValid: null })).toBe(false)
     })
 
-    test('degraded=true → 仍然翻轉（degraded 這一半在舊版一樣有效）', async () => {
-      expect(await trippedG({ requested: 'mysql', effective: 'sqlite', degraded: true, requestedValid: null })).toBe(true)
+    test('degraded=true → 仍然翻轉（第 1 支在舊版一樣有效）', async () => {
+      expect(await trippedG({ requested: 'mysql', effective: 'mysql', degraded: true, requestedValid: null })).toBe(true)
+    })
+
+    test('打錯字在舊版**抓不到**（已知界線）：normalize("mysq")="sqlite" 與 effective 一致，且無 requestedValid 可判', async () => {
+      // 這不是缺陷而是舊版回應的資訊上限——第 2 支就是為了補這個洞才加的欄位。
+      expect(await trippedG({ requested: 'mysq', effective: 'sqlite', degraded: false, requestedValid: null })).toBe(false)
     })
   })
 
@@ -374,6 +412,7 @@ describe('probeReadSource — 只有拿到合法回應才不是 unknown', () => 
       if (mode === 'ok') return Response.json({ requested: 'mysql', effective: 'sqlite', degraded: true, requestedValid: true })
       if (mode === 'legacy') return Response.json({ requested: 'mysql', effective: 'sqlite', degraded: true })
       if (mode === 'badvalid') return Response.json({ requested: 'mysql', effective: 'sqlite', degraded: true, requestedValid: 'yes' })
+      if (mode === 'unset') return Response.json({ requested: null, effective: 'sqlite', degraded: false, requestedValid: true })
       if (mode === 'shape') return Response.json({ requested: 'mysql' })
       if (mode === 'notjson') return new Response('<html>hi</html>', { headers: { 'content-type': 'text/html' } })
       return new Response('boom', { status: 500 })
@@ -395,6 +434,12 @@ describe('probeReadSource — 只有拿到合法回應才不是 unknown', () => 
   test('requestedValid 型別不對 → 同樣收斂成 null（不猜、不當成 false）', async () => {
     mode = 'badvalid'
     expect(await probeReadSource(`${base}/api/read-source`)).toEqual({ requested: 'mysql', effective: 'sqlite', degraded: true, requestedValid: null })
+  })
+
+  test('requested 為 null（MON_READ_SOURCE 未設）→ **不是** unknown，照常回內容', async () => {
+    // 這一條擋的是「把未設變數的那台整條判成 unknown ⇒ 條件 g 從此不評估」。
+    mode = 'unset'
+    expect(await probeReadSource(`${base}/api/read-source`)).toEqual({ requested: null, effective: 'sqlite', degraded: false, requestedValid: true })
   })
 
   test('404（tg-monitor 還沒載入 Phase 8 的碼）→ null，不告警', async () => {
@@ -545,8 +590,9 @@ describe('onRosterResolved 回呼（呼叫端清理退場 worker 的 key 用）'
 describe('(g) MON_READ_SOURCE 打錯字的 fail-safe 情境（指揮層追加驗收）', () => {
   // tg-monitor 的 resolveReadSource() 對打錯的值 fail-safe 回 sqlite，端點回
   // {requested:"mysq", effective:"sqlite", degraded:false, requestedValid:false}
-  // ——degraded 是 **false**，所以只看 degraded 會靜默放過；抓得到它的是
-  // requestedValid===false 這一半。
+  // ——degraded 是 **false**，所以第 1 支放過；第 3 支也放過（head 的 normalize
+  // 鏡射同一套 fail-safe，normalize("mysq")="sqlite" 正好等於 effective）。
+  // **只有第 2 支 requestedValid===false 抓得到它**——這就是那個欄位存在的理由。
   test('{degraded:false, requestedValid:false} → 必須翻轉告警', async () => {
     const alerts = await evaluateMonitorDbAlerts(
       healthyDeps({ readReadSource: async () => ({ requested: 'mysq', effective: 'sqlite', degraded: false, requestedValid: false }) }),
@@ -570,4 +616,27 @@ describe('(g) MON_READ_SOURCE 打錯字的 fail-safe 情境（指揮層追加驗
       server.stop(true)
     }
   })
+})
+
+// head 側的正規化——語意必須鏡射 tg-monitor/lib/read/source.ts 的 resolveReadSource。
+// 這組測試就是那份鏡射契約的落地：對方改值域而這裡沒跟上時，應該由這裡先紅。
+describe('normalizeReadSource（鏡射 tg-monitor resolveReadSource 的語意）', () => {
+  const cases: Array<[string | null, 'mysql' | 'sqlite']> = [
+    [null, 'sqlite'], // 未設
+    ['', 'sqlite'], // 空字串（run-monitor.sh 匯出的形式）
+    ['   ', 'sqlite'], // 只有空白
+    ['sqlite', 'sqlite'],
+    ['mysql', 'mysql'],
+    ['MySQL', 'mysql'], // 大小寫不敏感
+    ['  mysql  ', 'mysql'], // 前後空白
+    ['MYSQL', 'mysql'],
+    ['mysq', 'sqlite'], // 打錯字 → fail-safe
+    ['postgres', 'sqlite'], // 不認得的值 → fail-safe
+    ['mysql;', 'sqlite'], // 夾帶字元 → fail-safe
+  ]
+  for (const [raw, expected] of cases) {
+    test(`${JSON.stringify(raw)} → '${expected}'`, () => {
+      expect(normalizeReadSource(raw)).toBe(expected)
+    })
+  }
 })

@@ -24,17 +24,20 @@
 //   g. **讀取面靜默降級**（2026-09-02 指揮官追加，判準於同日更正）：tg-monitor 的
 //      `GET 127.0.0.1:8799/api/read-source` 回
 //      `{requested, effective, degraded, requestedValid}`；
-//      **判準 ＝ `degraded === true || requestedValid === false`**。語意是
-//      「`MON_READ_SOURCE=mysql` 但探針失敗、面板靜默退回 sqlite」或
-//      「`MON_READ_SOURCE` 根本填了非法值、被 fail-safe 吃掉」——兩種降級在畫面上
-//      都完全看不出來（數字還是有，只是來源變了）。
-//      **不再比對 `effective !== requested`**（原判準，已移除，不留兩套）：裸字串
-//      比對會對三種**健康**設定誤報——未設（`requested` 為空字串）、大小寫不同
-//      （`MySQL`）、尾隨空白（`'mysql '`）。這些 tg-monitor 端都正常解析，
-//      `requestedValid` 為 true，不該吵人。合法性判定的權威在 tg-monitor 那邊
-//      （它才知道自己認得哪些值），head 這裡只讀結論、不自己重寫一套解析。
-//      **`requestedValid` 欄位不存在**（對面還是舊版、尚未部署 a4）→ **只以
-//      `degraded` 判定**，不誤翻轉。
+//      **判準（總指揮終版裁定）＝三支 OR**：
+//        1. `degraded === true`——tg-monitor 自報「要 mysql 卻退回 sqlite」。
+//        2. `requestedValid === false`——設定值本身認不得（打錯字，被 fail-safe 吃掉）。
+//        3. `normalizeReadSource(requested) !== effective`——**head 側獨立算一次
+//           再對照**。前兩支都是「完全信任被監控者的自述」：`degraded` 由
+//           tg-monitor `server.ts:1113` 單一處算出，那一處若算錯或漏設，告警就跟著
+//           瞎掉。第三支不依賴對方任何自報旗標，補回「真降級但忘設 degraded」
+//           這個盲區，而且因為比的是**正規化後**的值，不會重蹈裸字串比對的誤報。
+//      **不比對裸字串 `effective !== requested`**（曾是原判準，已移除）：那會對三種
+//      **健康**設定誤報——未設（`requested` 為空字串或 `null`）、大小寫不同
+//      （`MySQL`）、尾隨空白（`'mysql '`）。第三支比的是正規化後的結果，這三種
+//      都會得到與 `effective` 相同的值，誤報歸零。
+//      **`requestedValid` 欄位不存在**（對面還是舊版、尚未部署 a4）→ 第 2 支不參與
+//      判定（不誤翻轉），第 1、3 支照跑（它們不依賴這個新欄位）。
 //      **端點 404／連線拒絕／逾時／回應形狀不對一律判 unknown、跳過不告警**：
 //      tg-monitor 尚未載入 Phase 8 的碼之前這條端點根本不存在，不得誤翻轉。
 //
@@ -116,7 +119,13 @@ export interface RosterWorker {
 /** (g) `GET /api/read-source` 的回應。`null` ＝ unknown（端點不存在／打不到／
  * 形狀不對），呼叫端一律跳過不告警。 */
 export interface ReadSourceStatus {
-  requested: string
+  /**
+   * `MON_READ_SOURCE` 的原始字串，未經解析。**`null` ＝ 該環境變數未設定**
+   * ——tg-monitor `server.ts:1107` 是 `requested: raw ?? null`，行程沒有這個
+   * 變數時送出的就是 JSON `null`（launchd 經 `run-monitor.sh` 匯出時是空字串，
+   * 兩種都代表「沒設」）。不可當成「回應形狀不對」而整條丟掉。
+   */
+  requested: string | null
   effective: string
   degraded: boolean
   /**
@@ -217,6 +226,22 @@ function defaultProbeTunnel(worker: string): Promise<boolean> {
 }
 
 /**
+ * `MON_READ_SOURCE` 的解析結果——**head 側獨立實作，語意鏡射 tg-monitor 的
+ * `resolveReadSource()`（`tg-monitor/lib/read/source.ts`）**：
+ *   trim + 轉小寫；`''`／未設（`null`）→ `'sqlite'`（預設）；
+ *   `'sqlite'` → `'sqlite'`；`'mysql'` → `'mysql'`；
+ *   **其他任何值 → `'sqlite'`**（對方是 fail-safe 退回，不是拋錯）。
+ *
+ * ⚠️ **這是刻意的重複實作，不是漂移疏忽**：條件 (g) 的第三支要的就是「不經由
+ * 被監控者自述、自己獨立算一次再對照」——共用對方的函式就失去交叉驗證的意義
+ * （對方那一處算錯時，兩邊會一起錯）。代價是**對方變更值域時必須同步改這裡**，
+ * 這是總指揮裁定接受的成本。同步點只有一個：上面那五行規則。
+ */
+export function normalizeReadSource(raw: string | null): 'mysql' | 'sqlite' {
+  return (raw ?? '').trim().toLowerCase() === 'mysql' ? 'mysql' : 'sqlite'
+}
+
+/**
  * (g)：打 tg-monitor 的 `GET /api/read-source`。
  *
  * **fail-open**：任何「問不到答案」的情況（連線拒絕、逾時、非 2xx 含 404、
@@ -231,13 +256,18 @@ export async function probeReadSource(url: string = READ_SOURCE_URL): Promise<Re
     const res = await fetch(url, { signal: AbortSignal.timeout(READ_SOURCE_PROBE_TIMEOUT_MS) })
     if (!res.ok) return null
     const data = (await res.json()) as { requested?: unknown; effective?: unknown; degraded?: unknown; requestedValid?: unknown }
-    if (typeof data.requested !== 'string' || typeof data.effective !== 'string' || typeof data.degraded !== 'boolean') return null
+    // `requested` 允許 `null`＝「MON_READ_SOURCE 未設」（見 ReadSourceStatus 的
+    // 說明）。若這裡跟著要求 string，未設變數的那台會被整條判成 unknown、
+    // 條件 g 從此不評估——那是靜默的偵測缺口，不是保守。
+    const requested = data.requested === null || data.requested === undefined ? null : data.requested
+    if (typeof requested !== 'string' && requested !== null) return null
+    if (typeof data.effective !== 'string' || typeof data.degraded !== 'boolean') return null
     // `requestedValid` 是 a4 才加上的欄位：缺欄（舊版）或型別不對一律收斂成
     // `null`＝「這個問題對面答不出來」，由判定端退回只看 `degraded`。
     // 三個字串欄位一律**原文透傳、零正規化**（無 lowercase／trim／enum 解析）：
     // 它們只進診斷訊息，維運要看到的是自己實際打錯的那串字。
     return {
-      requested: data.requested,
+      requested,
       effective: data.effective,
       degraded: data.degraded,
       requestedValid: typeof data.requestedValid === 'boolean' ? data.requestedValid : null,
@@ -463,21 +493,27 @@ export async function evaluateMonitorDbAlerts(deps: MonitorAlertDeps = {}): Prom
   try {
     const rs = await (deps.readReadSource ?? probeReadSource)()
     if (rs !== null) {
-      // 判準（2026-09-02 更正）：`degraded === true || requestedValid === false`。
-      // **刻意不比對 `effective !== requested`**——裸字串比對會對「未設／大小寫
-      // 不同／尾隨空白」這三種健康設定誤報，而那三種 tg-monitor 都正常解析。
-      // `requestedValid === null`（舊版沒有這個欄位）時只看 `degraded`。
+      // 判準（總指揮終版裁定）＝三支 OR，理由見檔頭 (g)。
       const invalidSetting = rs.requestedValid === false
+      // 第三支：head 自己正規化一次再跟對方回報的 effective 對照。不依賴
+      // `degraded`／`requestedValid` 任一自報旗標 ⇒ 對方漏設 degraded 也抓得到。
+      const expected = normalizeReadSource(rs.requested)
+      const crossCheckFailed = expected !== rs.effective
+      const shown = rs.requested === null ? '(未設)' : `'${rs.requested}'`
       alerts.push({
         key: 'monitor-db:read-source-degraded',
         label: 'tg-monitor 讀取面來源',
-        tripped: rs.degraded === true || invalidSetting,
+        tripped: rs.degraded === true || invalidSetting || crossCheckFailed,
         level: 'error',
         detail: invalidSetting
-          ? `tg-monitor 的 MON_READ_SOURCE 設定值不合法：requested='${rs.requested}'，已被 fail-safe 成 effective='${rs.effective}'` +
+          ? `tg-monitor 的 MON_READ_SOURCE 設定值不合法：requested=${shown}，已被 fail-safe 成 effective='${rs.effective}'` +
             `（degraded=${rs.degraded}）——面板上的數字看起來正常，但讀的根本不是你以為的那個來源，請改正設定值`
-          : `tg-monitor 的讀取面已靜默降級：requested='${rs.requested}'、effective='${rs.effective}'（degraded=true）` +
-            '——面板上的數字看起來正常，實際來源已不是要求的那一個',
+          : rs.degraded === true
+            ? `tg-monitor 的讀取面已靜默降級：requested=${shown}、effective='${rs.effective}'（degraded=true）` +
+              '——面板上的數字看起來正常，實際來源已不是要求的那一個'
+            : `tg-monitor 的讀取面與設定不符（head 側交叉驗證）：MON_READ_SOURCE=${shown} 依解析規則應得 '${expected}'，` +
+              `但 tg-monitor 回報 effective='${rs.effective}' 且 degraded=false——對方可能真降級卻漏設 degraded 旗標，` +
+              '請直接查 tg-monitor 的啟動 log 確認實際讀取來源',
       })
     }
     // rs === null ＝ unknown：**刻意不 push 任何條件**，呼叫端因此保留前一狀態，
