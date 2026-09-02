@@ -1,5 +1,5 @@
 #!/bin/bash
-# sync-workers.sh — head 端：把 GitHub 上**已 push** 的 aladdin_ai / telegram-dispatcher
+# sync-workers.sh — head 端：把 GitHub 上**已 push** 的 aladdin_ai / telegram-dispatcher / aladdin_mcps
 # 派送到名冊裡每台 worker（ssh 進去 git pull --ff-only + 視需要 bun install + 重啟 worker agent）。
 #
 # 用法：bash deploy/sync-workers.sh [--worker <name|ip>] [--no-restart] [--force-restart] [--dry-run]
@@ -19,7 +19,7 @@
 # 名冊來源：logs/cluster-workers.json（worker agent 啟動時自動登記），disabled=true 的跳過。
 #
 # 輸出契約（呼叫端行首 grep）：
-#   WORKER_OK   <name> aladdin_ai=<sha7> telegram-dispatcher=<sha7> bun_install=yes|no symlink=ok|<n>_bad restart=done|skipped(<n> jobs)|off health=ok|pending
+#   WORKER_OK   <name> aladdin_ai=<sha7> telegram-dispatcher=<sha7> aladdin_mcps=<sha7> bun_install=yes|no symlink=ok|<n>_bad restart=done|skipped(<n> jobs)|off health=ok|pending
 #   WORKER_FAIL <name> <原因>
 #   WORKER_SKIP <name> <原因>
 #   SYNC_DONE ok=N fail=M skip=K        （任一 WORKER_FAIL → exit 1）
@@ -28,7 +28,7 @@ ROOT=/Users/user/aladdin
 DISPATCHER=$ROOT/telegram-dispatcher
 ROSTER=$DISPATCHER/logs/cluster-workers.json
 SSH_USER=user
-REPOS="aladdin_ai telegram-dispatcher"
+REPOS="aladdin_ai telegram-dispatcher aladdin_mcps"
 
 ONLY=""; NO_RESTART=0; FORCE=0; DRY=0
 while [ $# -gt 0 ]; do
@@ -41,8 +41,8 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-# ---- 1. head 端前置：兩個 repo 都必須已 push（main 不可領先 origin/main）----
-TARGET_AI=""; TARGET_TD=""
+# ---- 1. head 端前置：三個 repo 都必須已 push（main 不可領先 origin/main）----
+TARGET_AI=""; TARGET_TD=""; TARGET_MCPS=""
 for repo in $REPOS; do
   git -C "$ROOT/$repo" fetch origin main --quiet 2>/dev/null || { echo "SYNC_DONE ok=0 fail=0 skip=0 (head 的 $repo fetch origin 失敗)"; exit 1; }
   AHEAD=$(git -C "$ROOT/$repo" rev-list --count origin/main..main 2>/dev/null || echo "?")
@@ -51,9 +51,9 @@ for repo in $REPOS; do
     echo "SYNC_DONE ok=0 fail=0 skip=0"; exit 1
   fi
   SHA=$(git -C "$ROOT/$repo" rev-parse --short=7 origin/main)
-  case "$repo" in aladdin_ai) TARGET_AI=$SHA;; telegram-dispatcher) TARGET_TD=$SHA;; esac
+  case "$repo" in aladdin_ai) TARGET_AI=$SHA;; telegram-dispatcher) TARGET_TD=$SHA;; aladdin_mcps) TARGET_MCPS=$SHA;; esac
 done
-echo "TARGET: aladdin_ai=$TARGET_AI telegram-dispatcher=$TARGET_TD (origin/main)"
+echo "TARGET: aladdin_ai=$TARGET_AI telegram-dispatcher=$TARGET_TD aladdin_mcps=$TARGET_MCPS (origin/main)"
 
 # ---- 2. 讀名冊 ----
 [ -f "$ROSTER" ] || { echo "SYNC_DONE ok=0 fail=0 skip=0 (名冊 $ROSTER 不存在——head 尚未啟用 cluster 或沒有 worker 登記)"; exit 1; }
@@ -69,14 +69,14 @@ PY
 )
 [ -n "$WORKERS" ] || { echo "SYNC_DONE ok=0 fail=0 skip=0 (名冊為空)"; exit 1; }
 
-# ---- 3. 遠端腳本（以 bash -s 送過去；$1..$4 = target_ai target_td no_restart force）----
+# ---- 3. 遠端腳本（以 bash -s 送過去；$1..$5 = target_ai target_td target_mcps no_restart force）----
 REMOTE='
 set -u
-TARGET_AI="$1"; TARGET_TD="$2"; NO_RESTART="$3"; FORCE="$4"
+TARGET_AI="$1"; TARGET_TD="$2"; TARGET_MCPS="$3"; NO_RESTART="$4"; FORCE="$5"
 ROOT=/Users/user/aladdin
 BUN=/Users/user/.bun/bin/bun
 BUN_INSTALL=no
-for repo in aladdin_ai telegram-dispatcher; do
+for repo in aladdin_ai telegram-dispatcher aladdin_mcps; do
   cd "$ROOT/$repo" 2>/dev/null || { echo "REMOTE_FAIL: $repo 目錄不存在"; exit 2; }
   if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
     echo "REMOTE_FAIL: $repo 有未 commit 的已追蹤變更，拒絕 pull（請到該機處理：git stash 或 commit）"; exit 2
@@ -93,6 +93,7 @@ for repo in aladdin_ai telegram-dispatcher; do
 done
 SHA_AI=$(git -C "$ROOT/aladdin_ai" rev-parse --short=7 HEAD)
 SHA_TD=$(git -C "$ROOT/telegram-dispatcher" rev-parse --short=7 HEAD)
+SHA_MCPS=$(git -C "$ROOT/aladdin_mcps" rev-parse --short=7 HEAD)
 # symlink 健檢（AGENTS.md 那行是已知且使用者裁定不修的，排除）
 BAD=$(bash "$ROOT/scripts/sync-mirrors.sh" --check 2>/dev/null | grep "^SYMLINK_" | grep -v "SYMLINK_OK" | grep -v "AGENTS.md" | wc -l | tr -d " ")
 [ "$BAD" = "0" ] && SYMLINK=ok || SYMLINK="${BAD}_bad"
@@ -105,7 +106,7 @@ else
 fi
 PORT=$(grep -m1 "^CLUSTER_WORKER_PORT=" "$ROOT/telegram-dispatcher/.env" 2>/dev/null | cut -d= -f2-); PORT="${PORT:-8801}"
 curl -sf --max-time 2 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && HEALTH=ok || HEALTH=pending
-echo "REMOTE_RESULT aladdin_ai=$SHA_AI telegram-dispatcher=$SHA_TD bun_install=$BUN_INSTALL symlink=$SYMLINK restart=$RESTART health=$HEALTH"
+echo "REMOTE_RESULT aladdin_ai=$SHA_AI telegram-dispatcher=$SHA_TD aladdin_mcps=$SHA_MCPS bun_install=$BUN_INSTALL symlink=$SYMLINK restart=$RESTART health=$HEALTH"
 '
 
 # ---- 4. 逐台執行 ----
@@ -117,12 +118,12 @@ while IFS=$'\t' read -r NAME HOST DISABLED; do
   if [ "$DISABLED" = "1" ]; then echo "WORKER_SKIP $NAME disabled=true"; SKIP=$((SKIP+1)); continue; fi
   [ -n "$HOST" ] || { echo "WORKER_FAIL $NAME 名冊 url 解析不出 host"; FAIL=$((FAIL+1)); continue; }
   if [ "$DRY" = 1 ]; then
-    echo "DRY: ssh $SSH_USER@$HOST → pull $REPOS 到 origin/main($TARGET_AI/$TARGET_TD)，restart=$([ "$NO_RESTART" = 1 ] && echo off || echo yes) force=$FORCE"
+    echo "DRY: ssh $SSH_USER@$HOST → pull $REPOS 到 origin/main($TARGET_AI/$TARGET_TD/$TARGET_MCPS)，restart=$([ "$NO_RESTART" = 1 ] && echo off || echo yes) force=$FORCE"
     echo "WORKER_SKIP $NAME dry-run"; SKIP=$((SKIP+1)); continue
   fi
   echo "== $NAME ($HOST) =="
   OUT=$(ssh -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new "$SSH_USER@$HOST" \
-        bash -s -- "$TARGET_AI" "$TARGET_TD" "$NO_RESTART" "$FORCE" <<<"$REMOTE" 2>&1)
+        bash -s -- "$TARGET_AI" "$TARGET_TD" "$TARGET_MCPS" "$NO_RESTART" "$FORCE" <<<"$REMOTE" 2>&1)
   RC=$?
   printf '%s\n' "$OUT" | grep -v "^REMOTE_RESULT" | sed 's/^/  /'
   RES=$(printf '%s\n' "$OUT" | grep -m1 "^REMOTE_RESULT")
@@ -132,8 +133,9 @@ while IFS=$'\t' read -r NAME HOST DISABLED; do
   fi
   GOT_AI=$(printf '%s' "$RES" | sed -E 's/.*aladdin_ai=([0-9a-f]+).*/\1/')
   GOT_TD=$(printf '%s' "$RES" | sed -E 's/.*telegram-dispatcher=([0-9a-f]+).*/\1/')
-  if [ "$GOT_AI" != "$TARGET_AI" ] || [ "$GOT_TD" != "$TARGET_TD" ]; then
-    echo "WORKER_FAIL $NAME pull 後版本不符（aladdin_ai=$GOT_AI≠$TARGET_AI 或 telegram-dispatcher=$GOT_TD≠$TARGET_TD）"; FAIL=$((FAIL+1)); continue
+  GOT_MCPS=$(printf '%s' "$RES" | sed -E 's/.*aladdin_mcps=([0-9a-f]+).*/\1/')
+  if [ "$GOT_AI" != "$TARGET_AI" ] || [ "$GOT_TD" != "$TARGET_TD" ] || [ "$GOT_MCPS" != "$TARGET_MCPS" ]; then
+    echo "WORKER_FAIL $NAME pull 後版本不符（aladdin_ai=$GOT_AI≠$TARGET_AI 或 telegram-dispatcher=$GOT_TD≠$TARGET_TD 或 aladdin_mcps=$GOT_MCPS≠$TARGET_MCPS）"; FAIL=$((FAIL+1)); continue
   fi
   echo "WORKER_OK $NAME ${RES#REMOTE_RESULT }"; OK=$((OK+1))
 done <<<"$WORKERS"

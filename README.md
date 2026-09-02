@@ -284,8 +284,8 @@ worker **不需要** cloudflared/tunnel/webhook——那些是 head 專屬。
 
 ### head → worker 程式碼派送（`deploy/sync-workers.sh`，2026-09-01 新增）
 
-`aladdin_ai`（commands/agents/skills/scripts）與 `telegram-dispatcher` 改了之後，
-worker 不會自己更新——之前得逐台登入 `git pull`。現在在 head 上跑一支即可：
+`aladdin_ai`（commands/agents/skills/scripts）、`telegram-dispatcher` 與 `aladdin_mcps`
+改了之後，worker 不會自己更新——之前得逐台登入 `git pull`。現在在 head 上跑一支即可：
 
 ```bash
 # 1. 人先 push（腳本不代推；head 本機 main 領先 origin/main 會直接拒跑）
@@ -295,10 +295,10 @@ bash telegram-dispatcher/deploy/sync-workers.sh --worker landon2   # 只一台�
 bash telegram-dispatcher/deploy/sync-workers.sh --dry-run    # 只看會做什麼
 ```
 
-每台 worker 上做的事：兩個 repo `git pull --ff-only origin main`（有未 commit 的已追蹤
+每台 worker 上做的事：三個 repo `git pull --ff-only origin main`（有未 commit 的已追蹤
 變更或分岔 commit 就拒絕並回報，不 stash、不 reset）→ `telegram-dispatcher` 的
 `package.json`/`bun.lock` 有變才 `bun install --frozen-lockfile` → `sync-mirrors.sh --check`
-symlink 健檢 → `launchctl kickstart -k` 重啟 worker agent → 回報兩個 repo 的 HEAD、
+symlink 健檢 → `launchctl kickstart -k` 重啟 worker agent → 回報三個 repo 的 HEAD、
 head 端比對是否等於 `origin/main`。
 
 - **進行中的 pipeline**：worker 上 `/tmp/bug-analysis-locks/` 有 ticket 鎖時**預設跳過重啟**
