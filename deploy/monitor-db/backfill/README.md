@@ -34,6 +34,21 @@
 - **log 回填的遮罩**：`lib/redaction.ts` 是 §7.3 十一條規則的回填先行版；Phase 7 的
   `lib/log-shipper/redaction.ts` 落地後應收斂為單一來源。
 - **VL retention**：`_time` 早於 90 天的行主動跳過並列入報告（VL 端會無聲拒收，§11.2）。
+- **既存防撞守衛（總指揮裁定，2026-09-02）**：`runs` PK 只有 `run_id`、`legacy_key` 非
+  唯一鍵——live 寫入路徑用 `randomUUID()` 鑄 `run_id`，回填路徑用
+  `deriveRunId(legacy_key)` 導出 `run_id`，同一支歷史 run 兩軌算出不同 PK，
+  `INSERT IGNORE` 因此偵測不到重複，雙軌重疊的 run 會被插成兩列且零警告
+  （實測重疊 2 筆：`FAQ-4771` / `FAQ-4855`）。`backfill-sqlite.ts` 在回填 `runs` 之前
+  先唯讀 `SELECT legacy_key FROM runs WHERE legacy_key IS NOT NULL` 建記憶體 Set
+  （此步嚴禁任何寫入，唯讀與寫入分離），命中者整列 skip（skipReason：
+  `已存在於 mysql（live 寫入）：key=<key>`），並級聯 skip 該 run 對應的 `agent_runs`
+  （skipReason 獨立標示為「既存防撞守衛級聯跳過」），避免插出掛在未回填 `run_id`
+  下的孤兒列。**這是時間序問題：Phase 6 回填的執行順序排在 live 寫入路徑
+  （migration 004／W1 legacy_key 落地）部署輪之後**——回填執行當下，live 路徑可能
+  已經把 sqlite 歷史裡同一支 run 寫過一次，兩軌才有機會撞在一起；**但守衛本身
+  無論何時跑都必須有**，不得因「這次應該在乾淨窗口跑、理論上不會撞」而省略——
+  唯讀查詢成本近乎零，省略等於把「假設不會撞」的判斷權下放給執行當下的人，
+  而 2026-09-02 的實測已經證明這個假設會落空。
 
 ## 測試
 
@@ -84,6 +99,13 @@ WAL 踩坑（impl-constraints-addendum §4）：讀 `monitor.sqlite` **禁止 cp
   2. **一次跑完，不分批跨版本**：`INSERT IGNORE` 的安全性建立在「所有列由同一版
      mapping 寫入」——第一批跑完後若 mapping 被改過再跑第二批，先寫的列用舊 mapping
      且不會被修正、也不會報錯，這是 `INSERT IGNORE` 最陰的失敗模式。
+  3. **既存防撞守衛的驗收檢查（b5 對線定案）**：回填跑完後執行
+     `SELECT legacy_key, COUNT(*) FROM runs WHERE legacy_key IS NOT NULL GROUP BY legacy_key
+     HAVING COUNT(*)>1`，結果必須為空。**`WHERE legacy_key IS NOT NULL` 不可省**：
+     cancel placeholder 路徑（`lib/monitor-db/writes.ts:304` 的 `input.legacyKey ?? null`）
+     會產生 `legacy_key` 為 NULL 的列，MySQL 的 `GROUP BY` 把所有 NULL 併成同一組，
+     一旦 placeholder 列 ≥ 2 筆，拿掉這個 WHERE 就會 false-red。此 SQL 層檢查沒有
+     讀取層 `COALESCE(legacy_key, run_id)` 那種保護，NULL 過濾是必要條件，不是風格選擇。
 
 ## §10.2 對數備註（雙軌對照；容差定義 2026-09-02 與讀取面統一，a7 核定）
 

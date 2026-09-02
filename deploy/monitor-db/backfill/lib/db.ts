@@ -55,3 +55,20 @@ export async function countRows(pool: Pool, table: string, whereSql = '', params
   const [rows] = await pool.query<any[]>(`SELECT COUNT(*) AS c FROM ${table} ${whereSql}`, params)
   return Number(rows[0].c)
 }
+
+/**
+ * 既存防撞守衛：唯讀查詢 mysql `runs.legacy_key` 全集。
+ *
+ * 背景：`runs` 的 PK 只有 `run_id`，`legacy_key` 非唯一鍵；live 寫入路徑用
+ * `randomUUID()` 鑄 `run_id`，回填路徑用 `deriveRunId(legacy_key)` 導出
+ * `run_id`——兩者對同一支歷史 run 算出的 `run_id` 不同，`INSERT IGNORE`
+ * 因此不會偵測到重複，雙軌重疊的 run 會被插成兩列且零警告。
+ *
+ * 本函式**只讀**，呼叫端在回填 runs 之前先呼叫本函式建 Set，據以在寫入迴圈
+ * 開始前把命中的列全數 skip；本函式與所有寫入語句嚴格分離，不得在同一次
+ * 呼叫裡夾帶任何寫入。
+ */
+export async function fetchExistingLegacyKeys(pool: Pool): Promise<Set<string>> {
+  const [rows] = await pool.query<any[]>(`SELECT legacy_key FROM runs WHERE legacy_key IS NOT NULL`)
+  return new Set(rows.map((r: any) => String(r.legacy_key)))
+}

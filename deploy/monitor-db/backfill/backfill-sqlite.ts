@@ -27,7 +27,7 @@ import type { Pool } from 'mysql2/promise'
 import { isoToMysqlDatetime3, isoToMysqlDatetime3OrNull } from '../../../lib/monitor-db/mysql-datetime.ts'
 import { KNOWN_OUTCOME_TIER, LIFECYCLE_RANK } from '../../../lib/monitor-db/types.ts'
 import { parseBackfillArgs } from './lib/cli.ts'
-import { countRows, insertIfNotExists, insertIgnoreRow, openBackfillPool } from './lib/db.ts'
+import { countRows, fetchExistingLegacyKeys, insertIfNotExists, insertIgnoreRow, openBackfillPool } from './lib/db.ts'
 import { BACKFILL_HOST, loadBackfillEnv } from './lib/env.ts'
 import { makeReport, printReports, type SourceReport } from './lib/report.ts'
 import { deriveRunId } from './lib/run-id.ts'
@@ -286,8 +286,15 @@ export interface MapAgentRunResult {
  *   kind='demand' → 同 ticket、kind='demand'、started_at ≤ agent.started_at 的
  *                    pipeline_runs 中 started_at 最大者。
  * ISO 字串固定格式（毫秒＋'Z'）下，字典序比較等同時間序，故直接用字串比較。
+ *
+ * `guardSkippedKeys`（既存防撞守衛級聯）：對應的 pipeline_runs 列因 legacy_key
+ * 已存在於 mysql 被跳過時，該列衍生的 agent_runs 一律跟著跳過——否則會插出
+ * 掛在「不存在的 UUIDv5 run_id」下的孤兒列（該 run_id 從未被回填寫進 runs）。
  */
-export function buildAgentRunMapper(pipelineRuns: readonly SqlitePipelineRun[]): (agent: SqliteAgentRun) => MapAgentRunResult {
+export function buildAgentRunMapper(
+  pipelineRuns: readonly SqlitePipelineRun[],
+  guardSkippedKeys: ReadonlySet<string> = new Set(),
+): (agent: SqliteAgentRun) => MapAgentRunResult {
   const byStdoutPath = new Map<string, SqlitePipelineRun>()
   const demandByTicket = new Map<string, SqlitePipelineRun[]>()
   for (const pr of pipelineRuns) {
@@ -311,10 +318,20 @@ export function buildAgentRunMapper(pipelineRuns: readonly SqlitePipelineRun[]):
     }
   }
 
+  function guardCascadeSkip(pr: SqlitePipelineRun, agent: SqliteAgentRun): MapAgentRunResult | null {
+    if (!guardSkippedKeys.has(pr.key)) return null
+    return {
+      skip: true,
+      skipReason: `既存防撞守衛級聯跳過（對應 run 已存在於 mysql，未回填 run_id）：run_key=${pr.key} path=${agent.path}`,
+    }
+  }
+
   return function mapAgentRun(agent: SqliteAgentRun): MapAgentRunResult {
     if (agent.kind === 'bug') {
       const pr = byStdoutPath.get(agent.path)
       if (!pr) return { skip: true, skipReason: `bug agent_run 對不到 pipeline_runs.stdout_path：path=${agent.path}` }
+      const guarded = guardCascadeSkip(pr, agent)
+      if (guarded) return guarded
       return { skip: false, row: buildRow(agent, pr) }
     }
     if (agent.kind === 'demand') {
@@ -326,6 +343,8 @@ export function buildAgentRunMapper(pipelineRuns: readonly SqlitePipelineRun[]):
         }
       }
       const pr = candidates[candidates.length - 1]!
+      const guarded = guardCascadeSkip(pr, agent)
+      if (guarded) return guarded
       return { skip: false, row: buildRow(agent, pr) }
     }
     return { skip: true, skipReason: `未知 kind（非 bug/demand）：kind=${agent.kind} path=${agent.path}` }
@@ -484,8 +503,13 @@ export async function runBackfill(opts: RunBackfillOptions, deps: RunBackfillDep
     const events = db.query(`SELECT service, ts, identity, source_ip, raw FROM events`).all() as SqliteEvent[]
     const statusLogs = db.query(`SELECT service, ts, status, pid, detail FROM status_log`).all() as SqliteStatusLog[]
 
-    const runsReport = await backfillPipelineRuns(pipelineRuns, opts.dryRun, deps.pool)
-    const agentRunsReport = await backfillAgentRuns(agentRuns, pipelineRuns, opts.dryRun, deps.pool)
+    // 既存防撞守衛（唯讀，先於任何寫入）：runs.legacy_key 命中集合，供 pipeline_runs
+    // 與其級聯的 agent_runs 一併 skip；無 pool（純 dry-run 未連線）時視為空集合，
+    // 不做任何猜測性判斷。
+    const existingLegacyKeys = deps.pool ? await fetchExistingLegacyKeys(deps.pool) : new Set<string>()
+
+    const { report: runsReport, guardSkippedKeys } = await backfillPipelineRuns(pipelineRuns, opts.dryRun, deps.pool, existingLegacyKeys)
+    const agentRunsReport = await backfillAgentRuns(agentRuns, pipelineRuns, opts.dryRun, deps.pool, guardSkippedKeys)
     const mcpUsageReport = await backfillEvents(events, opts.dryRun, deps.pool)
     const statusLogReport = await backfillStatusLogs(statusLogs, opts.dryRun, deps.pool)
 
@@ -495,15 +519,37 @@ export async function runBackfill(opts: RunBackfillOptions, deps: RunBackfillDep
   }
 }
 
-async function backfillPipelineRuns(rows: SqlitePipelineRun[], dryRun: boolean, pool: Pool | undefined): Promise<SourceReport> {
+interface BackfillPipelineRunsResult {
+  report: SourceReport
+  /** 被既存防撞守衛跳過的 pipeline_runs.key 集合，供 agent_runs 級聯 skip。 */
+  guardSkippedKeys: Set<string>
+}
+
+async function backfillPipelineRuns(
+  rows: SqlitePipelineRun[],
+  dryRun: boolean,
+  pool: Pool | undefined,
+  existingLegacyKeys: ReadonlySet<string>,
+): Promise<BackfillPipelineRunsResult> {
   const report = makeReport('sqlite.pipeline_runs → runs', dryRun)
   report.sourceRows = rows.length
+  const guardSkippedKeys = new Set<string>()
 
   let timeoutCount = 0
   let timeoutDiffSum = 0
   let timeoutDiffKnown = 0
 
   for (const r of rows) {
+    // 既存防撞守衛：這列在 mysql 已存在（live 寫入，legacy_key 命中）→ 跳過，
+    // 不再進 outcome 映射／不寫入，避免同一支歷史 run 因 run_id 導出方式不同
+    // （live=randomUUID vs 回填=deriveRunId）被插成兩列。
+    if (existingLegacyKeys.has(r.key)) {
+      report.skipped++
+      report.notes.push(`已存在於 mysql（live 寫入）：key=${r.key}`)
+      guardSkippedKeys.add(r.key)
+      continue
+    }
+
     const mapped = mapPipelineRunToRunsRow(r)
     if (mapped.skip) {
       report.skipped++
@@ -531,8 +577,11 @@ async function backfillPipelineRuns(rows: SqlitePipelineRun[], dryRun: boolean, 
     report.notes.push(`timeout finished_at 重算為 started_at+7200s：${timeoutCount} 列，重算值與原值平均差 ${avg} 秒`)
   }
   report.notes.push('triggered_by 欄位語意不符：來源是顯示名不是 email，照存至 triggered_by_email')
+  if (guardSkippedKeys.size > 0) {
+    report.notes.push(`既存防撞守衛：略過 ${guardSkippedKeys.size} 列（legacy_key 已存在於 mysql runs，判定為 live 寫入）`)
+  }
 
-  return report
+  return { report, guardSkippedKeys }
 }
 
 async function backfillAgentRuns(
@@ -540,17 +589,20 @@ async function backfillAgentRuns(
   pipelineRuns: SqlitePipelineRun[],
   dryRun: boolean,
   pool: Pool | undefined,
+  guardSkippedKeys: ReadonlySet<string>,
 ): Promise<SourceReport> {
   const report = makeReport('sqlite.agent_runs → agent_runs', dryRun)
   report.sourceRows = agentRows.length
 
-  const mapAgentRun = buildAgentRunMapper(pipelineRuns)
+  const mapAgentRun = buildAgentRunMapper(pipelineRuns, guardSkippedKeys)
+  let guardCascadeSkipped = 0
 
   for (const a of agentRows) {
     const mapped = mapAgentRun(a)
     if (mapped.skip) {
       report.skipped++
       report.notes.push(mapped.skipReason!)
+      if (mapped.skipReason?.startsWith('既存防撞守衛級聯跳過')) guardCascadeSkipped++
       continue
     }
     report.attempted++
@@ -562,6 +614,9 @@ async function backfillAgentRuns(
   }
 
   report.notes.push(`schema 無對應欄位，已丟棄欄位清單：${AGENT_RUNS_DROPPED_COLUMNS.join(', ')}`)
+  if (guardCascadeSkipped > 0) {
+    report.notes.push(`既存防撞守衛級聯：略過 ${guardCascadeSkipped} 列 agent_runs（對應 run 已存在於 mysql，未回填 run_id）`)
+  }
 
   return report
 }
