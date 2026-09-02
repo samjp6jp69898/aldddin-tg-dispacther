@@ -67,14 +67,15 @@ export interface RunIdentity {
  */
 export const W1_SQL = `
 INSERT INTO runs
-  (run_id, host, ticket, kind, lifecycle_rank, started_at, pid, stdout_path,
+  (run_id, host, ticket, kind, lifecycle_rank, started_at, pid, stdout_path, stderr_path,
    trigger_source, retry_of_run_id, dispatch_id, legacy_key, created_at)
-VALUES (?,?,?,?,?,?,?,?,?,?,?,?, NOW(3)) AS new
+VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?, NOW(3)) AS new
 ON DUPLICATE KEY UPDATE
   lifecycle_rank  = IF(runs.host = new.host, GREATEST(runs.lifecycle_rank, new.lifecycle_rank), runs.lifecycle_rank),
   started_at      = IF(runs.host = new.host, COALESCE(runs.started_at,      new.started_at),      runs.started_at),
   pid             = IF(runs.host = new.host, COALESCE(runs.pid,             new.pid),             runs.pid),
   stdout_path     = IF(runs.host = new.host, COALESCE(runs.stdout_path,     new.stdout_path),     runs.stdout_path),
+  stderr_path     = IF(runs.host = new.host, COALESCE(runs.stderr_path,     new.stderr_path),     runs.stderr_path),
   trigger_source  = IF(runs.host = new.host, COALESCE(runs.trigger_source,  new.trigger_source),  runs.trigger_source),
   retry_of_run_id = IF(runs.host = new.host, COALESCE(runs.retry_of_run_id, new.retry_of_run_id), runs.retry_of_run_id),
   dispatch_id     = IF(runs.host = new.host, COALESCE(runs.dispatch_id,     new.dispatch_id),     runs.dispatch_id),
@@ -88,6 +89,7 @@ export interface WriteRunProgressInput extends RunIdentity {
   startedAt?: string | null
   pid?: number | null
   stdoutPath?: string | null
+  stderrPath?: string | null
   triggerSource?: string | null
   retryOfRunId?: string | null
   dispatchId?: string | null
@@ -104,6 +106,7 @@ export async function writeRunProgress(pool: MonitorDbExecutor, input: WriteRunP
     dt(input.startedAt),
     input.pid ?? null,
     input.stdoutPath ?? null,
+    input.stderrPath ?? null,
     input.triggerSource ?? null,
     input.retryOfRunId ?? null,
     input.dispatchId ?? null,

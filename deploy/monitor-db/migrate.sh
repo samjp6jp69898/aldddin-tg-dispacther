@@ -100,8 +100,8 @@ GRANT SELECT ON pipeline_monitor.service_status_log TO 'mon_ui'@'%';
 GRANT SELECT ON pipeline_monitor.tg_webhook_status_log TO 'mon_ui'@'%';
 GRANT SELECT ON pipeline_monitor.mcp_usage TO 'mon_ui'@'%';
 GRANT SELECT ON pipeline_monitor.monitor_heartbeat TO 'mon_ui'@'%';
-GRANT INSERT (run_id, host, ticket, kind, lifecycle_rank, cancel_requested_at, cancel_resolved_by, legacy_key, created_at) ON pipeline_monitor.runs TO 'mon_ui'@'%';
-GRANT UPDATE (cancel_requested_at, cancel_resolved_by, outcome, outcome_source) ON pipeline_monitor.runs TO 'mon_ui'@'%';
+GRANT INSERT (run_id, host, ticket, kind, lifecycle_rank, cancel_requested_at, cancel_resolved_by, legacy_key, created_at, review_rounds, final_review_rounds) ON pipeline_monitor.runs TO 'mon_ui'@'%';
+GRANT UPDATE (cancel_requested_at, cancel_resolved_by, outcome, outcome_source, review_rounds, final_review_rounds) ON pipeline_monitor.runs TO 'mon_ui'@'%';
 
 -- mon_exec：每一台 worker（逐表最小權限，不含 mcp_tokens/tech_users/tg_unknown_senders/mcp_usage/dispatch_attempts）。
 GRANT SELECT, INSERT, UPDATE ON pipeline_monitor.runs TO 'mon_exec'@'%';

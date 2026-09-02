@@ -23,6 +23,7 @@ export interface FakeRunRow {
   started_at: string | null
   pid: number | null
   stdout_path: string | null
+  stderr_path: string | null
   trigger_source: string | null
   retry_of_run_id: string | null
   dispatch_id: string | null
@@ -90,6 +91,7 @@ export class FakeRunsDb implements MonitorDbExecutor {
       started_at: null,
       pid: null,
       stdout_path: null,
+      stderr_path: null,
       trigger_source: null,
       retry_of_run_id: null,
       dispatch_id: null,
@@ -115,7 +117,7 @@ export class FakeRunsDb implements MonitorDbExecutor {
 
   // W1：INSERT … ON DUPLICATE KEY UPDATE（形狀 A）
   private handleW1(params: unknown[]): ResultSetHeader {
-    const [runId, host, ticket, kind, rank, startedAt, pid, stdoutPath, triggerSource, retryOfRunId, dispatchId, legacyKey] = params as [
+    const [runId, host, ticket, kind, rank, startedAt, pid, stdoutPath, stderrPath, triggerSource, retryOfRunId, dispatchId, legacyKey] = params as [
       string,
       string,
       string,
@@ -123,6 +125,7 @@ export class FakeRunsDb implements MonitorDbExecutor {
       number,
       string | null,
       number | null,
+      string | null,
       string | null,
       string | null,
       string | null,
@@ -136,6 +139,7 @@ export class FakeRunsDb implements MonitorDbExecutor {
         started_at: startedAt,
         pid,
         stdout_path: stdoutPath,
+        stderr_path: stderrPath,
         trigger_source: triggerSource,
         retry_of_run_id: retryOfRunId,
         dispatch_id: dispatchId,
@@ -152,6 +156,7 @@ export class FakeRunsDb implements MonitorDbExecutor {
     existing.started_at = existing.started_at ?? startedAt
     existing.pid = existing.pid ?? pid
     existing.stdout_path = existing.stdout_path ?? stdoutPath
+    existing.stderr_path = existing.stderr_path ?? stderrPath
     existing.trigger_source = existing.trigger_source ?? triggerSource
     existing.retry_of_run_id = existing.retry_of_run_id ?? retryOfRunId
     existing.dispatch_id = existing.dispatch_id ?? dispatchId

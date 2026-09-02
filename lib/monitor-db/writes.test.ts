@@ -36,11 +36,20 @@ describe('writeRunProgress（W1，形狀 A）', () => {
     const db = new FakeRunsDb()
     const r1 = await writeRunProgress(db, { ...ident(), lifecycleRank: 10 })
     expect(r1.kind).toBe('inserted')
-    const r2 = await writeRunProgress(db, { ...ident(), lifecycleRank: 30, pid: 4321, startedAt: '2026-09-02T00:00:00.000Z' })
+    const r2 = await writeRunProgress(db, {
+      ...ident(),
+      lifecycleRank: 30,
+      pid: 4321,
+      startedAt: '2026-09-02T00:00:00.000Z',
+      stdoutPath: '/tmp/run-1.stdout.log',
+      stderrPath: '/tmp/run-1.stderr.log',
+    })
     expect(r2.kind).toBe('applied')
     const row = db.rows.get('run-1')!
     expect(row.lifecycle_rank).toBe(30)
     expect(row.pid).toBe(4321)
+    expect(row.stdout_path).toBe('/tmp/run-1.stdout.log')
+    expect(row.stderr_path).toBe('/tmp/run-1.stderr.log')
   })
 
   test('lifecycle rank 後退寫入 → guarded_rank，值不變', async () => {
@@ -63,6 +72,7 @@ describe('writeRunProgress（W1，形狀 A）', () => {
       started_at: null,
       pid: null,
       stdout_path: null,
+      stderr_path: null,
       trigger_source: null,
       retry_of_run_id: null,
       dispatch_id: null,
@@ -164,6 +174,7 @@ describe("writeRunOutcomeAuthoritative（W2，tier 2）與 writeRunOutcomeProvis
       started_at: null,
       pid: null,
       stdout_path: null,
+      stderr_path: null,
       trigger_source: null,
       retry_of_run_id: null,
       dispatch_id: null,
