@@ -42,6 +42,38 @@
   `doctor-monitor.sh` 驗證；其餘欄位的完整型別/索引/生成欄位細節仍待 Phase 1 依 §6.2.1 S1–S11
   的實測結果，以後續 migration（`002-*.sql` 起）校正——**不得回頭改 `001-init.sql`**。
 
+## Token registry fail-safe（`lib/registry/token-registry.ts`，BL-C4 / §5.9）
+
+七步流程（reconcile → 寫 DB → 投影 → 雙向差異閘門 → 備份 → 原子寫 → 投影後驗證）
+的殘餘風險，Phase 5 對抗性覆核（`SIDE_EFFECT_VERDICT: ACCEPTABLE`）逐條記錄如下：
+
+- **R1（守衛式 ODKU 落地後已消解）**：`issueToken()` 的 rotate 型撞上「檔案還有、
+  DB 已撤銷」的列時，`ISSUE_UPSERT_SQL` 的 `ON DUPLICATE KEY UPDATE` 對
+  `token_enc` / `token_bidx` / `issued_at` / `display_name` 四欄各自包一層
+  `IF(revoked_at IS NULL, new.x, x)`——已撤銷列撞上 rotate 時四欄**維持原值**，
+  舊密文、bidx、原核發時間**不再遺失**。行為方向不變：`revoked_at` 仍不重設、
+  投影仍少這一筆、雙向差異閘門仍以「未預期 removed」中止並保留舊檔、`alert`
+  仍恰發一次。（採納自審查報告 §B.2(4)(甲)；單元測試見
+  `lib/registry/token-registry.test.ts` 的「守衛式 ODKU」案例。）
+- **R2（bidx 反查誤讀警告）**：`token_bidx` 是確定性 HMAC
+  （`HKDF-SHA256(MON_BIDX_KEY, info='mcp_tokens.token')`），事件應變時若拿一把
+  外洩的舊 token 值去查 `WHERE token_bidx = ?`，**只要該列後續被 rotate 過**，
+  查詢會回 0 列（rotate 後的新密文/bidx 已取代舊值）。**不得**把 0 列讀成
+  「這不是我們發的 token」——真正決定 token 是否有效的是名冊檔（fail-closed、
+  每個 request 現讀），DB 從來不是認證來源；查無此 bidx 只代表「這個值不是
+  *目前* 掛在該 id 上的值」，不代表「這個 id 沒發過這個值」。
+- **R3（中止後的復原程序固定兩步，不能只做第一步）**：雙向差異閘門因「DB 該列
+  已被撤銷、但檔案還有」而中止後，正確復原程序是 **① 清 `revoked_at`（`UPDATE
+  mcp_tokens SET revoked_at = NULL WHERE server=? AND env=? AND token_id=?`）
+  → ② 重跑一次 rotate（`issueToken` 對同一個 id）**，兩步缺一不可。**只清
+  `revoked_at` 就當作已復原是錯的**：這只解除了撤銷狀態，不保證 DB 該列此刻的
+  `token_enc`/`token_bidx`/`issued_at` 與名冊檔完全一致（尤其操作者的原始意圖
+  通常就是「重簽一把新的」，而不是讓舊 token 原封不動地重新生效）；沒有接著跑
+  ② 的話，後續任何操作重新投影比對時，只要 DB 與檔案這一欄有任何一絲不一致
+  （token 不符、`issued_at` 不符等），雙向差異閘門就會以「未預期 changed／
+  removed」持續擋下，需要再次人工介入才能跳出。務必**兩步都做**，讓
+  ② 的 rotate 把 DB 與名冊重新收斂成同一次寫入、同一組欄位值。
+
 ## 健康檢查
 
 `../doctor-monitor.sh`：容器健康、publish 位址、三條帳號驗收（含裁定3 的欄位級負向驗收）、

@@ -542,6 +542,71 @@ describe('regenerateCsvContent（純函式）', () => {
 })
 
 // ─────────────────────────────────────────────────────────────────────────
+// m6 防呆（重生方向，C5）：DB 值含污染字元（, " \r \n）→ 整個重生中止、不寫檔、
+// CSV 檔案 byte 完全不變。寫 DB 方向已由 parseTechUsersCsvStrict / CHAT_ID_RE
+// 涵蓋，這裡補的是 DB→CSV 方向的另一半（regenerateCsvContent 寫入前驗證）。
+// ─────────────────────────────────────────────────────────────────────────
+
+describe('m6 防呆（重生方向）：DB 值含污染字元 → 整個重生中止，CSV byte 不變', () => {
+  const flagoffContent = readFileSync(join(FIXTURES, 'tech-users-flagoff-sample.csv'), 'utf8')
+
+  test('regenerateCsvContent（純函式）：DB 值含逗號 → throw，不回傳半套內容', () => {
+    const map = new Map<string, string | null>([['alice@example.test', '123,evil@x.com,injected']])
+    expect(() => regenerateCsvContent(flagoffContent, map)).toThrow(/重生防呆失敗/)
+  })
+
+  test('regenerateCsvContent（純函式）：DB 值含換行 → throw，不回傳半套內容', () => {
+    const map = new Map<string, string | null>([['alice@example.test', '12\n34']])
+    expect(() => regenerateCsvContent(flagoffContent, map)).toThrow(/重生防呆失敗/)
+  })
+
+  test('端到端：DB 一列的 tg_chat_id 解密後含逗號 → --reconcile 整個中止，CSV 檔案 byte 完全不變', async () => {
+    const csvPath = copyFixtureToTmp('tech-users-direction.csv')
+    const originalContent = readFileSync(csvPath, 'utf8')
+    const eveCtx = 'tech_users.tg_chat_id:eve@example.test'
+    const taintedValue = '123,evil@x.com,injected' // 疑似寫入時繞過驗證的既有髒列（例如手動改 DB）
+    const { executor } = makeFakeExecutor([
+      {
+        email: 'eve@example.test',
+        notion_user_name: 'Eve DB Old Name',
+        notion_user_id: 'uid-eve-db-old',
+        pushed_repos: 'agrabah',
+        tg_chat_id_enc: encryptField(eveCtx, taintedValue),
+        tg_chat_id_bidx: blindIndex(TECH_USER_BIDX_SCOPE, taintedValue),
+        bidx_key_ver: 1,
+      },
+    ])
+
+    await expect(runReconcile(deps(csvPath, { executor }))).rejects.toThrow(/重生防呆失敗/)
+
+    // 中止發生在 regenerateCsvContent（backup/write 之前）→ CSV 檔案 byte 完全不變
+    expect(readFileSync(csvPath, 'utf8')).toBe(originalContent)
+  })
+
+  test('端到端：DB 一列的 tg_chat_id 解密後含換行 → --reconcile 整個中止，CSV 檔案 byte 完全不變', async () => {
+    const csvPath = copyFixtureToTmp('tech-users-direction.csv')
+    const originalContent = readFileSync(csvPath, 'utf8')
+    const eveCtx = 'tech_users.tg_chat_id:eve@example.test'
+    const taintedValue = '12\n34'
+    const { executor } = makeFakeExecutor([
+      {
+        email: 'eve@example.test',
+        notion_user_name: 'Eve DB Old Name',
+        notion_user_id: 'uid-eve-db-old',
+        pushed_repos: 'agrabah',
+        tg_chat_id_enc: encryptField(eveCtx, taintedValue),
+        tg_chat_id_bidx: blindIndex(TECH_USER_BIDX_SCOPE, taintedValue),
+        bidx_key_ver: 1,
+      },
+    ])
+
+    await expect(runReconcile(deps(csvPath, { executor }))).rejects.toThrow(/重生防呆失敗/)
+
+    expect(readFileSync(csvPath, 'utf8')).toBe(originalContent)
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────
 // CLI 參數解析
 // ─────────────────────────────────────────────────────────────────────────
 

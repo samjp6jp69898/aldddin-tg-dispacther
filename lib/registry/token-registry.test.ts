@@ -165,11 +165,14 @@ class FakeMcpTokensDb implements MonitorDbExecutor {
       if (existing) {
         // INSERT IGNORE：撞 PK 什麼都不做。
         if (isReconcile) return [{ affectedRows: 0 } as unknown as T, undefined]
-        // ODKU（rotate）：更新四欄，revoked_at 刻意不在賦值清單裡。
-        existing.token_enc = token_enc
-        existing.token_bidx = token_bidx
-        existing.issued_at = issued_at
-        existing.display_name = display_name
+        // 守衛式 ODKU（rotate）：revoked_at 刻意不在賦值清單裡；已撤銷列（revoked_at
+        // 非 NULL）的四欄一律維持原值不被覆寫，模擬 IF(revoked_at IS NULL, new.x, x)。
+        if (existing.revoked_at === null) {
+          existing.token_enc = token_enc
+          existing.token_bidx = token_bidx
+          existing.issued_at = issued_at
+          existing.display_name = display_name
+        }
         return [{ affectedRows: 2 } as unknown as T, undefined]
       }
       this.rows.push({ server, env, token_id, token_enc, token_bidx, issued_at, display_name, revoked_at: null })
@@ -661,6 +664,35 @@ describe('issue 的 rotate 型：newId 已在現行名冊', () => {
     ).rejects.toThrow(RegistryGateError)
     expect(h.io.files.get(ADMIN_DEFAULT)).toBe(before)
     expect(h.db.rows.find((r) => r.token_id === 'alice')!.revoked_at).not.toBeNull()
+  })
+
+  test('守衛式 ODKU：rotate 撞上已撤銷列時，該列 token_enc/token_bidx/issued_at/display_name 全部保持原值不被覆寫', async () => {
+    const h = makeHarness([ALICE, BOB])
+    const aliceRow = h.db.rows.find((r) => r.token_id === 'alice')!
+    aliceRow.revoked_at = '2026-08-01 00:00:00.000'
+    const beforeEnc = aliceRow.token_enc
+    const beforeBidx = aliceRow.token_bidx
+    const beforeIssuedAt = aliceRow.issued_at
+    const beforeDisplayName = aliceRow.display_name
+    const before = h.io.files.get(ADMIN_DEFAULT)!
+
+    await expect(
+      issueToken({ op: 'issue', server: SERVER, env: ENV_DEFAULT, newId: 'alice', displayName: '重簽' }, h.deps),
+    ).rejects.toThrow(RegistryGateError)
+
+    // (a) 已撤銷列的密文/bidx/issued_at/display_name 全部不動（守衛式 ODKU：IF(revoked_at IS NULL, new.x, x)）
+    expect(aliceRow.token_enc).toBe(beforeEnc)
+    expect(aliceRow.token_bidx).toEqual(beforeBidx)
+    expect(aliceRow.issued_at).toBe(beforeIssuedAt)
+    expect(aliceRow.display_name).toBe(beforeDisplayName)
+    expect(aliceRow.revoked_at).not.toBeNull() // revoked_at 仍不重設
+
+    // (b) 閘門仍以未預期 removed 中止；現行檔 byte 完全不變
+    expect(h.io.files.get(ADMIN_DEFAULT)).toBe(before)
+    expect(h.io.writes).toEqual([])
+
+    // (c) alert 恰被呼叫一次
+    expect(h.alerts).toHaveLength(1)
   })
 })
 
