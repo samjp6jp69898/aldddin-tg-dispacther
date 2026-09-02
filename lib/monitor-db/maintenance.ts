@@ -35,21 +35,41 @@ export interface MonitorMaintenanceOpts {
   /** 本機是否有這個 run_id 的待重放 spool 條目（§6.6 降噪跳過條件）；
    * 不提供時視同永遠沒有。 */
   hasPendingSpoolEntry?: (runId: string) => boolean
+  /** 測試專用覆寫；production 呼叫端不傳，一律用 SPOOL_DIR。 */
+  spoolDir?: string
 }
 
 export interface MonitorMaintenanceHandle {
   stop(): void
 }
 
+const NOOP_HANDLE: MonitorMaintenanceHandle = { stop() {} }
+
 /**
  * 啟動週期維護 tick。isMonitorDbEnabled()=false 時整段是 no-op（回傳一個
  * stop() 什麼也不做的 handle），連 setInterval 都不建。
+ *
+ * 2026-09-02 熱修（Bug 1(b)）：「pipeline 不因監控 DB 失敗而失敗」是計畫最高
+ * 原則，開機路徑同樣適用——本函式的同步準備動作（取重放者鎖）曾經未被捕捉
+ * 就讓 ENOENT 直接炸穿 server.ts/worker-agent.ts 的頂層呼叫，變成
+ * launchd crash loop。整個函式體現在包一層 try/catch：任何失敗只 WARN
+ * 並回傳一個安全的 no-op handle（不建 timer），絕不讓呼叫端的開機流程中斷。
  */
 export function startMonitorMaintenance(opts: MonitorMaintenanceOpts): MonitorMaintenanceHandle {
-  if (!isMonitorDbEnabled()) return { stop() {} }
+  if (!isMonitorDbEnabled()) return NOOP_HANDLE
 
+  try {
+    return startMonitorMaintenanceUnsafe(opts)
+  } catch (err) {
+    console.error(`monitor-db maintenance: 啟動失敗（本輪監控維護略過，不影響主流程開機）: ${err}`)
+    return NOOP_HANDLE
+  }
+}
+
+function startMonitorMaintenanceUnsafe(opts: MonitorMaintenanceOpts): MonitorMaintenanceHandle {
+  const dir = opts.spoolDir ?? SPOOL_DIR
   const writer = isWorkerProcess() ? 'worker-agent' : 'server'
-  const lock = acquireReplayerLock(SPOOL_DIR, writer)
+  const lock = acquireReplayerLock(dir, writer)
   if (!lock.ok) {
     // §6.5(d)：已有另一個活著的重放者——絕不搶鎖，本行程只做 sweep（sweep
     // 不受「單一重放者」不變式約束，本來就允許多行程各自掃自己的 running 列，
@@ -63,12 +83,12 @@ export function startMonitorMaintenance(opts: MonitorMaintenanceOpts): MonitorMa
 
     if (lock.ok) {
       try {
-        await replayOnce(SPOOL_DIR, createReplayDeps(pool))
+        await replayOnce(dir, createReplayDeps(pool))
       } catch (err) {
         console.error(`monitor-db maintenance: replayOnce 失敗: ${err}`)
       }
       try {
-        reclaimSpoolFiles(SPOOL_DIR, { writer, pid: process.pid })
+        reclaimSpoolFiles(dir, { writer, pid: process.pid })
       } catch (err) {
         console.error(`monitor-db maintenance: reclaimSpoolFiles 失敗: ${err}`)
       }
@@ -89,7 +109,7 @@ export function startMonitorMaintenance(opts: MonitorMaintenanceOpts): MonitorMa
   return {
     stop() {
       clearInterval(timer)
-      if (lock.ok) releaseReplayerLock(SPOOL_DIR, process.pid)
+      if (lock.ok) releaseReplayerLock(dir, process.pid)
     },
   }
 }

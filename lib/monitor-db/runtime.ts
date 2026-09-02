@@ -12,12 +12,19 @@
 // 為「整合期任務」（見兩檔各自檔頭）。本檔把兩組（長駐、短命）各自收斂成
 // 單一實作，spawn-create-mr.ts / demand-monitor-writes.ts / post-run-notify.ts
 // 改為 import，行為不變。
-import { isMonitorDbEnabled, MON_HOST, type MonitorRole } from './env.ts'
+import { getDeclaredMonitorRole, isMonitorDbEnabled, MON_HOST, type MonitorRole } from './env.ts'
 import { createSpoolWriter, type SpoolWriterHandle } from './spool/writer.ts'
 import type { MonitorDbExecutor } from './writes.ts'
 
-/** worker 行程用 CLUSTER_WORKER_NAME 判斷角色，跟 env.ts 的 MON_HOST 推導同一條規則。 */
+/**
+ * 是否為 worker 行程。2026-09-02 熱修：優先看 env.ts 的顯式宣告（見
+ * `declareMonitorRole()`）；只有從未宣告過的呼叫端（短命 CLI／未升級呼叫端／
+ * 測試）才退回舊的 `CLUSTER_WORKER_NAME` 環境變數嗅探——長駐進入點
+ * （server.ts/worker-agent.ts）一旦宣告，就不再受這個變數的任何殘留污染。
+ */
 export function isWorkerProcess(): boolean {
+  const declared = getDeclaredMonitorRole()
+  if (declared !== null) return declared === 'mon_exec'
   return !!(process.env.CLUSTER_WORKER_NAME ?? '').trim()
 }
 

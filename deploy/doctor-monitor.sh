@@ -111,11 +111,11 @@ if [ -n "$VL_PID" ] && [ "$VL_PID" != "-" ]; then
     ok "victorialogs 行程 argv 不含密碼"
   fi
   UNAUTH=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:9428/select/logsql/query?query=%2A")
-  [ "$UNAUTH" = "401" ] && ok "無憑證查詢正確回 401" || err "無憑證查詢回 $UNAUTH（預期 401）"
+  [ "$UNAUTH" = "401" ] && ok "無憑證查詢正確回 401" || err "無憑證查詢回 ${UNAUTH}（預期 401）"
   MON_VL_USER=$(grep '^MON_VL_USER=' "$ENV_FILE" | cut -d= -f2- | tr -d '\r\n')
   MON_VL_PASSWORD=$(grep '^MON_VL_PASSWORD=' "$ENV_FILE" | cut -d= -f2- | tr -d '\r\n')
   AUTHED=$(curl -s -o /dev/null -w '%{http_code}' -u "${MON_VL_USER}:${MON_VL_PASSWORD}" "http://127.0.0.1:9428/select/logsql/query?query=%2A")
-  [ "$AUTHED" = "200" ] && ok "帶憑證查詢正確回 200" || err "帶憑證查詢回 $AUTHED（預期 200）"
+  [ "$AUTHED" = "200" ] && ok "帶憑證查詢正確回 200" || err "帶憑證查詢回 ${AUTHED}（預期 200）"
   echo "$ARGV" | grep -q 'retentionPeriod=90d' && ok "retentionPeriod=90d" || err "retentionPeriod 不是 90d"
   echo "$ARGV" | grep -q 'insert.maxLineSizeBytes=2MB' && ok "insert.maxLineSizeBytes=2MB" || err "maxLineSizeBytes 不是 2MB"
 else
@@ -164,7 +164,7 @@ TGMON="/Users/user/aladdin/tg-monitor"
 if [ -f "$TGMON/.env" ] && [ -f "$TGMON/.env.example" ] && grep -q 'MON_DB_ENABLED' "$TGMON/launchd/run-monitor.sh"; then
   ok "tg-monitor .env/.env.example/run-monitor.sh 白名單齊備（MAJOR-F7 v3.2 第 0 步已由指揮官解除，ee0391f）"
   PERM=$(stat -f%Lp "$TGMON/.env" 2>/dev/null || stat -c%a "$TGMON/.env" 2>/dev/null)
-  [ "$PERM" = "600" ] && ok "tg-monitor/.env 權限 600" || err "tg-monitor/.env 權限不是 600（現值 $PERM）"
+  [ "$PERM" = "600" ] && ok "tg-monitor/.env 權限 600" || err "tg-monitor/.env 權限不是 600（現值 ${PERM}）"
   if [ -f "$SECRETS_DIR/mon_ui.env" ]; then
     MON_UI_PW=$(grep '^PASSWORD=' "$SECRETS_DIR/mon_ui.env" | cut -d= -f2-)
     ENV_MON_UI_PW=$(grep '^MON_DB_PASSWORD=' "$TGMON/.env" | cut -d= -f2- | tr -d '\r\n')
@@ -181,6 +181,31 @@ else
   err "tg-monitor 的 .env/.env.example/run-monitor.sh 白名單尚未齊備"
 fi
 grep -q '^MON_FIELD_KEY' "$TGMON/.env" 2>/dev/null && err "tg-monitor/.env 不應含 MON_FIELD_KEY_*（金鑰只放 head）" || ok "tg-monitor/.env 正確地沒有欄位加密金鑰"
+
+echo ""
+echo "=== 7b. head 行程角色必須是 mon_head（2026-09-02 熱修回歸檢查，Bug 2） ==="
+# 根因：head 的 .env 一旦殘留非空 CLUSTER_WORKER_NAME，isWorkerProcess() 舊版
+# 嗅探邏輯會把 head 誤判成 worker，要求 mon_exec 但 .env 只有 mon_head 密碼，
+# 連線池建立失敗（進而讓 startMonitorMaintenance 在開機路徑未被捕捉地拋出，
+# 釀成 launchd crash loop）。結構性修法是 server.ts/worker-agent.ts 顯式呼叫
+# declareMonitorRole()，不再嗅探這個變數；這裡額外檢查根因本身有沒有清掉，
+# 屬縱深防禦（即使程式碼修法被回退，這條檢查仍能先示警）。
+WORKER_NAME_IN_HEAD_ENV=$(grep '^CLUSTER_WORKER_NAME=' "$ENV_FILE" | cut -d= -f2- | tr -d '\r\n')
+if [ -n "$WORKER_NAME_IN_HEAD_ENV" ]; then
+  err "head 的 .env 含非空 CLUSTER_WORKER_NAME='$WORKER_NAME_IN_HEAD_ENV'（head 不該有這個值，worker 才用；這正是 2026-09-02 crash loop 的根因）"
+else
+  ok "head 的 .env 沒有殘留 CLUSTER_WORKER_NAME"
+fi
+if grep -q "declareMonitorRole('mon_head')" "$DISPATCHER/server.ts"; then
+  ok "server.ts 已顯式宣告角色 mon_head（不再嗅探 CLUSTER_WORKER_NAME）"
+else
+  err "server.ts 未找到 declareMonitorRole('mon_head') 宣告（角色偵測退回舊嗅探邏輯，易受 .env 污染）"
+fi
+if grep -q "declareMonitorRole('mon_exec')" "$DISPATCHER/worker-agent.ts"; then
+  ok "worker-agent.ts 已顯式宣告角色 mon_exec"
+else
+  err "worker-agent.ts 未找到 declareMonitorRole('mon_exec') 宣告"
+fi
 
 echo ""
 echo "=== 8. 備份（§2.4） ==="
@@ -210,8 +235,8 @@ echo ""
 echo "=== 9. mysql2 版本 pin（【G:MN-G3】，Phase 1 才會裝，本階段預期 N/A） ==="
 PKG="/Users/user/aladdin/telegram-dispatcher/package.json"
 if grep -q '"mysql2"' "$PKG" 2>/dev/null; then
-  VER=$(grep '"mysql2"' "$PKG" | sed -E 's/.*"mysql2":\s*"([^"]+)".*/\1/')
-  [ "$VER" = "3.18.0" ] && ok "mysql2 pin 於 3.18.0" || err "mysql2 版本不是精確的 3.18.0（現值: $VER）"
+  VER=$(grep '"mysql2"' "$PKG" | sed -E 's/.*"mysql2":[[:space:]]*"([^"]+)".*/\1/')
+  [ "$VER" = "3.18.0" ] && ok "mysql2 pin 於 3.18.0" || err "mysql2 版本不是精確的 3.18.0（現值: ${VER}）"
 else
   napb 1 "telegram-dispatcher/package.json 尚未加入 mysql2 依賴（Phase 1 工項）"
 fi

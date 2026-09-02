@@ -16,6 +16,7 @@ import { recoverBugQueue, hasBugTicketActive } from './lib/pipeline-runner/spawn
 import { recoverDemandQueue, hasDemandTicketActive } from './lib/pipeline-runner/spawn-demand-pipeline.ts'
 import { registerClusterRoutes, initClusterHead } from './lib/cluster/cluster-head.ts'
 import { startMonitorMaintenance, runRestartSweep } from './lib/monitor-db/maintenance.ts'
+import { declareMonitorRole } from './lib/monitor-db/env.ts'
 
 registerHandlers(bot)
 
@@ -203,6 +204,11 @@ startStaleLockReaper()
 // （job-done 回報遺失/worker 失聯時的事後校正，見 cluster-head.ts 檔頭）。
 // CLUSTER_SHARED_SECRET 未設定時是 no-op。
 initClusterHead()
+
+// 2026-09-02 熱修（Bug 2）：在任何可能觸發監控 DB 讀寫的程式碼之前顯式宣告
+// 本行程角色——head 一律 mon_head，不再嗅探 CLUSTER_WORKER_NAME（那個變數
+// 一旦在 head 的 .env 殘留就會被誤判成 worker，見 env.ts declareMonitorRole 註解）。
+declareMonitorRole('mon_head')
 
 // 2026-08-28：排隊機制的重啟恢復——把上一個 server process 結束前還在排隊的
 // 單（logs/pipeline-queue.*.json）撿回來：有名額直接 spawn、沒有就依原順序

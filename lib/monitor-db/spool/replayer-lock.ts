@@ -13,7 +13,7 @@
 // 方向也一樣是 fail-closed」）。絕不因為「讀不出啟動時刻」就搶鎖——那會產生
 // 兩個重放者，直接打掉這個模組唯一的不變式。
 
-import { closeSync, existsSync, fsyncSync, openSync, readFileSync, unlinkSync, writeSync } from 'node:fs'
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, unlinkSync, writeSync } from 'node:fs'
 import { join } from 'node:path'
 import { isPidAlive, readProcStartMs } from './proc-start.ts'
 import { REPLAYER_LOCK_NAME } from './types.ts'
@@ -69,6 +69,13 @@ export function acquireReplayerLock(dir: string, writer: string, pid: number = p
   const readStart = deps.readProcStartMs ?? readProcStartMs
   const path = lockPathFor(dir)
   const selfStart = readStart(pid)
+
+  // 2026-09-02 熱修：O_CREAT|O_EXCL 不會建父目錄，spool 目錄在任何寫入者
+  // 真的 append 過一筆之前不存在（writer.ts 的 mkdirSync 只在 createSpoolWriter
+  // 內，本函式是獨立進入點）——boot 時第一個呼叫這裡的行程若先於任何寫入
+  // 發生，openSync 會拋 ENOENT，未被外層捕捉會直接讓 server/worker-agent
+  // crash loop。
+  mkdirSync(dir, { recursive: true, mode: 0o700 })
 
   try {
     const fd = openSync(path, 'wx', 0o600) // O_CREAT|O_EXCL：已存在即拋 EEXIST

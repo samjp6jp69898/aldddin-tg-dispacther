@@ -48,6 +48,7 @@ import { isTicketLocked, describeTicketProgress, getTicketProgressStages } from 
 import { ensureTrackerPending } from './lib/pipeline-runner/tracker-sync.ts'
 import { startStaleLockReaper } from './lib/pipeline-runner/stale-lock-reaper.ts'
 import { startMonitorMaintenance, runRestartSweep } from './lib/monitor-db/maintenance.ts'
+import { declareMonitorRole } from './lib/monitor-db/env.ts'
 import type { SubmitResult } from './lib/pipeline-runner/pipeline-queue.ts'
 import type { TechUser } from './lib/user-resolution/tech-user.ts'
 
@@ -69,6 +70,12 @@ const advertiseUrl = (process.env.CLUSTER_WORKER_URL ?? '').trim().replace(/\/+$
 if (!WORKER_URL_RE.test(headUrl)) throw new Error('worker-agent: CLUSTER_HEAD_URL 未設定或格式不對（需 http(s)://host[:port]）')
 if (!WORKER_NAME_RE.test(workerName)) throw new Error('worker-agent: CLUSTER_WORKER_NAME 未設定或格式不對（英數 . _ -，≤64 字元）')
 if (!WORKER_URL_RE.test(advertiseUrl)) throw new Error('worker-agent: CLUSTER_WORKER_URL 未設定或格式不對（本機對 LAN 的網址，如 http://192.168.1.50:8801）')
+
+// 2026-09-02 熱修（Bug 2）：CLUSTER_WORKER_NAME 已在上面驗過格式，這裡顯式
+// 宣告角色——之後 MON_HOST/isWorkerProcess() 一律用宣告值，不再嗅探環境
+// 變數（worker 本來就該用這個變數，宣告只是把「怎麼用」收斂成單一入口，
+// 與 server.ts 對稱）。
+declareMonitorRole('mon_exec')
 
 // ---- 完成回報（事件驅動） + 向 head 登記（啟動時一次 + 每 30 分鐘冪等重送，
 // 讓 head 端名冊檔遺失/重建後自癒；週期性排程器，非輪詢等待）----

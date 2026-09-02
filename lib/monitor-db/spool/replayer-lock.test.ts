@@ -20,6 +20,23 @@ describe('acquireReplayerLock', () => {
     expect(content).toEqual({ pid: 100, writer: 'server', startedAt: 5000 })
   })
 
+  test('2026-09-02 熱修回歸測試：spool 目錄本身不存在（O_CREAT|O_EXCL 不會建父目錄）→ 不拋 ENOENT，自動建目錄後成功取鎖', () => {
+    // 刻意不預先 mkdir——舊版程式碼在這裡會拋 ENOENT（見 acquireReplayerLock
+    // 的 openSync 呼叫），未被 maintenance.ts 捕捉時會讓 server.ts/
+    // worker-agent.ts 開機直接 crash（launchd crash loop 的真實事故）。
+    const parent = tmpDir()
+    const neverCreatedDir = join(parent, 'spool') // 不存在，acquireReplayerLock 必須自己建
+    expect(existsSync(neverCreatedDir)).toBe(false)
+    const result = acquireReplayerLock(neverCreatedDir, 'server', 100, {
+      isPidAlive: () => true,
+      readProcStartMs: () => 5000,
+    })
+    expect(result).toEqual({ ok: true })
+    expect(existsSync(neverCreatedDir)).toBe(true)
+    const content = JSON.parse(readFileSync(join(neverCreatedDir, '.replayer.lock'), 'utf8'))
+    expect(content).toEqual({ pid: 100, writer: 'server', startedAt: 5000 })
+  })
+
   test('【Phase 1.4 測試 5】重放者互斥：第二個重放者啟動時取不到鎖 → 不重放、回報 ERROR', () => {
     const dir = tmpDir()
     const first = acquireReplayerLock(dir, 'server', 100, { isPidAlive: () => true, readProcStartMs: () => 5000 })

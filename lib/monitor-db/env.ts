@@ -20,19 +20,71 @@ export function isMonitorDbEnabled(): boolean {
   return process.env.MON_DB_ENABLED === '1'
 }
 
+export type MonitorRole = 'mon_head' | 'mon_ui' | 'mon_exec'
+
+/** 長駐進入點（server.ts / worker-agent.ts）可顯式宣告的角色子集——'mon_ui'
+ * 是 tg-monitor 自己的獨立行程，不會呼叫 declareMonitorRole()。 */
+export type DeclarableMonitorRole = 'mon_head' | 'mon_exec'
+
+let declaredRole: DeclarableMonitorRole | null = null
+
 /**
  * 本機在 `runs.host` / `monitor_heartbeat.host` 等欄位裡使用的身分字串。
  *
- * - worker 行程：`worker-agent.ts` 已經有 `CLUSTER_WORKER_NAME`（見
- *   `worker-agent.ts:65`），本模組直接沿用，不另造第二個身分來源。
- * - head 行程（`server.ts` / `log-intake`）：該 env 不存在，固定為字面量 'head'
- *   （plan §11.1 修訂／§6.8(a) 的範例皆以 `(head, 'server')` 稱呼 head 自己）。
+ * 2026-09-02 熱修事故（Bug 2）：舊版無條件用
+ * `process.env.CLUSTER_WORKER_NAME` 是否非空來嗅探角色/host——head 的 `.env`
+ * 一旦殘留這個變數（不管什麼原因），head 就會被誤判成 worker，MON_HOST 也
+ * 會被寫成別台機器的名字，`runs.host` 的 R1 host 守衛因此可能整個錯位。
+ * 修法：改成「未宣告時維持舊嗅探行為（相容短命 CLI 行程／未升級呼叫端／
+ * 測試——它們本來就沒有 declareMonitorRole() 可呼叫，只能靠環境變數認出
+ * 自己在哪台機器）；一旦進入點呼叫 declareMonitorRole()，一律以宣告值為準，
+ * 完全不再看這個環境變數」。
  *
- * 在模組載入時求值一次並凍結成常數：同一行程的身分在整個生命週期內不會變。
+ * `let`（非 `const`）：declareMonitorRole() 呼叫時原地覆寫，ESM 的 live
+ * binding 保證所有已經 `import { MON_HOST }` 的呼叫端在下一次讀取時都拿到
+ * 新值——不需要改任何消費端的 import 或用法。
  */
-export const MON_HOST: string = (process.env.CLUSTER_WORKER_NAME ?? '').trim() || 'head'
+export let MON_HOST: string = (process.env.CLUSTER_WORKER_NAME ?? '').trim() || 'head'
 
-export type MonitorRole = 'mon_head' | 'mon_ui' | 'mon_exec'
+/**
+ * 進入點顯式宣告本行程的監控 DB 角色。必須在任何觸發 monitor-db 讀寫的程式
+ * 碼路徑之前呼叫一次（server.ts / worker-agent.ts 在檔案頂層、import 完成
+ * 後立刻呼叫）——之後 `MON_HOST` 與 `isWorkerProcess()`（runtime.ts）一律
+ * 用宣告值，不再嗅探 `CLUSTER_WORKER_NAME`。
+ *
+ * `role='mon_exec'` 才讀 `CLUSTER_WORKER_NAME` 並驗非空（worker 本來就得靠
+ * 這個變數自報身分，沒有其他來源）；`role='mon_head'` 固定 `MON_HOST='head'`，
+ * 完全不看這個變數——這正是杜絕「head .env 殘留 CLUSTER_WORKER_NAME」污染
+ * 的結構性隔離。
+ */
+export function declareMonitorRole(role: DeclarableMonitorRole): void {
+  if (declaredRole !== null && declaredRole !== role) {
+    throw new Error(`declareMonitorRole: 本行程已宣告過角色 '${declaredRole}'，不可再宣告成 '${role}'（同一行程只能宣告一次）`)
+  }
+  declaredRole = role
+  if (role === 'mon_exec') {
+    const raw = (process.env.CLUSTER_WORKER_NAME ?? '').trim()
+    if (!raw) {
+      throw new Error("declareMonitorRole: role='mon_exec' 但 process.env.CLUSTER_WORKER_NAME 未設定或空白")
+    }
+    MON_HOST = raw
+  } else {
+    MON_HOST = 'head'
+  }
+}
+
+/** 目前已宣告的角色；未呼叫過 declareMonitorRole() 時回 null（短命 CLI／
+ * 測試／tg-monitor 等不宣告的呼叫端）。供 runtime.ts 的 isWorkerProcess()
+ * 與 doctor-monitor.sh 的角色檢查使用。 */
+export function getDeclaredMonitorRole(): DeclarableMonitorRole | null {
+  return declaredRole
+}
+
+/** 測試專用：重置宣告狀態與 MON_HOST，回到「嗅探環境變數」的預設行為。 */
+export function __resetDeclaredMonitorRoleForTest(): void {
+  declaredRole = null
+  MON_HOST = (process.env.CLUSTER_WORKER_NAME ?? '').trim() || 'head'
+}
 
 export interface MonitorConnectionEnv {
   host: string
