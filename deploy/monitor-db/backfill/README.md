@@ -85,10 +85,22 @@ WAL 踩坑（impl-constraints-addendum §4）：讀 `monitor.sqlite` **禁止 cp
      mapping 寫入」——第一批跑完後若 mapping 被改過再跑第二批，先寫的列用舊 mapping
      且不會被修正、也不會報錯，這是 `INSERT IGNORE` 最陰的失敗模式。
 
-## §10.2 對數備註（雙軌對照）
+## §10.2 對數備註（雙軌對照；容差定義 2026-09-02 與讀取面統一，a7 核定）
 
-- `runs.started_at` 兩軌語意不同：sqlite 由 log 檔名（`<ticket>.<ISO毫秒>`）反推，
-  MySQL 由 W1 spawn 當下實際寫入，兩者存在 1ms 級的落點差（同一支 plan §10.2 已知的
-  「時戳寫入時機不同」類別，比照 `finished_at` 的 <5s 容忍度處理）。對回填列與線上列
-  做雙軌對照時，一律以 `legacy_key`（§10.2 的對位鍵）為主要對位依據，時間欄位
+- `runs.started_at` 兩軌語意不同：sqlite 由 log 檔名（`<ticket>.<ISO毫秒>`）反推
+  （spawn-create-mr.ts:322 的檔名時戳），MySQL 由 W1 spawn 當下另一次 `new Date()`
+  實際寫入（:430/:445）——兩者隔著建檔＋sidecar I/O，**方向單向（MySQL ≥ sqlite）**，
+  實測現象為 1ms 級落點差（n=2 描述性觀察，**不是容差**）。
+- **容差判準的 canonical 定義在 `tg-monitor/scripts/switch-readiness.ts` 的
+  `STARTED_AT_TOLERANCE_MS`**（現值：單向 `0 ≤ Δ ≤ 2000ms`，逾界 FAIL；本 README
+  不自帶數字，以該常數為唯一來源）。上界為**抗負載抖動的餘裕，非實測值**——誤配對
+  只會發生在同票不同次執行之間（間隔至少幾分鐘），2s 與其差三個數量級仍擋得住。
+- 判準明文**限定 `mysql.runs.host='head'` 的配對**；host 非 head 的配對出現即單獨
+  FAIL（switch-readiness C5b）——head 的 sqlite 結構上沒有 worker 執行單的列
+  （ingest.ts:460 只掃本機 log dir），真出現只可能是 `legacy_key` 碰撞，是 bug 不是誤差。
+- **回填列（`host='unknown_pre_migration'`）排除出分布統計**：回填列不走 spawn 路徑，
+  `mapPipelineRunToRunsRow` 把 sqlite 的 `started_at` 原字串直通寫入、不重算，故
+  Δ ≡ 0 by construction——不得拿回填列的 Δ=0 去質疑 2000ms 上界。
+- 對照一律以 `legacy_key`（§10.2 對位鍵）為主要對位依據，時間欄位
   （`started_at`/`finished_at`）用容差比較，不能拿來當對位鍵或要求逐毫秒相等。
+- 回填實跑若量到 host='head' 配對 Δ > 2000ms 或任何負 Δ，回報讀取面（a4）重新推導。
