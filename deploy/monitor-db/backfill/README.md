@@ -77,6 +77,13 @@ WAL 踩坑（impl-constraints-addendum §4）：讀 `monitor.sqlite` **禁止 cp
   `pipeline_monitor.runs` 寫過任何一列，因此「重跑補齊舊列」目前不是實際問題；
   若之後需要對已回填過的正式列補新欄，屬於一次性人工 UPDATE，不建議塞進這支
   設計上「只插入、不更新」的冪等腳本。
+- **Phase 6 執行前置（2026-09-02 總指揮裁定，配套上一條「維持純 INSERT IGNORE」）**：
+  1. 開跑前**實查**正式 `runs` 表確認零回填列
+     （`SELECT COUNT(*) FROM runs WHERE host='unknown_pre_migration'` 必須為 0），
+     不接受「應該是零」的假設；非零即停下上呈，不得直接跑。
+  2. **一次跑完，不分批跨版本**：`INSERT IGNORE` 的安全性建立在「所有列由同一版
+     mapping 寫入」——第一批跑完後若 mapping 被改過再跑第二批，先寫的列用舊 mapping
+     且不會被修正、也不會報錯，這是 `INSERT IGNORE` 最陰的失敗模式。
 
 ## §10.2 對數備註（雙軌對照）
 
