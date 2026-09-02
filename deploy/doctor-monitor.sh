@@ -251,5 +251,77 @@ else
 fi
 
 echo ""
+echo "=== 11. Phase 8 讀取面（MON_READ_SOURCE 回滾槓桿 + /api/stream） ==="
+# 本節刻意只做**廉價、唯讀、零副作用**的檢查，維持本腳本檔頭「不做任何寫入，
+# 純檢查」的契約。tg-monitor 那兩支驗收腳本（compare-sqlite-mysql.ts /
+# verify-stream.ts）不適合放進預設路徑：
+#   - verify-stream.ts 會**另起一個 server**、開 40 條連線、並在**活的**
+#     DISPATCHER_LOG_DIR 底下建一個暫時 log 檔（白名單只涵蓋那個目錄，改放 /tmp
+#     會被 403），單次 2–4 分鐘；
+#   - compare-sqlite-mysql.ts 唯讀但要整表撈兩軌的 events 做逐欄比對。
+# 所以它們放在 DOCTOR_DEEP=1 之後（見本節最後一段）。預設巡檢只驗「槓桿存在、
+# 沒有靜默降級、驗收產物還在」這三件事——那才是每次巡檢都該問的問題。
+TGM_DIR="/Users/user/aladdin/tg-monitor"
+TGM_ENV="$TGM_DIR/.env"
+RUN_MONITOR="$TGM_DIR/launchd/run-monitor.sh"
+
+# (a) 回滾槓桿的兩個必要條件：.env 有這個 key、wrapper 會把它匯出。
+#     缺任一個，「改 .env 一個字 + kickstart」這顆按鈕就是假的（BL-C2 同型）。
+if [ -f "$TGM_ENV" ] && grep -q '^MON_READ_SOURCE=' "$TGM_ENV"; then
+  ok "tg-monitor/.env 有 MON_READ_SOURCE（回滾槓桿存在）"
+else
+  err "tg-monitor/.env 缺 MON_READ_SOURCE —— 讀取面回滾按鈕不成立"
+fi
+if grep -q 'MON_READ_SOURCE' "$RUN_MONITOR" 2>/dev/null; then
+  ok "run-monitor.sh 的逐 key 匯出白名單含 MON_READ_SOURCE"
+else
+  err "run-monitor.sh 白名單缺 MON_READ_SOURCE —— launchd 起的行程永遠讀不到它"
+fi
+
+# (b) 靜默降級偵測：MON_READ_SOURCE=mysql 但探針失敗時，tg-monitor 會退回 sqlite
+#     並繼續服務（lib/read/index.ts：plist 是 KeepAlive=true，啟動 throw 會變成
+#     無窮重啟迴圈）。那件事只寫 stderr，從外面看不出來——操作者會以為在跑 mysql。
+#     /api/read-source 就是為了讓巡檢問得出這句話而加的。
+READ_SRC_JSON=$(curl -s -m 3 http://127.0.0.1:8799/api/read-source 2>/dev/null || true)
+if [ -z "$READ_SRC_JSON" ]; then
+  err "tg-monitor（127.0.0.1:8799）沒有回應 /api/read-source"
+elif echo "$READ_SRC_JSON" | grep -q '"effective"'; then
+  EFFECTIVE=$(echo "$READ_SRC_JSON" | sed -E 's/.*"effective":"([^"]*)".*/\1/')
+  if echo "$READ_SRC_JSON" | grep -q '"degraded":true'; then
+    err "讀取面靜默降級中：要的是 mysql，實際在跑 $EFFECTIVE（查 tg-monitor stderr 的探針失敗原因）"
+  else
+    ok "讀取面資料源 = $EFFECTIVE（無降級）"
+  fi
+else
+  napb 8 "tg-monitor 尚未重啟載入含 /api/read-source 的版本（回應：${READ_SRC_JSON:0:60}）"
+fi
+
+# (c) 兩支驗收產物還在（被刪掉就等於 Phase 8 的迴歸基準沒了）
+for SCRIPT in "$TGM_DIR/scripts/sse-segfault-repro.ts" "$TGM_DIR/scripts/verify-stream.ts" "$TGM_DIR/scripts/compare-sqlite-mysql.ts"; do
+  [ -f "$SCRIPT" ] && ok "驗收產物存在：$(basename "$SCRIPT")" || err "驗收產物缺失：$SCRIPT"
+done
+
+# (d) 深度巡檢（預設不跑）：DOCTOR_DEEP=1 才會真的執行那兩支。
+#     verify-stream.ts 有副作用（見本節開頭），所以連 deep 模式都明確印出來。
+if [ "${DOCTOR_DEEP:-0}" = "1" ]; then
+  echo "--- DOCTOR_DEEP=1：跑 tg-monitor 的兩支驗收腳本（數分鐘） ---"
+  if (cd "$TGM_DIR" && bun run scripts/verify-stream.ts sqlite >/tmp/doctor-verify-stream.log 2>&1); then
+    ok "verify-stream.ts sqlite 全綠"
+  else
+    err "verify-stream.ts sqlite 失敗（詳見 /tmp/doctor-verify-stream.log）"
+  fi
+  # 雙軌對照的非 0 退出碼代表「兩軌有差異」，在 collector 遷移與回填完成前**本來就會有**，
+  # 所以判 WARN 不判 ERROR；退出碼 2 才是真的連不上監控 DB。
+  (cd "$TGM_DIR" && bun run scripts/compare-sqlite-mysql.ts >/tmp/doctor-compare.log 2>&1)
+  case "$?" in
+    0) ok "雙軌對照：兩軌一致" ;;
+    2) err "雙軌對照：連不上監控 DB（詳見 /tmp/doctor-compare.log）" ;;
+    *) warn "雙軌對照有差異（回填/collector 進度未完成時屬預期，詳見 /tmp/doctor-compare.log）" ;;
+  esac
+else
+  echo "[SKIP]  深度驗收（verify-stream / 雙軌對照）——需要時跑 DOCTOR_DEEP=1 $0"
+fi
+
+echo ""
 echo "=== SUMMARY: ERRORS=$ERRORS WARNS=$WARNS ==="
 [ "$ERRORS" -eq 0 ]
