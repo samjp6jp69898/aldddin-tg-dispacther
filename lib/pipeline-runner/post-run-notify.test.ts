@@ -82,6 +82,46 @@ describe('writeAuthoritativeOutcome — v3.2 §9 Phase2 bug 終態（權威）�
     }
   })
 
+  // 2026-09-03 稽核：過去 24 小時 8 次 FAQ 票的 post-run-notify.log 都留下
+  // 「監控 DB 連線建立失敗: Error: loadMonitorEnv: 角色不符...」——即
+  // createMonitorPool() 內的 loadMonitorEnv(expectedRole) 因 .env 的
+  // MON_DB_USER 跟呼叫端要求的角色不符而同步 throw（見 env.ts 該檢查）。
+  // 上面「pool 為 null」測試直接注入 `deps.pool: null`，繞過了 writeAuthoritativeOutcome
+  // 內部真正的 try/catch（304-315 行，圍住 dynamic import + createMonitorPool()
+  // 呼叫）；本測試刻意不傳 `deps.pool`，讓函式走真正的 dynamic import 分支，
+  // 用真的環境變數角色不符（不動 .env 檔本身，只在測試期間暫時覆寫
+  // process.env 後還原）觸發跟生產環境逐字相同的例外，驗證這條 try/catch →
+  // pool 維持 null → else 分支落 spool 的整合路徑沒有被繞過、資料真的落地。
+  // 刻意不用 mock.module 掉 pool.ts：pool.test.ts／semantic-verify.test.ts
+  // 在同一次 `bun test` 行程內依賴同一個 module 的真實 createMonitorPool，
+  // 全域 mock 會互相污染（見 whitelist-auto-sync-trigger.test.ts 檔頭同類警示）。
+  test('createMonitorPool() 真的 throw（模擬真實 MON_DB_USER 角色不符，不注入 deps.pool）→ 仍落 spool，資料不遺失', async () => {
+    const prevRunId = process.env.MON_RUN_ID
+    const prevUser = process.env.MON_DB_USER
+    const prevWorker = process.env.CLUSTER_WORKER_NAME
+    process.env.MON_RUN_ID = '66666666-6666-6666-6666-666666666666'
+    delete process.env.CLUSTER_WORKER_NAME // 確保走 mon_head 分支（跟 head 機器的真實情境一致）
+    process.env.MON_DB_USER = 'mon_exec' // 故意跟 mon_head 角色不符——重現 8 次事故的真實錯誤
+    try {
+      const fakeSpool = makeFakeSpool()
+      // 刻意只傳 deps.spool、不傳 deps.pool：函式因此會真的執行
+      // `await import('../monitor-db/pool.ts')` + `createMonitorPool()`，
+      // 而不是被測試直接繞過。
+      await writeAuthoritativeOutcome('FAQ-9007', 'timeout', 124, '/tmp/FAQ-9007.stdout.log', '/tmp/FAQ-9007.stderr.log', { spool: fakeSpool })
+      expect(fakeSpool.appended.length).toBe(1)
+      expect(fakeSpool.appended[0]!.run_id).toBe('66666666-6666-6666-6666-666666666666')
+      expect(fakeSpool.appended[0]!.fn).toBe('writeRunOutcomeAuthoritative')
+      expect((fakeSpool.appended[0]!.args[0] as { outcome: string }).outcome).toBe('timeout')
+    } finally {
+      if (prevRunId === undefined) delete process.env.MON_RUN_ID
+      else process.env.MON_RUN_ID = prevRunId
+      if (prevUser === undefined) delete process.env.MON_DB_USER
+      else process.env.MON_DB_USER = prevUser
+      if (prevWorker === undefined) delete process.env.CLUSTER_WORKER_NAME
+      else process.env.CLUSTER_WORKER_NAME = prevWorker
+    }
+  })
+
   test('pool.execute 丟例外 → 落 spool（不是直接讓例外往外拋，best-effort）', async () => {
     const prev = process.env.MON_RUN_ID
     process.env.MON_RUN_ID = '33333333-3333-3333-3333-333333333333'
