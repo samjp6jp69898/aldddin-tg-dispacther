@@ -12,6 +12,18 @@
 //      `(head,'tg-monitor')`、`(head,'log-intake')` 各一條同型告警
 //      （§11.1 修訂：`monitor_heartbeat` PK 改 `(host, writer)`，三個 head
 //       行程各自一列——共用一列時只要任一還活著就永遠不會告警）。
+//      **`(head,'tg-monitor')` 這一條的解讀陷阱（closeout §6 殘留項，
+//      2026-09-03 補；來源：phase4-taskB-review.md #3）**：tg-monitor 沒有
+//      監控 DB 寫入權限，心跳一律先落本機 spool（見 tg-monitor/lib/mon-db.ts
+//      的 appendHeartbeatToSpool），再由 head 這裡的重放者
+//      （spool/replayer.ts）落庫。因此這條心跳的新鮮度證明的是**兩件事的
+//      合取**：「tg-monitor 行程活著且還在產生心跳」**與**「head 的重放者
+//      正常在排水」——兩者缺一都會讓這條 ts 停止前進。**若重放者掛掉（或
+//      積壓），tg-monitor 本身完全正常也會被這條告警判定為故障**——收到這
+//      條告警時不能直接斷定 tg-monitor 掛了，要先看 (b) spool 深度告警
+//      有沒有同時翻轉：只有 (a)-tg-monitor 翻轉、(b) 沒翻轉，才指向
+//      tg-monitor 自己的問題；(a)-tg-monitor 與 (b) 一起翻轉，通常是重放者
+//      端出了狀況。這是 spool 架構的固有性質，不是缺陷。
 //   b. head 的 spool 深度 > 200 或最舊未 ack 條目 > 15 分鐘
 //      （§6.8(b) 修訂：深度＝`logs/spool/` 全部資料檔未 ack 位元組換算的條目數
 //       總和，見 spool/depth.ts）。
