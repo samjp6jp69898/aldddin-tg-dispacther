@@ -256,6 +256,24 @@ Telegram → head（webhook、白名單、Notion 重驗、per-ticket 鎖）
    太短會被視同未設定）。
 2. 重啟 server：`launchctl kickstart -k gui/$(id -u)/com.aladdin.tg-dispatch-server`。
    啟動 log 出現 `cluster: head 模式啟用` 即生效。
+3. **從 head 遠端體檢任何一台 worker**（日常也可隨時重跑，唯讀無副作用）：
+
+```bash
+# 不需要在 worker 上放檔案，腳本走 stdin 過去
+ssh user@<worker_ip> 'bash -s' < /Users/user/aladdin/telegram-dispatcher/deploy/doctor-worker.sh
+
+# 只看紅燈與警告
+ssh user@<worker_ip> 'bash -s' < /Users/user/aladdin/telegram-dispatcher/deploy/doctor-worker.sh | grep -E "❌|⚠️|體檢"
+```
+
+   判讀：`❌` 代表這台不能用，修完再上線；`⚠️` 代表能接單、但某類收尾要人工
+   補（目前唯一一項是 glab 未認證 ⇒ 開不了 MR，分析與推分支不受影響）。
+   離開退出碼只計 `❌`，警告不會讓它非零。
+
+   ⚠️ 這支腳本以前對執行方式很敏感：非互動 shell 的 `PATH` 只有
+   `/usr/bin:/bin:/usr/sbin:/sbin`，會把裝在 `/opt/homebrew/bin` 的 `timeout`、
+   `glab` 全部誤報成缺失（2026-09-03 據此誤判 worker 沒裝 glab，實際上裝著、
+   缺的只是認證）。腳本開頭現在會自行補上 Homebrew 路徑，上面兩種寫法都安全。
 
 ### worker 部署步驟（新機）
 
@@ -281,7 +299,14 @@ worker **不需要** cloudflared/tunnel/webhook——那些是 head 專屬。
    路由器上做 DHCP 固定 IP。
 3. `bash telegram-dispatcher/deploy/doctor-worker.sh`：唯讀體檢（工具鏈、
    repo 遠端連通、symlink、**非 git 資產**、.env、head 連通性、電源設定），
-   **全綠才上線**。
+   **沒有 `❌` 才上線**。也可以不登入這台、直接從 head 遠端跑（見「head 啟用
+   步驟」第 3 項）。兩種等級的差別：
+   - `❌` = 這台不能用（推拉不通、.env 缺、tracker 缺⋯⋯），修完再跑一次。
+   - `⚠️` = 能接單，但某類收尾要人工補。目前唯一一項是 **glab 未認證**：
+     git 推拉走 SSH key（含 `.ppk`）沒問題，但開 MR 走的是 GitLab **API
+     token**，兩者是不同憑證——2026-09-03 三張單全部分析成功、分支也推上
+     origin，卻卡在 `glab mr create`，就是這個差別。缺這項的 worker 跑出來的
+     單會停在 `failed`（或 MR 內容不更新），要有人事後在 head 補開/補更新。
 4. `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.aladdin.tg-worker-agent.plist`。
    worker agent 啟動時會自動向 head 登記（其後每 30 分鐘冪等重送），不用
    手動改 head 的任何檔案。**worker 退役**：先 `launchctl bootout` 該機的

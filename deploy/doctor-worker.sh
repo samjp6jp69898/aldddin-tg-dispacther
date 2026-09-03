@@ -4,6 +4,14 @@
 # 在日常任何時候重跑（例如懷疑某台 worker 環境壞了），不會有副作用。
 set -u
 
+# PATH 正規化（2026-09-03 踩到）：本腳本常被從 head 遠端非互動執行
+# （`ssh user@worker 'bash -s' < deploy/doctor-worker.sh`），那種 shell 的
+# PATH 只有 /usr/bin:/bin:/usr/sbin:/sbin，**不含 Homebrew**，於是 timeout、
+# glab 這些裝在 /opt/homebrew/bin 的工具會全部被誤報成「缺失」——當時據此
+# 判定 worker 沒裝 glab，實際上它裝著、缺的只是認證。pipeline 自己跑在
+# launchd 環境下 PATH 是完整的，所以誤報只會出現在體檢，不影響實際執行。
+export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+
 ALADDIN="/Users/user/aladdin"
 DISPATCHER="$ALADDIN/telegram-dispatcher"
 ENV_FILE="$DISPATCHER/.env"
@@ -11,9 +19,14 @@ ALADDIN_AI_ENV_FILE="$ALADDIN/aladdin_ai/.env.local"
 BUN="/Users/user/.bun/bin/bun"
 CLAUDE_BIN="/Users/user/.local/bin/claude"
 FAIL=0
+WARN=0
 
 ok()   { echo "  ✅ $1"; }
 bad()  { echo "  ❌ $1"; FAIL=$((FAIL+1)); }
+# warn：這台仍可上線接單，但某類收尾會做不完（例如開不了 MR），需要有人事後
+# 補。刻意不計入 FAIL——把「機器不能用」跟「產出少一步」混為同一個阻擋條件，
+# 會讓維運者為了讓體檢變綠而忽略真正的紅燈。
+warn() { echo "  ⚠️  $1"; WARN=$((WARN+1)); }
 info() { echo "  ℹ️  $1"; }
 
 envval() { grep -m1 "^$1=" "$ENV_FILE" 2>/dev/null | cut -d= -f2- | tr -d '\r\n'; }
@@ -32,10 +45,26 @@ else
 fi
 command -v timeout >/dev/null 2>&1 && ok "GNU timeout（$(command -v timeout)）" || bad "GNU timeout 缺失（brew install coreutils）"
 command -v git >/dev/null 2>&1 && ok "git" || bad "git 缺失"
+# glab（2026-09-03 改為條件模式）：git 推拉與開 MR 是兩種不同的憑證，體檢不該
+# 混為一談——
+#   - 推拉（push/fetch）走 SSH key，由下面「repo checkout 與遠端連通」那節的
+#     `git ls-remote origin HEAD` 實測，那才是「這台能不能工作」的硬條件。
+#   - 開 MR 走 GitLab **API token**，只有 glab 認證能提供。SSH key（含 .ppk）
+#     再怎麼能推都開不了 MR，2026-09-03 三張單全部卡在這裡實證過。
+# 所以 glab 缺失/未認證降為 warn：這台照樣能跑完分析、修復、推分支，只是
+# MR 要有人事後在 head 補。硬擋上線反而會讓真正的紅燈被一起忽略。
+# host 從 lago 的 origin 推導，不寫死——換 GitLab 站台時這裡自動跟著走。
+GITLAB_HOST="$(git -C "$ALADDIN/lago" remote get-url origin 2>/dev/null | sed -E 's#^[a-z+]+://[^@]*@([^:/]+).*#\1#')"
 if command -v glab >/dev/null 2>&1; then
-  glab auth status >/dev/null 2>&1 && ok "glab 已認證" || bad "glab 未認證（glab auth login）"
+  if [ -z "$GITLAB_HOST" ]; then
+    warn "glab 已安裝，但無法從 lago 的 origin 推導 GitLab host，未能驗證認證狀態"
+  elif glab auth status --hostname "$GITLAB_HOST" >/dev/null 2>&1; then
+    ok "glab 已認證 ${GITLAB_HOST}"
+  else
+    warn "glab 已安裝但**未認證** ${GITLAB_HOST}（No token found）→ 這台跑出來的單會停在 failed 或 MR 內容不更新，需事後在 head 補開/補更新。修法：glab auth login --hostname ${GITLAB_HOST}，或把 head 的 ~/Library/Application\\ Support/glab-cli/config.yml scp 過來"
+  fi
 else
-  bad "glab 缺失（brew install glab）"
+  warn "glab 缺失（brew install glab）→ 同上，分析與推分支不受影響，但開不了 MR"
 fi
 
 echo "== repo checkout 與遠端連通 =="
@@ -184,15 +213,28 @@ else
 fi
 
 echo "== 電源 =="
-if command -v pmset >/dev/null 2>&1; then
+# 2026-09-03：先看有沒有第三方防睡眠工具在跑。landon2 用 Amphetamine 常駐維持
+# 喚醒，pmset 的 sleep 值仍是 1，只看 pmset 會誤報成「會睡眠」。判定順序改成
+# 「工具接管 > pmset 設定」——真正要確認的是「這台不會睡著」，不是某個設定值。
+KEEPAWAKE=""
+for APP in Amphetamine caffeinate KeepingYouAwake Lungo; do
+  pgrep -qx "$APP" 2>/dev/null && KEEPAWAKE="$APP" && break
+done
+if [ -n "$KEEPAWAKE" ]; then
+  ok "防睡眠工具運行中（${KEEPAWAKE}）——pmset 的 sleep 設定不適用"
+elif command -v pmset >/dev/null 2>&1; then
   SLEEP_SETTING=$(pmset -g custom 2>/dev/null | awk '/AC Power/{f=1} f && /^[[:space:]]*sleep/{print $2; exit}')
-  if [ "$SLEEP_SETTING" = "0" ]; then ok "插電不睡眠（sleep=0）"; else bad "插電會睡眠（sleep=${SLEEP_SETTING:-?}）——睡著會接不到派工，請到系統設定關閉"; fi
+  if [ "$SLEEP_SETTING" = "0" ]; then ok "插電不睡眠（sleep=0）"; else bad "插電會睡眠（sleep=${SLEEP_SETTING:-?}）且未偵測到防睡眠工具——睡著會接不到派工，請到系統設定關閉或啟用 Amphetamine"; fi
 fi
 
 echo ""
 if [ "$FAIL" -eq 0 ]; then
-  echo "== 體檢通過（0 項失敗）：這台可以加入派工池 =="
+  if [ "$WARN" -eq 0 ]; then
+    echo "== 體檢通過（0 失敗 / 0 警告）：這台可以加入派工池 =="
+  else
+    echo "== 體檢通過（0 失敗 / ${WARN} 警告）：這台可以加入派工池，但上面的 ⚠️ 代表某些收尾要人工補，請先看過再上線 =="
+  fi
 else
-  echo "== 體檢未過：$FAIL 項失敗，修完再跑一次 =="
+  echo "== 體檢未過：${FAIL} 項失敗、${WARN} 項警告，修完再跑一次 =="
 fi
 exit "$FAIL"
