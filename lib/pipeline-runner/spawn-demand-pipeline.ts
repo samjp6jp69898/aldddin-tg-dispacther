@@ -307,6 +307,24 @@ const demandQueue = createPipelineQueue<DemandPayload>({
         }),
     )
   },
+  // 【MA-3】與 bugQueue 的 onDispatchedRemote 對稱：backlog 派往 worker 成功
+  // 時收掉 onEnqueued 寫的 queued 列（dispatched_to_worker，tier 2）。
+  onDispatchedRemote: entry => {
+    const finishedAt = new Date().toISOString()
+    dispatchMonitorWrite(
+      'writeRunOutcomeAuthoritative',
+      { runId: entry.payload.runId, ticket: entry.ticket, kind: DEMAND_RUN_KIND, outcome: 'dispatched_to_worker', outcomeSource: 'backlog-dispatch', finishedAt },
+      pool =>
+        writeRunOutcomeAuthoritative(pool, {
+          runId: entry.payload.runId,
+          ticket: entry.ticket,
+          kind: DEMAND_RUN_KIND,
+          outcome: 'dispatched_to_worker',
+          outcomeSource: 'backlog-dispatch',
+          finishedAt,
+        }),
+    )
+  },
   onSkipped: (entry, reason) => {
     // 監控 DB 化：code 值域見 makeQueueSkipReason——'locked' 別的流程正在跑
     // （那個存活 run 的權威終態由它自己的 finalize 寫，W2 的守衛只覆寫

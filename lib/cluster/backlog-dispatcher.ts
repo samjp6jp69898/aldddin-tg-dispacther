@@ -91,6 +91,11 @@ export function createBacklogDispatcher(deps: BacklogDispatcherDeps): BacklogDis
         // 同步佔位：見檔頭註解，必須是 attempt 的第一行、postJob 的 await 之前。
         const dispatchId = deps.registry.markDispatching(entry.ticket, 'bug', entry.triggeredBy)
         const dispatchedAt = new Date().toISOString()
+        // MA-3/MI-10：與 dispatch.ts 的直接派工路徑對齊——先把同票殘留的
+        // 未終態 attempt 標 superseded，create 帶 headRunId（backlog 條目在
+        // head 有 onEnqueued 寫的 queued run 列，這是 §5.3 的對位鍵；直接派工
+        // 路徑沒有 head 列所以不帶）。
+        attempts?.supersedeOthers?.({ ticket: entry.ticket, kind: 'bug', excludeDispatchId: dispatchId })
         attempts?.create({
           dispatchId,
           ticket: entry.ticket,
@@ -98,6 +103,7 @@ export function createBacklogDispatcher(deps: BacklogDispatcherDeps): BacklogDis
           status: 'dispatching',
           statusRank: DISPATCH_STATUS_RANK.dispatching,
           dispatchedAt,
+          headRunId: entry.payload.runId,
           triggeredByEmail: entry.triggeredBy?.email ?? null,
         })
         const r = await deps.postJob(worker, buildJobRequest('bug', entry, dispatchId))
@@ -126,6 +132,8 @@ export function createBacklogDispatcher(deps: BacklogDispatcherDeps): BacklogDis
       }
       const dispatchId = deps.registry.markDispatching(entry.ticket, 'demand', entry.triggeredBy)
       const dispatchedAt = new Date().toISOString()
+      // MA-3/MI-10：同上方 bug 分支的對齊（supersede 殘留 + headRunId 對位鍵）。
+      attempts?.supersedeOthers?.({ ticket: entry.ticket, kind: 'demand', excludeDispatchId: dispatchId })
       attempts?.create({
         dispatchId,
         ticket: entry.ticket,
@@ -133,6 +141,7 @@ export function createBacklogDispatcher(deps: BacklogDispatcherDeps): BacklogDis
         status: 'dispatching',
         statusRank: DISPATCH_STATUS_RANK.dispatching,
         dispatchedAt,
+        headRunId: entry.payload.runId,
         triggeredByEmail: entry.triggeredBy?.email ?? null,
       })
       const r = await deps.postJob(worker, buildJobRequest('demand', entry, dispatchId))

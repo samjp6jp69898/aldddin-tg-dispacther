@@ -136,6 +136,15 @@ export function createPipelineQueue<P>(cfg: {
    * 對應註解）。跟其他 hook 一樣經 safeHook 包住，例外不外洩、不擋住
    * submit() 本身的既有回傳。 */
   onEnqueued?: (entry: QueueEntry<P>) => void
+  /** 【MA-3，review-final-A-dispatcher.md】tryDispatchFront 的 attempt 回
+   * true（backlog-dispatcher 成功把這張單派給某台 worker）時呼叫恰好一次。
+   * 存在的理由：onEnqueued 為這張單寫過 queued（W1 rank 10）的 head run 列，
+   * 派往 worker 後這張單改由 worker 自己鑄的新 run_id 追蹤，head 那列若無人
+   * 收尾就成了幽靈 queued 列——下次重啟被 restart sweep 錯標 lost_on_restart
+   * （語意錯誤：它沒丟，它在 worker 上跑）。監控 DB 化的
+   * 「dispatched_to_worker（tier 2 終態）」寫入點掛在這裡，與 onEnqueued
+   * 同一種純注入慣例，本檔不知道也不依賴監控 DB 的存在。 */
+  onDispatchedRemote?: (entry: QueueEntry<P>) => void
   /** 排隊中的單輪到並成功啟動時呼叫（用來 TG 通知發起人）。 */
   onDequeueStarted?: (entry: QueueEntry<P>) => void
   /** 排隊中的單輪到但 spawn 失敗時呼叫（通知發起人需重新認領）；佇列會跳過
@@ -363,7 +372,11 @@ export function createPipelineQueue<P>(cfg: {
         persist()
         return 'declined'
       }
-      if (ok) return 'dispatched'
+      if (ok) {
+        // MA-3：成功派往 worker——讓 spawn-* 收掉 onEnqueued 寫的 queued 列。
+        safeHook('onDispatchedRemote', () => cfg.onDispatchedRemote?.(head))
+        return 'dispatched'
+      }
       // 呼叫端確定沒接下這張單：塞回隊頭保留 FIFO 位置，不繼續嘗試下一張。
       queue.unshift(head)
       persist()
