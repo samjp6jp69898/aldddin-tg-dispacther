@@ -59,6 +59,38 @@ for sh in bug-lock.sh tracker.sh notion.sh tg-notify.sh setup-worktree.sh; do
   [ -f "$ALADDIN/scripts/$sh" ] && ok "scripts/$sh" || bad "scripts/$sh 缺失"
 done
 
+echo "== 非 git 資產（需從 head 複製，本腳本不代辦）=="
+# 2026-09-03 事故補課。這三項都不在任何 repo 裡，2026-08-31 建 landon2 時全部
+# 漏帶，而當時 doctor 沒有任何一項檢查涵蓋它們——**體檢全綠、機器卻是壞的**。
+# 三者的共同特徵是「缺了不會讓 pipeline 報錯退出」，所以只能靠體檢抓：
+#   - tracker 缺 → tracker.sh 對檔案不存在直接 exit 1、被 ensureTrackerPending
+#     的 catch 靜默吞掉 → /create-mr Step 0.1 把每張單都判 not claimable、
+#     幾十秒就 SKIPPED。head 端只看得到「派出去、幾秒後 job-done」，兩天 7 張白跑。
+#   - gdrive 缺 → drive-uploader 上傳全失敗，Notion 留言沒有文件連結，
+#     分析產物困在 worker 本機。
+#   - cqa-e2e 缺 → cqa-grounder 的 Playwright lib 全滅，畫面取證降級 DEGRADED。
+TRACKER_MD="$HOME/.claude/projects/-Users-user-aladdin/memory/bug_analysis_tracker.md"
+if [ -f "$TRACKER_MD" ] && grep -qE '^\| FAQ-[0-9]+ \|' "$TRACKER_MD" 2>/dev/null; then
+  ok "bug_analysis_tracker.md（$(grep -cE '^\| FAQ-[0-9]+ \|' "$TRACKER_MD" 2>/dev/null) 筆）"
+else
+  bad "bug_analysis_tracker.md 缺失或空表 → /create-mr Step 0.1 會把每張派來的單都判成 not claimable。從 head 執行：ssh user@<本機IP> 'mkdir -p ~/.claude/projects/-Users-user-aladdin/memory' && scp -p ~/.claude/projects/-Users-user-aladdin/memory/bug_analysis_tracker.md user@<本機IP>:~/.claude/projects/-Users-user-aladdin/memory/"
+fi
+# 首次複製之後不需要人工維護：worker-agent 每次接單前會向 head 抓一份覆蓋本機
+# （GET /cluster/tracker），跑完把該單終態隨 job-done 回寫 head，head 那份是
+# 唯一權威（見 lib/pipeline-runner/tracker-sync.ts「整檔同步」段落）。這裡檢查
+# 的是「首次要有一份」——worker-agent 起來之前就得存在。
+if [ -x "$HOME/.claude/gdrive.sh" ] && [ -f "$HOME/.claude/gdrive_token.json" ]; then
+  ok "gdrive.sh + gdrive_token.json（drive-uploader 用）"
+else
+  bad "gdrive.sh 或 gdrive_token.json 缺失 → 分析文件上傳 Google Drive 會全數失敗、Notion 留言不會有文件連結。從 head 執行：scp -p ~/.claude/gdrive.sh ~/.claude/gdrive_token.json user@<本機IP>:~/.claude/"
+fi
+if [ -d "$ALADDIN/cqa-e2e" ] && [ -n "$(ls -A "$ALADDIN/cqa-e2e" 2>/dev/null)" ]; then
+  ok "cqa-e2e/（cqa-grounder 的 Playwright lib）"
+else
+  bad "cqa-e2e/ 缺失或空目錄 → cqa-grounder 無法做畫面取證，grounding 會降級成 DEGRADED。從 head 執行：rsync -a /Users/user/aladdin/cqa-e2e/ user@<本機IP>:/Users/user/aladdin/cqa-e2e/"
+fi
+info "worker 上 obsidian/Debug/ 的分析產物不會自動回到 head（該 repo 在 worker 端不 push）；gdrive 正常時走 Drive，需要原始檔則從 head scp 撈回"
+
 echo "== .env（telegram-dispatcher/.env）=="
 if [ -f "$ENV_FILE" ]; then
   for KEY in CLUSTER_SHARED_SECRET CLUSTER_HEAD_URL CLUSTER_WORKER_NAME CLUSTER_WORKER_URL TG_DISPATCH_BOT_TOKEN; do

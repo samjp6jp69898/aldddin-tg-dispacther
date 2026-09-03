@@ -267,12 +267,21 @@ worker **不需要** cloudflared/tunnel/webhook——那些是 head 專屬。
    能自動做的（symlink 重建、bun install、目錄、plist 複製）自動做，需要
    人工的（repo clone、.env 安全複製、claude 登入、glab auth）印成待辦
    清單。重跑到 0 待辦為止。
+   ⚠️ 待辦清單裡有一組**非 git 資產**（第 6 節）特別容易被忽略，因為缺了
+   不會讓任何東西報錯，只會讓 pipeline 靜默地做錯事——2026-08-31 建 landon2
+   時三項全漏、體檢當時也沒檢查，結果兩天內 7 張派過去的單全部白跑：
+   `~/.claude/projects/-Users-user-aladdin/memory/bug_analysis_tracker.md`
+   （缺 → 每張單在 `/create-mr` Step 0.1 判 not claimable、幾十秒 SKIPPED）、
+   `~/.claude/gdrive.sh` + `gdrive_token.json`（缺 → 文件上傳全失敗、Notion
+   留言沒有連結）、`cqa-e2e/`（缺 → grounding 畫面取證降級 DEGRADED）。
+   三項都要從 head 推過去，指令印在待辦裡。
 2. `.env` 補四個 worker 變數（值的說明見 `launchd/run-worker-agent.sh`
    檔頭）：`CLUSTER_SHARED_SECRET`（與 head 同值）、`CLUSTER_HEAD_URL`、
    `CLUSTER_WORKER_NAME`、`CLUSTER_WORKER_URL`。head/worker 都建議在
    路由器上做 DHCP 固定 IP。
 3. `bash telegram-dispatcher/deploy/doctor-worker.sh`：唯讀體檢（工具鏈、
-   repo 遠端連通、symlink、.env、head 連通性、電源設定），**全綠才上線**。
+   repo 遠端連通、symlink、**非 git 資產**、.env、head 連通性、電源設定），
+   **全綠才上線**。
 4. `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.aladdin.tg-worker-agent.plist`。
    worker agent 啟動時會自動向 head 登記（其後每 30 分鐘冪等重送），不用
    手動改 head 的任何檔案。**worker 退役**：先 `launchctl bootout` 該機的
@@ -329,8 +338,15 @@ head 端比對是否等於 `origin/main`。
 - tg-monitor 只看得到自己機器上的 pipeline；派去 worker 的單要去 worker
   的 logs/ 看。tg-monitor 的重試按鈕也只影響本機，且看不到遠端登記表——
   避免對「派在別台跑的單」按重試。
-- `bug_analysis_tracker.md` 每台機器各一份，會分岔——既有的
-  `/sync-bug-tracker` skill 就是為多機補正而生，維持原本的事後同步策略。
+- `bug_analysis_tracker.md`（2026-09-03 起改為 head 唯一權威，取代舊的「每台
+  各一份、事後靠 `/sync-bug-tracker` 補正」策略）：worker 接單前向 head 抓一份
+  完整覆蓋本機（`GET /cluster/tracker`），跑完把該單終態隨 `job-done` 回寫
+  head。全程降級不阻斷——head 打不到、回應格式不對、或本機正有人在寫（搶不到
+  `tracker.sh` 那把檔級鎖）都只記 log、沿用本機那份繼續接單。新舊版本雙向
+  相容，任一端單獨上線都不會壞。細節見 `lib/pipeline-runner/tracker-sync.ts`
+  的「整檔同步」段落。`/sync-bug-tracker` 仍有用，但範圍縮到「head 與 Notion
+  之間」這一層。**新機器仍需先人工複製一份**（worker-agent 起來之前就得存在，
+  見上面建置步驟第 1 項與 `doctor-worker.sh` 的「非 git 資產」節）。
 - worker 機同樣要插電、關閉「插電時允許進入睡眠」（doctor 會檢查），睡著
   等於這台從派工池消失（head 探測不到會自動跳過，不會壞流程，只是少一台）。
 - worker agent 的 8801 只該存在於受信任的 LAN；不要在路由器上對它做任何
