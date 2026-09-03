@@ -136,7 +136,17 @@ function getWorkerBuckets(worker: string): { req: AmountBucket; bytes: AmountBuc
 const DEDUP_CAPACITY = 1_000_000
 
 export interface LruDedupSet {
-  /** 命中即回 true（並把該 id touch 到最新）；未命中則記錄下來並回 false。 */
+  /**
+   * 命中即回 true（並把該 id touch 到最新）；未命中**只回 false、不登記**。
+   * B-2（review-final-A-dispatcher.md）：登記與查詢必須分離——「已看過」只能
+   * 在「已持久化到 VL」之後寫下，否則一次 VL 暫時失敗＋worker 重送就會被誤判
+   * 全重複而永久遺失該批（違反 §3.3(d)「只重複、不缺口」）。
+   */
+  has: (id: string) => boolean
+  /** 登記一個 id（含滿載淘汰）。只在 VL 回 2xx 之後呼叫。 */
+  add: (id: string) => void
+  /** 舊語意（查＋未命中即登記）——僅供既有單元測試驗 LRU 行為，處理路徑
+   * 已不再使用（見 B-2 註解）。 */
   isDuplicate: (id: string) => boolean
   size: () => number
 }
@@ -144,19 +154,27 @@ export interface LruDedupSet {
 /** capacity 可注入，供測試用小容量驗證滿載淘汰行為，不用真的塞 100 萬筆。 */
 export function createLruDedupSet(capacity: number = DEDUP_CAPACITY): LruDedupSet {
   const seen = new Map<string, true>()
+  function has(id: string): boolean {
+    if (!seen.has(id)) return false
+    // LRU touch：刪了再插回去，讓它排到 Map 迭代順序的最後（最新）。
+    seen.delete(id)
+    seen.set(id, true)
+    return true
+  }
+  function add(id: string): void {
+    seen.delete(id)
+    seen.set(id, true)
+    if (seen.size > capacity) {
+      const oldest = seen.keys().next().value
+      if (oldest !== undefined) seen.delete(oldest)
+    }
+  }
   return {
+    has,
+    add,
     isDuplicate(id: string): boolean {
-      if (seen.has(id)) {
-        // LRU touch：刪了再插回去，讓它排到 Map 迭代順序的最後（最新）。
-        seen.delete(id)
-        seen.set(id, true)
-        return true
-      }
-      seen.set(id, true)
-      if (seen.size > capacity) {
-        const oldest = seen.keys().next().value
-        if (oldest !== undefined) seen.delete(oldest)
-      }
+      if (has(id)) return true
+      add(id)
       return false
     },
     size: () => seen.size,
@@ -320,22 +338,61 @@ app.post(
     if (lines.length === 0) return c.json({ ok: false, reason: 'bad_request' }, 400)
     for (const line of lines) enforceLineSizeLimit(line)
 
-    // §3.3(d) 去重：全部重複時仍回 200/accepted:0（worker 才會推進 offset；
-    // 對它而言這批已經送達過，不推進會造成無窮重送）。
-    const deduped = lines.filter(line => !dedupSet.isDuplicate(computeLineId(worker, line.path, line.inode, line.offset)))
-    if (deduped.length === 0) {
-      return c.json({ ok: true, accepted: 0 })
-    }
-
-    // §3.3(d)：「回 2xx 的語意明訂為『已持久化到 VictoriaLogs』」——intake
-    // 必須先寫成 9428 再回 200；9428 寫入失敗即回 503（worker 因此不推進
-    // offset，下一輪從同一 offset 重送——兩條通道故障域不同，結構上只會
-    // 產生重複，不會產生缺口）。
-    const written = await forwardToVictoriaLogs(worker, deduped)
-    if (!written) return c.text('Service Unavailable', 503)
-    return c.json({ ok: true, accepted: deduped.length })
+    const result = await acceptLogBatch(worker, lines)
+    if (result.status === 503) return c.text('Service Unavailable', 503)
+    return c.json({ ok: true, accepted: result.accepted })
   },
 )
+
+export interface AcceptLogBatchDeps {
+  dedup?: LruDedupSet
+  forward?: (host: string, lines: LogLineIn[]) => Promise<boolean>
+}
+
+/**
+ * 去重＋轉寫核心（route handler 只做驗簽/限流/形狀檢查後呼叫這裡；deps 可注入
+ * 供測試，production 用模組級 dedupSet 與 forwardToVictoriaLogs）。
+ *
+ * B-2（review-final-A-dispatcher.md）：順序必須是**先查（不登記）→ 寫 VL →
+ * VL 回成功才登記**。舊版在 filter 時就把 id 登記進 LRU，於是一次 VL 暫時失敗
+ * （503，worker 正確地不推進 offset）之後，worker 原封重送、intake 卻判「全部
+ * 重複」回 200/accepted:0 → worker 推進 offset → 該批永久遺失——恰好製造了
+ * §3.3(d) 明訂結構上不會發生的那一半（缺口）。改成登記後置之後：VL 失敗 →
+ * id 未登記 → 重送照常轉寫；「寫入 VL 成功但登記前崩潰」的殘餘窗口落在允許的
+ * 那一半（重複），不是缺口。
+ *
+ * 批內重複（同一批出現相同 id）沿用舊行為只轉寫第一份：batchSeen 承接舊版
+ * 「filter 過程中即時登記」順帶提供的批內去重，避免行為迴歸。
+ */
+export async function acceptLogBatch(
+  worker: string,
+  lines: LogLineIn[],
+  deps: AcceptLogBatchDeps = {},
+): Promise<{ status: 200 | 503; accepted: number }> {
+  const dedup = deps.dedup ?? dedupSet
+  const forward = deps.forward ?? forwardToVictoriaLogs
+
+  // §3.3(d) 去重：全部重複時仍回 200/accepted:0（worker 才會推進 offset；
+  // 對它而言這批已經送達過，不推進會造成無窮重送）。
+  const fresh: { id: string; line: LogLineIn }[] = []
+  const batchSeen = new Set<string>()
+  for (const line of lines) {
+    const id = computeLineId(worker, line.path, line.inode, line.offset)
+    if (dedup.has(id) || batchSeen.has(id)) continue
+    batchSeen.add(id)
+    fresh.push({ id, line })
+  }
+  if (fresh.length === 0) return { status: 200, accepted: 0 }
+
+  // §3.3(d)：「回 2xx 的語意明訂為『已持久化到 VictoriaLogs』」——intake
+  // 必須先寫成 9428 再回 200；9428 寫入失敗即回 503（worker 因此不推進
+  // offset，下一輪從同一 offset 重送——兩條通道故障域不同，結構上只會
+  // 產生重複，不會產生缺口）。
+  const written = await forward(worker, fresh.map(f => f.line))
+  if (!written) return { status: 503, accepted: 0 }
+  for (const f of fresh) dedup.add(f.id)
+  return { status: 200, accepted: fresh.length }
+}
 
 // POST /cluster/logs 以外的一律 uniform 401（與其餘未知路徑無法區分，維持
 // 既有拒絕不變式，比照 worker-agent.ts）。
