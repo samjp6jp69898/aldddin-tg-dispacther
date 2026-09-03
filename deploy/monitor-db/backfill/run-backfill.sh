@@ -44,7 +44,10 @@ if [ "$DRY_RUN" -eq 0 ] && { [ -z "$ONLY" ] || [ "$ONLY" = "sqlite" ]; }; then
   echo "=== 前置：events 去重前提探針（precheck-events-dedup --gate）==="
   PRECHECK="${PRECHECK_CMD:-bun $DIR/precheck-events-dedup.ts}"
   set +e
-  $PRECHECK --gate ${SCHEMA_ARGS[@]+"${SCHEMA_ARGS[@]}"}
+  # ${=PRECHECK}：zsh 預設不做字詞分割，含空白的預設值（bun <路徑>）會被當成
+  # 單一指令名而 127。＝旗標顯式分割（本檔 shebang 是 zsh）。踩坑記錄：stub 測試
+  # 全是無空白單一路徑所以沒抓到——替身比真物寬鬆的實例。
+  ${=PRECHECK} --gate ${SCHEMA_ARGS[@]+"${SCHEMA_ARGS[@]}"}
   rc=$?
   set -e
   if [ "$rc" -eq 2 ]; then
