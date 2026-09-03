@@ -151,9 +151,26 @@ UPDATE runs
    AND (outcome IS NULL OR outcome_tier < 2)
 `.trim()
 
+// 2026-09-03（根因修復，見 switch-readiness.ts C4/C6 持續性缺口分析）：
+// W1（writeRunProgress）若在 server 崩潰/重啟的窄縫遺失，這條 INSERT 就是
+// 這一列在 runs 表唯一的落地機會——原本沒帶 legacy_key/stdout_path/
+// stderr_path，永遠留 NULL，導致 tg-monitor 用 COALESCE(legacy_key, run_id)
+// 或 stdout_path 做比對時永遠對不上 sqlite 舊資料/collector。呼叫端
+// （post-run-notify.ts main()）本來就知道這一輪的 stdoutPath（argv 帶入）與
+// 可推導出的 stderrPath/legacyKey（`<ticket>.<timestamp>` 命名慣例），這裡
+// 補上這三欄，皆選填（COALESCE 語意的延伸：呼叫端沒有值時維持 NULL，不硬填
+// 假值）。
+//
+// `started_at` 一併補上（同一次根因修復追加）：`RUNS_LIST_WHERE`
+// （tg-monitor/lib/read/mysql.ts）要求 `started_at IS NOT NULL` 才會被
+// `pipelineRuns()`（switch-readiness.ts C4 實際讀取的入口）看見——只補
+// legacy_key/stdout_path/stderr_path 三欄，列依然會被這個 WHERE 篩掉，C4
+// 缺口不會真的消失。呼叫端推回的 startedAt 值來源與 sqlite 側
+// `pipeline_runs.started_at` 完全同構（兩邊都是從同一個 log 檔名時間戳反推，
+// 見 switch-readiness.ts 檔頭「`started_at` 的兩軌容差」說明），不是臆測值。
 export const W2_INSERT_SQL = `
-INSERT INTO runs (run_id, host, ticket, kind, lifecycle_rank, outcome, outcome_tier, outcome_source, finished_at, exit_code, created_at)
-VALUES (?, ?, ?, ?, 100, ?, 2, ?, ?, ?, NOW(3))
+INSERT INTO runs (run_id, host, ticket, kind, lifecycle_rank, outcome, outcome_tier, outcome_source, finished_at, exit_code, legacy_key, stdout_path, stderr_path, started_at, created_at)
+VALUES (?, ?, ?, ?, 100, ?, 2, ?, ?, ?, ?, ?, ?, ?, NOW(3))
 `.trim()
 
 export const RUNS_COLD_PATH_TERMINAL_SQL = 'SELECT host, outcome, outcome_tier FROM runs WHERE run_id = ?'
@@ -165,6 +182,21 @@ export interface WriteRunOutcomeAuthoritativeInput extends RunIdentity {
   outcomeSource: string
   finishedAt: string
   exitCode?: number | null
+  /**
+   * 2026-09-03 根因修復：只在 W2 走 INSERT fallback（W1 從未落地）時派上用場——
+   * UPDATE 路徑代表列已存在（多半是 W1 寫的），這三欄早已由 W1 補齊，這裡不重複
+   * 覆寫。呼叫端沒有值就傳 undefined/null，INSERT 出的列該三欄仍為 NULL（不硬填
+   * 假值），不影響既有行為。
+   */
+  legacyKey?: string | null
+  stdoutPath?: string | null
+  stderrPath?: string | null
+  /**
+   * 2026-09-03 根因修復（同上）：只在 INSERT fallback 用得到，UPDATE 路徑的列
+   * 已存在（多半是 W1 寫的），這欄早已補齊。見 W2_INSERT_SQL 檔頭關於
+   * `RUNS_LIST_WHERE`／C4 的說明。
+   */
+  startedAt?: string | null
 }
 
 /**
@@ -203,6 +235,10 @@ export async function writeRunOutcomeAuthoritative(
       input.outcomeSource,
       dt(input.finishedAt),
       input.exitCode ?? null,
+      input.legacyKey ?? null,
+      input.stdoutPath ?? null,
+      input.stderrPath ?? null,
+      dt(input.startedAt),
     ])
     return { kind: 'inserted' }
   } catch (err) {

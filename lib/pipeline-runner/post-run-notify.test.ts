@@ -22,7 +22,7 @@ describe('writeAuthoritativeOutcome — v3.2 §9 Phase2 bug 終態（權威）�
     try {
       const fakeDb = new FakeRunsDb()
       const fakeSpool = makeFakeSpool()
-      await writeAuthoritativeOutcome('FAQ-9001', 'success', 0, { pool: fakeDb, spool: fakeSpool })
+      await writeAuthoritativeOutcome('FAQ-9001', 'success', 0, '/tmp/FAQ-9001.stdout.log', '/tmp/FAQ-9001.stderr.log', { pool: fakeDb, spool: fakeSpool })
       expect(fakeDb.calls.length).toBe(0)
       expect(fakeSpool.appended.length).toBe(0)
     } finally {
@@ -37,12 +37,25 @@ describe('writeAuthoritativeOutcome — v3.2 §9 Phase2 bug 終態（權威）�
     try {
       const fakeDb = new FakeRunsDb()
       const fakeSpool = makeFakeSpool()
-      await writeAuthoritativeOutcome('FAQ-9002', 'infra_failure', 1, { pool: fakeDb, spool: fakeSpool })
+      const stdoutPath = '/Users/user/aladdin/telegram-dispatcher/logs/FAQ-9002.2026-09-03T00-00-00-000Z.stdout.log'
+      const stderrPath = '/Users/user/aladdin/telegram-dispatcher/logs/FAQ-9002.2026-09-03T00-00-00-000Z.stderr.log'
+      await writeAuthoritativeOutcome('FAQ-9002', 'infra_failure', 1, stdoutPath, stderrPath, { pool: fakeDb, spool: fakeSpool })
       const row = fakeDb.rows.get('11111111-1111-1111-1111-111111111111')
       expect(row).not.toBeUndefined()
       expect(row!.outcome).toBe('infra_failure')
       expect(row!.outcome_tier).toBe(2)
       expect(row!.exit_code).toBe(1)
+      // 2026-09-03 根因修復：run_id 在 FakeRunsDb 裡完全不存在 → W2 走 INSERT
+      // fallback（模擬 W1 遺失的真實情境），legacy_key/stdout_path/stderr_path
+      // 要跟著這次寫入正確落地，不再永遠 NULL（見 writes.ts W2_INSERT_SQL）。
+      // started_at 也要能從 stdoutPath 檔名時間戳反推（不然 RUNS_LIST_WHERE
+      // 會把這列從 pipelineRuns()／C4 的讀取結果整個濾掉，見同一份修復）。
+      expect(row!.legacy_key).toBe('FAQ-9002.2026-09-03T00-00-00-000Z')
+      expect(row!.stdout_path).toBe(stdoutPath)
+      expect(row!.stderr_path).toBe(stderrPath)
+      // dt()（isoToMysqlDatetime3OrNull）把 ISO 字串轉成 MySQL DATETIME(3) 字面格式
+      // （空白分隔、無 T/Z）。
+      expect(row!.started_at).toBe('2026-09-03 00:00:00.000')
       expect(fakeSpool.appended.length).toBe(0)
     } finally {
       if (prev === undefined) delete process.env.MON_RUN_ID
@@ -55,7 +68,7 @@ describe('writeAuthoritativeOutcome — v3.2 §9 Phase2 bug 終態（權威）�
     process.env.MON_RUN_ID = '22222222-2222-2222-2222-222222222222'
     try {
       const fakeSpool = makeFakeSpool()
-      await writeAuthoritativeOutcome('FAQ-9003', 'timeout', 124, { pool: null, spool: fakeSpool })
+      await writeAuthoritativeOutcome('FAQ-9003', 'timeout', 124, '/tmp/FAQ-9003.stdout.log', '/tmp/FAQ-9003.stderr.log', { pool: null, spool: fakeSpool })
       expect(fakeSpool.appended.length).toBe(1)
       expect(fakeSpool.appended[0]!.run_id).toBe('22222222-2222-2222-2222-222222222222')
       expect(fakeSpool.appended[0]!.fn).toBe('writeRunOutcomeAuthoritative')
@@ -72,7 +85,9 @@ describe('writeAuthoritativeOutcome — v3.2 §9 Phase2 bug 終態（權威）�
     try {
       const throwingPool = { execute: async () => Promise.reject(new Error('連線斷了')) }
       const fakeSpool = makeFakeSpool()
-      await expect(writeAuthoritativeOutcome('FAQ-9004', 'cli_failure', 1, { pool: throwingPool, spool: fakeSpool })).resolves.toBeUndefined()
+      await expect(
+        writeAuthoritativeOutcome('FAQ-9004', 'cli_failure', 1, '/tmp/FAQ-9004.stdout.log', '/tmp/FAQ-9004.stderr.log', { pool: throwingPool, spool: fakeSpool }),
+      ).resolves.toBeUndefined()
       expect(fakeSpool.appended.length).toBe(1)
       expect(fakeSpool.appended[0]!.run_id).toBe('33333333-3333-3333-3333-333333333333')
     } finally {

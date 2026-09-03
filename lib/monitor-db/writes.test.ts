@@ -213,6 +213,42 @@ describe("writeRunOutcomeAuthoritative（W2，tier 2）與 writeRunOutcomeProvis
     expect(row.outcome_tier).toBe(2)
     expect(row.lifecycle_rank).toBe(100)
   })
+
+  // 2026-09-03 根因修復（見 switch-readiness.ts C4/C6 持續性缺口）：模擬「W1
+  // 完全遺失（server 崩潰窄縫），只有 W2 INSERT fallback 路徑執行」的真實情境
+  // ——run_id 在 runs 表完全不存在，直接進 W2_INSERT_SQL。呼叫端（
+  // post-run-notify.ts）本來就知道 legacyKey/stdoutPath/stderrPath/startedAt，
+  // 這裡驗證 writeRunOutcomeAuthoritative 真的會把四者寫進新建的列，不再永遠
+  // 留 NULL（legacy_key/stdout_path/stderr_path 三欄的 NULL 導致 C4/C6 對不上
+  // sqlite；started_at 留 NULL 則導致列被 RUNS_LIST_WHERE 整個濾掉，C4 依然
+  // 看不到）。退回舊版 writes.ts（W2_INSERT_SQL 沒有這四欄、
+  // WriteRunOutcomeAuthoritativeInput 沒有這四個欄位）時，這個測試會因為
+  // legacyKey/stdoutPath/stderrPath/startedAt 根本不是合法輸入欄位（TS 編譯期）
+  // 或即使硬塞進去也不會被 INSERT 到 row（執行期 FakeRunsDb 讀不到對應
+  // params）而斷言失敗——見下方 test 附註的退版驗證紀錄。
+  test('W2 insert-fallback（W1 遺失）：呼叫端提供的 legacyKey/stdoutPath/stderrPath/startedAt 要正確落地，不再永遠 NULL', async () => {
+    const db = new FakeRunsDb()
+    const r = await writeRunOutcomeAuthoritative(db, {
+      ...ident({ runId: 'run-headless' }),
+      ticket: 'FAQ-4865',
+      outcome: 'infra_failure',
+      outcomeSource: 'post-run-notify',
+      finishedAt: '2026-09-03T03:44:27.630Z',
+      exitCode: 1,
+      legacyKey: 'FAQ-4865.2026-09-03T03-44-00-000Z',
+      stdoutPath: '/Users/user/aladdin/telegram-dispatcher/logs/FAQ-4865.2026-09-03T03-44-00-000Z.stdout.log',
+      stderrPath: '/Users/user/aladdin/telegram-dispatcher/logs/FAQ-4865.2026-09-03T03-44-00-000Z.stderr.log',
+      startedAt: '2026-09-03T03:44:00.000Z',
+    })
+    expect(r).toEqual({ kind: 'inserted' })
+    const row = db.rows.get('run-headless')!
+    expect(row.legacy_key).toBe('FAQ-4865.2026-09-03T03-44-00-000Z')
+    expect(row.stdout_path).toBe('/Users/user/aladdin/telegram-dispatcher/logs/FAQ-4865.2026-09-03T03-44-00-000Z.stdout.log')
+    expect(row.stderr_path).toBe('/Users/user/aladdin/telegram-dispatcher/logs/FAQ-4865.2026-09-03T03-44-00-000Z.stderr.log')
+    // dt()（isoToMysqlDatetime3OrNull）把 ISO 字串轉成 MySQL DATETIME(3) 字面格式
+    // （空白分隔、無 T/Z）——writes.ts 檔頭已有說明，這裡驗證的是同一個轉換。
+    expect(row.started_at).toBe('2026-09-03 03:44:00.000')
+  })
 })
 
 describe('cancel：W4（旗標）／W5（遲到修正）— 三種到達順序都收斂到 cancelled', () => {

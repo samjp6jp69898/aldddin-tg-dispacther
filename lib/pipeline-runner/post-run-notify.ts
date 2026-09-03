@@ -1,6 +1,6 @@
 import { readFileSync, appendFileSync, mkdirSync } from 'node:fs'
 import { execFileSync } from 'node:child_process'
-import { join } from 'node:path'
+import { basename, join } from 'node:path'
 import { classifyPipelineResult, type Classification } from './classify-result.ts'
 import { getTicketNotionUrl, getTicketAiAnalysisStatus } from '../notion-integration/candidate-tickets.ts'
 import { notifyOperator } from '../notify/operator.ts'
@@ -172,6 +172,46 @@ const MONITOR_WRITE_BUDGET_MS = SHORT_LIVED_WRITE_BUDGET_MS // §6.7：短命行
 const BUG_RUN_KIND: RunKind = 'bug'
 
 /**
+ * 2026-09-03 根因修復（見 switch-readiness.ts C4/C6 持續性缺口分析）：從
+ * stdoutPath 反推 `<ticket>.<timestamp>` 格式的 legacy_key——spawn-create-mr.ts
+ * 的 spawnCreateMrNow 用同一個 `base`（見該檔 `const base = \`${ticket}.${timestamp}\``）
+ * 同時鑄出 legacyKey 與 stdoutPath（`${base}.stdout.log`），兩者互為可逆運算，
+ * 這裡只是反過來剝掉目錄與 `.stdout.log` 後綴，不是重新臆測格式。
+ */
+function deriveLegacyKeyFromStdoutPath(stdoutPath: string): string {
+  return basename(stdoutPath).replace(/\.stdout\.log$/, '')
+}
+
+// `<ticket>.<timestamp>` 裡的 timestamp 段固定是
+// `new Date().toISOString().replace(/[:.]/g, '-')` 的輸出（spawn-create-mr.ts
+// 的 `const timestamp = ...`），形狀固定是 `YYYY-MM-DDTHH-MM-SS-mmmZ`——把
+// `:`/`.` 換回來就是可還原的 ISO 字串，不是憑空臆測格式。
+const TIMESTAMP_TOKEN_RE = /^(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2})-(\d{3})Z$/
+
+/**
+ * 2026-09-03 根因修復追加：只補 legacy_key/stdout_path/stderr_path 三欄不夠——
+ * tg-monitor 的 `RUNS_LIST_WHERE`（lib/read/mysql.ts）要求 `started_at IS NOT
+ * NULL` 才會被 `pipelineRuns()`（switch-readiness.ts C4 的實際讀取入口）看見，
+ * W2 INSERT fallback 原本完全不寫這欄，即使 legacy_key/stdout_path 都補齊，
+ * C4 缺口仍不會消失。
+ *
+ * 這裡從 legacyKey 反推 startedAt：與 sqlite 側 `pipeline_runs.started_at`
+ * 完全同構——兩邊都是從同一個 log 檔名時間戳反推（見
+ * switch-readiness.ts 檔頭「`started_at` 的兩軌容差」說明），不是臆測值，
+ * C5 的 `STARTED_AT_TOLERANCE_MS` 容差窗本來就是為這種「兩次獨立 new Date()」
+ * 的落差設計，這裡反而是 Δ=0（同一個字串反推）。
+ *
+ * 解析失敗（legacyKey 不是預期形狀）回傳 null，呼叫端就不硬填假值。
+ */
+function deriveStartedAtFromLegacyKey(legacyKey: string, ticket: string): string | null {
+  if (!legacyKey.startsWith(`${ticket}.`)) return null
+  const token = legacyKey.slice(ticket.length + 1)
+  const m = TIMESTAMP_TOKEN_RE.exec(token)
+  if (!m) return null
+  return `${m[1]}T${m[2]}:${m[3]}:${m[4]}.${m[5]}Z`
+}
+
+/**
  * 【plan-db-as-truth-v3.2.md §9 Phase2】bug 終態（權威，tier2）：本檔是
  * WRAPPER_SCRIPT 的 EXIT trap 子行程，`process.env.MON_RUN_ID` 繼承自
  * spawn 時顯式覆寫的值（見 spawn-create-mr.ts 的 spawnCreateMrNow），正是
@@ -181,11 +221,19 @@ const BUG_RUN_KIND: RunKind = 'bug'
  * 失敗落 spool；退出前明確關閉本函式自己建立的連線／spool fd（不是等待，
  * 是確定性地釋放資源，讓行程能乾淨結束，不留著 socket 卡住 event loop）。
  * `deps` 只給測試注入假 pool/spool，production 呼叫端一律不傳。
+ *
+ * `stdoutPath`/`stderrPath`（2026-09-03 新增，根因修復）：main() 從 argv/命名
+ * 慣例推回的這一輪 log 路徑——W2 若因 W1 遺失而走 INSERT fallback，這是
+ * legacy_key/stdout_path/stderr_path 唯一能落地的機會（見 writes.ts
+ * W2_INSERT_SQL 檔頭註解）。W1 若已正常寫過，這三欄早已存在，UPDATE 路徑不會
+ * 用到這裡傳的值（W2_UPDATE_SQL 本來就不觸碰這三欄）。
  */
 export async function writeAuthoritativeOutcome(
   ticket: string,
   classification: Classification,
   exitCode: number,
+  stdoutPath: string,
+  stderrPath: string,
   deps: { pool?: MonitorDbExecutor | null; spool?: SpoolWriterHandle } = {},
 ): Promise<void> {
   const testMode = 'pool' in deps || 'spool' in deps
@@ -198,7 +246,20 @@ export async function writeAuthoritativeOutcome(
   }
 
   const finishedAt = new Date().toISOString()
-  const input = { runId, ticket, kind: BUG_RUN_KIND, outcome: classification, outcomeSource: 'post-run-notify', finishedAt, exitCode }
+  const legacyKey = deriveLegacyKeyFromStdoutPath(stdoutPath)
+  const input = {
+    runId,
+    ticket,
+    kind: BUG_RUN_KIND,
+    outcome: classification,
+    outcomeSource: 'post-run-notify',
+    finishedAt,
+    exitCode,
+    legacyKey,
+    stdoutPath,
+    stderrPath,
+    startedAt: deriveStartedAtFromLegacyKey(legacyKey, ticket),
+  }
 
   let pool: MonitorDbExecutor | null = null
   let ownsPool = false
@@ -386,17 +447,22 @@ async function main(): Promise<void> {
   const classification = classifyPipelineResult(Number(exitCodeRaw), stdoutContent)
   log(`${ticket} classification=${classification} exitCode=${exitCodeRaw}`)
 
+  // stderrPath 用命名慣例（T11 固定 `{base}.stdout.log` / `{base}.stderr.log`
+  // 成對）推回來，不用多帶一個參數。提前到這裡計算（原本在 checkPushMismatch
+  // 呼叫前才算）：下面 writeAuthoritativeOutcome 也需要它（2026-09-03 根因
+  // 修復，見該函式檔頭註解）。
+  const stderrPath = stdoutPath.replace(/\.stdout\.log$/, '.stderr.log')
+
   // 【plan-db-as-truth-v3.2.md §9 Phase2】權威終態寫入：不管要不要補發 TG
   // 通知都要寫（跟下面的 NEEDS_NOTIFY 分支完全獨立），這是每一輪 run 的
   // 監控 DB 生命週期收尾，不是「需要通知」才做的事。獨立包一層 try/catch：
   // 這裡失敗不能連坐擋掉下面既有的通知邏輯（該保證從遷移前就存在）。
   try {
-    await writeAuthoritativeOutcome(ticket, classification, Number(exitCodeRaw))
+    await writeAuthoritativeOutcome(ticket, classification, Number(exitCodeRaw), stdoutPath, stderrPath)
   } catch (err) {
     log(`${ticket} writeAuthoritativeOutcome 例外（不影響既有通知邏輯）: ${err}`)
   }
 
-  const stderrPath = stdoutPath.replace(/\.stdout\.log$/, '.stderr.log')
   checkPushMismatch(ticket, classification, stdoutPath, stderrPath)
 
   if (!shouldNotify(classification)) return
