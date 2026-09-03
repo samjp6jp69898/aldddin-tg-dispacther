@@ -33,12 +33,18 @@
 // 第一條就是最舊的**——只需要解析開頭幾行，不需要 parse 整個檔案。開頭若剛好
 // 是壞行，往後最多再看 `MAX_TS_PROBE_LINES` 行；都取不到就這一檔回 null
 // （「不知道」，不是「沒有」）。
-// **已知界線**：ts 只在未 ack 區開頭 `HEAD_SCAN_BYTES`（64KB）內探測。若未 ack
-// 區的第一條條目本身就超過 64KB（正常條目約 112 bytes，實務上不會發生——超大的
-// stdout 行走 VictoriaLogs，不進 spool），`oldestTs` 回 **null＝不知道**，
-// 而不是退而回報後面某條的 ts。這是刻意的：回後面那條會**低報**積壓年齡，
-// 讓 §6.8(b) 的 15 分鐘門檻在最該觸發時失效；回 null 只是讓該檔不參與年齡判定，
-// 深度那一半仍然完整計數。
+// **已知界線**：ts 只在未 ack 區開頭 `UNACKED_WINDOW_SCAN_BYTES`（64KB）內探測。
+// 若未 ack 區的第一條條目本身就超過 64KB（正常條目約 112 bytes，實務上不會
+// 發生——超大的 stdout 行走 VictoriaLogs，不進 spool），`oldestTs` 回
+// **null＝不知道**，而不是退而回報後面某條的 ts。這是刻意的：回後面那條會
+// **低報**積壓年齡，讓 §6.8(b) 的 15 分鐘門檻在最該觸發時失效；回 null 只是
+// 讓該檔不參與年齡判定，深度那一半仍然完整計數。
+// **命名勘誤（closeout §6 殘留項，2026-09-03 正名；語意本來就正確，覆核已
+// 證實，見 phase4-healthmon-review.md #8）**：這個常數與下面的
+// `firstTsFromUnackedWindow` 舊名分別是 `HEAD_SCAN_BYTES`／
+// `firstTsFromHead`，「頭」指的從來都是**未 ack 區的開頭**（`start = acked_
+// bytes` 起算，見 `measureFile()`），不是檔案實際的檔頭——舊名容易讓後續
+// 維護者誤改成真的去讀檔案開頭（那才會變成真正的語意錯誤），故正名。
 
 import { closeSync, existsSync, fstatSync, openSync, readSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
@@ -49,10 +55,11 @@ import { SPOOL_DIR, isSpoolDataFileName } from './types.ts'
  * 一次把整檔讀進記憶體。 */
 const READ_CHUNK_BYTES = 1 << 20
 
-/** 為了取 `oldestTs` 而保留的檔頭位元組數（只用來解析前幾行，不影響計數）。 */
-const HEAD_SCAN_BYTES = 64 * 1024
+/** 為了取 `oldestTs` 而保留的「未 ack 區開頭」位元組數（只用來解析前幾行，
+ * 不影響計數；不是檔案實際的檔頭，見上方命名勘誤說明）。 */
+const UNACKED_WINDOW_SCAN_BYTES = 64 * 1024
 
-/** 檔頭最多試解析幾行來取 `ts`（第一行是壞行時的退路）。 */
+/** 未 ack 區開頭最多試解析幾行來取 `ts`（第一行是壞行時的退路）。 */
 const MAX_TS_PROBE_LINES = 5
 
 export interface SpoolFileDepth {
@@ -86,20 +93,21 @@ function emptyStats(): SpoolDepthStats {
   return { depth: 0, oldestTs: null, files: 0, unackedBytes: 0, unreadableFiles: 0, perFile: [] }
 }
 
-/** 從檔頭緩衝裡取最多 MAX_TS_PROBE_LINES 條完整行，回傳第一個解析得出的 `ts`。 */
-function firstTsFromHead(head: Buffer): string | null {
+/** 從「未 ack 區開頭」緩衝裡取最多 MAX_TS_PROBE_LINES 條完整行，回傳第一個
+ * 解析得出的 `ts`。 */
+function firstTsFromUnackedWindow(window: Buffer): string | null {
   let pos = 0
   for (let i = 0; i < MAX_TS_PROBE_LINES; i++) {
-    const nl = head.indexOf(0x0a, pos)
+    const nl = window.indexOf(0x0a, pos)
     if (nl === -1) return null
-    const line = head.subarray(pos, nl).toString('utf8')
+    const line = window.subarray(pos, nl).toString('utf8')
     pos = nl + 1
     if (line.length === 0) continue
     try {
       const ts = (JSON.parse(line) as { ts?: unknown }).ts
       if (typeof ts === 'string' && ts.length > 0) return ts
     } catch {
-      // 壞行：往下一行試（見檔頭說明）。
+      // 壞行：往下一行試（見未 ack 區開頭掃描窗說明）。
     }
   }
   return null
@@ -131,8 +139,8 @@ function measureFile(filePath: string): SpoolFileDepth | null {
     // 那個方向是**反保守**的，也與 replayer.ts:98-100 的判準分歧——本檔宣稱
     // 「與 replayer 同判準」，就不能在分塊邊界上偷偷少算。
     let lineStartAbs = start
-    const headParts: Buffer[] = []
-    let headBytes = 0
+    const windowParts: Buffer[] = []
+    let windowBytes = 0
     const buf = Buffer.allocUnsafe(READ_CHUNK_BYTES)
 
     while (pos < size) {
@@ -142,10 +150,10 @@ function measureFile(filePath: string): SpoolFileDepth | null {
       const chunkStart = pos
       const chunk = buf.subarray(0, n)
 
-      if (headBytes < HEAD_SCAN_BYTES) {
-        const take = chunk.subarray(0, Math.min(chunk.length, HEAD_SCAN_BYTES - headBytes))
-        headParts.push(Buffer.from(take))
-        headBytes += take.length
+      if (windowBytes < UNACKED_WINDOW_SCAN_BYTES) {
+        const take = chunk.subarray(0, Math.min(chunk.length, UNACKED_WINDOW_SCAN_BYTES - windowBytes))
+        windowParts.push(Buffer.from(take))
+        windowBytes += take.length
       }
 
       let idx = 0
@@ -164,7 +172,7 @@ function measureFile(filePath: string): SpoolFileDepth | null {
     return {
       file: filePath,
       depth,
-      oldestTs: depth > 0 ? firstTsFromHead(Buffer.concat(headParts)) : null,
+      oldestTs: depth > 0 ? firstTsFromUnackedWindow(Buffer.concat(windowParts)) : null,
       unackedBytes: lastNewlineAbs >= 0 ? lastNewlineAbs + 1 - start : 0,
       cursorFallback,
     }
