@@ -51,6 +51,8 @@ import { startMonitorMaintenance, runRestartSweep } from './lib/monitor-db/maint
 import { declareMonitorRole, isMonitorDbEnabled } from './lib/monitor-db/env.ts'
 import { startMonitorCollectors } from './lib/monitor-db/collectors/index.ts'
 import { getLastHeartbeatResult, startMonitorHeartbeat } from './lib/monitor-db/heartbeat.ts'
+import { startLogShipperLoop, listDispatcherLogFiles } from './lib/log-shipper/mount.ts'
+import { createClusterSink } from './lib/log-shipper/cluster-sink.ts'
 import { readSpoolDepth } from './lib/monitor-db/spool/depth.ts'
 import type { SubmitResult } from './lib/pipeline-runner/pipeline-queue.ts'
 import type { TechUser } from './lib/user-resolution/tech-user.ts'
@@ -225,6 +227,23 @@ startMonitorCollectors({ role: 'mon_exec' })
 // （writer='worker-agent'，PK 是 (host, writer)，每台 worker 自己一列）。
 // 失敗只 WARN + 落 spool；isMonitorDbEnabled()=false 時整段 no-op。
 startMonitorHeartbeat({ writer: 'worker-agent' })
+
+// 【plan §7.2/§7.4，Phase 7 整合】worker 端的 log shipping 常駐迴圈。
+// library（lib/log-shipper/shipper.ts）2026-09-02 就完成了，但在此之前**沒有
+// 任何行程呼叫過 runOneCycle()**——VictoriaLogs 一直沒有新資料，那不是驗證
+// 缺口而是整合工項從未開始，2026-09-03 補上。head 那一份掛在 intake-server.ts。
+//
+// sink 走 cluster-sink → head 的 9429（經 SSH tunnel 的 127.0.0.1:9429，
+// 與監控 DB 的 3307 同一條隧道，doctor-worker 的「監控 DB」節就在驗這兩個埠）。
+// 不直寫 VictoriaLogs：worker 上沒有 MON_VL_* 憑證，而且 §3.3(e) 的 host 覆寫
+// 與 LRU 去重都在 intake 那一側，繞過它等於繞過那兩層。
+startLogShipperLoop({
+  label: 'worker-agent',
+  listSourceFiles: listDispatcherLogFiles,
+  // 直接用模組層那個已收斂成 string 的 `secret`：本行程在 :63 就對缺 secret
+  // 拒絕啟動了，這裡再檢查一次是永遠不會成立的死碼。
+  createSink: () => createClusterSink({ worker: workerName, clusterSecret: secret }),
+})
 
 // 【plan-db-as-truth-v3.2.md MJ-E4 ＝ MAJOR-F6，§6.8(e)】每 60 秒把本機的監控
 // 自況主動回報給 head（head 存記憶體，由它的 health-monitor 判斷告警）。

@@ -10,11 +10,11 @@
 // §3.3(e) 的 host 覆寫）。
 //
 // 範圍聲明（誠實記錄，不在本檔內、留給後續工項）：
-// - worker 端實際的檔案 tailing + 遮罩（lib/log-shipper/redaction.ts）+
-//   常駐 shipper 迴圈**不在本檔**——那是 worker-agent.ts 的工項，且遮罩模組
-//   （§7.3 的 11 條 regex）尚未存在。派工 prompt 明訂「若計畫歸 Phase 7 就
-//   只留介面不實作」，本輪判斷：完整遮罩規則需要獨立驗證（L1/L2 兩層關門
-//   條件），不應由本檔憑空杜撰，留待該模組就位後再串接。
+// - worker 端實際的檔案 tailing + 遮罩 + 常駐 shipper 迴圈不在本檔——那是
+//   worker-agent.ts 的工項。**（2026-09-03 更新：redaction.ts 已就位，worker
+//   端迴圈也已於 worker-agent.ts 掛載；本檔則在檔尾掛上 head 自己的那一份。
+//   兩邊共用 mount.ts，差別只有 sink：head 直寫 VictoriaLogs，worker 經
+//   cluster-sink 走 9429 到這裡。）**
 // - §7.3 明訂「head 端不再信任 worker 已遮罩、再套一次」——這一步依賴同一支
 //   尚不存在的 redaction.ts，本檔目前**未對收到的內容做二次遮罩**，是已知
 //   缺口，不是遺漏，見下方 forwardToVictoriaLogs 的註解。
@@ -29,6 +29,8 @@ import { createWorkerRegistry } from '../cluster/worker-registry.ts'
 import { respondUniform401 } from '../security/uniform-401.ts'
 import { declareMonitorRole, MON_HOST } from '../monitor-db/env.ts'
 import { startMonitorHeartbeat } from '../monitor-db/heartbeat.ts'
+import { startLogShipperLoop, listDispatcherLogFiles } from './mount.ts'
+import { createVLDirectSink } from './vl-sink.ts'
 
 // 【183bf5a 同原則，總指揮 2026-09-02 裁定】進入點顯式宣告角色：本行程是
 // head only 的 log intake，MON_HOST 必須釘死 'head'，不得依賴環境嗅探——
@@ -404,6 +406,31 @@ app.all('*', c => respondUniform401(c))
 // 失敗處置（只 WARN + 落 spool，絕不影響本行程）全部封在 heartbeat.ts 內；
 // isMonitorDbEnabled()=false 時整段 no-op。本檔僅此一處改動。
 startMonitorHeartbeat({ writer: 'log-intake' })
+
+// 【plan §7.2/§7.4，Phase 7 整合】head 端的 log shipping 常駐迴圈。
+// library（shipper.ts）2026-09-02 就完成了，但在此之前**沒有任何行程呼叫過
+// runOneCycle()**——VictoriaLogs 因此一直沒有新資料進來。那不是驗證缺口，
+// 是整合工項從未開始，2026-09-03 由本次補上。
+//
+// 掛在 log-intake 而不是 server.ts：本行程就是 head 的 log 專責行程，
+// 而且它已經持有 MON_VL_* 三個環境變數（run-log-intake.sh 的匯出白名單），
+// server.ts 沒有。head 直寫 9428 不繞自己的 9429——同一行程內 HTTP 迴圈一趟
+// 只是多一個可壞的環節，去重與 host 覆寫對 head 自己的檔案也不需要。
+startLogShipperLoop({
+  label: 'log-intake',
+  listSourceFiles: listDispatcherLogFiles,
+  createSink: () => {
+    const vlUrl = (process.env.MON_VL_URL ?? '').trim()
+    const vlUser = process.env.MON_VL_USER ?? ''
+    const vlPassword = process.env.MON_VL_PASSWORD ?? ''
+    if (!vlUrl || !vlUser || !vlPassword) {
+      // 出聲再放棄：靜靜不啟動就是一個沒有觀察者的失敗。
+      console.error('log-intake: MON_VL_URL/MON_VL_USER/MON_VL_PASSWORD 未設定，log-shipper 不啟動')
+      return null
+    }
+    return createVLDirectSink({ vlUrl, vlUser, vlPassword })
+  },
+})
 
 export default {
   fetch: app.fetch,
