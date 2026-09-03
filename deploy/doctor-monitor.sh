@@ -204,6 +204,18 @@ if [ -n "$WORKER_NAME_IN_HEAD_ENV" ]; then
 else
   ok "head 的 .env 沒有殘留 CLUSTER_WORKER_NAME"
 fi
+# 2026-09-03 補：doctor-worker.sh:163-164 對 worker 端有對稱檢查
+# （MON_DB_USER 必須恆等於 mon_exec），head 這邊原本沒有——loadMonitorEnv()
+# 的 expectedRole 同步檢查（env.ts）本來就會在角色/帳號不符時擋下連線，這裡
+# 只是把這個事實提前變成一條可主動示警的 doctor 檢查項目。
+MON_DB_USER_IN_HEAD_ENV=$(grep '^MON_DB_USER=' "$ENV_FILE" | cut -d= -f2- | tr -d '\r\n')
+if [ -z "$MON_DB_USER_IN_HEAD_ENV" ]; then
+  err "head 的 .env 找不到 MON_DB_USER（無法確認角色帳號）"
+elif [ "$MON_DB_USER_IN_HEAD_ENV" = "mon_head" ]; then
+  ok "head 的 .env 的 MON_DB_USER=mon_head"
+else
+  err "head 的 .env 的 MON_DB_USER='$MON_DB_USER_IN_HEAD_ENV'（head 必須恆等於 mon_head，否則 loadMonitorEnv 的 expectedRole 檢查會擋下連線；對稱於 doctor-worker.sh:163-164）"
+fi
 if grep -q "declareMonitorRole('mon_head')" "$DISPATCHER/server.ts"; then
   ok "server.ts 已顯式宣告角色 mon_head（不再嗅探 CLUSTER_WORKER_NAME）"
 else

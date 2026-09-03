@@ -9,10 +9,11 @@
 //     不是拿 sleep 去湊出某個非時間性條件）
 //   - flag 關閉（MON_DB_ENABLED 未設）時，短命行程公開函式必須零副作用
 //     （不丟例外、呼叫端可放心 await）
-import { describe, expect, test, afterEach } from 'bun:test'
+import { describe, expect, spyOn, test, afterEach } from 'bun:test'
 import { FakeRunsDb } from '../monitor-db/test-support/fake-runs-db.ts'
 import { W1_SQL } from '../monitor-db/writes.ts'
 import { mintRunId, readInheritedRunId, tryWriteOrSpool, writeDemandOutcomeAuthoritative } from './demand-monitor-writes.ts'
+import { __resetDeclaredMonitorRoleForTest } from '../monitor-db/env.ts'
 import type { SpoolEntry } from '../monitor-db/spool/types.ts'
 
 const ORIGINAL_MON_RUN_ID = process.env.MON_RUN_ID
@@ -158,5 +159,46 @@ describe('flag 關閉（MON_DB_ENABLED 未設）→ 公開函式零副作用', (
         { writerName: 'cli' },
       ),
     ).resolves.toBeUndefined()
+  })
+})
+
+// 2026-09-03 回歸測試：本檔的兩個實際呼叫端（post-run-demand.ts 的 trap 側、
+// run-demand-pipeline.ts 的 finalize()）都固定只在 head 機器上跑，
+// writeDemandOutcomeAuthoritative 現已在最早執行點顯式宣告 declareMonitorRole
+// ('mon_head')（見本檔該函式），之後角色判斷不再嗅探 CLUSTER_WORKER_NAME。
+describe('writeDemandOutcomeAuthoritative — 顯式宣告角色，不再嗅探 CLUSTER_WORKER_NAME', () => {
+  test('即使 CLUSTER_WORKER_NAME 被汙染成非空字串，角色判斷仍固定回報 mon_head', async () => {
+    const prevEnabled = process.env.MON_DB_ENABLED
+    const prevUser = process.env.MON_DB_USER
+    const prevWorker = process.env.CLUSTER_WORKER_NAME
+    __resetDeclaredMonitorRoleForTest()
+    process.env.MON_DB_ENABLED = '1'
+    process.env.CLUSTER_WORKER_NAME = 'polluted-worker-name' // 模擬環境變數污染（舊嗅探邏輯會誤判成 worker）
+    // 故意設成跟 mon_head、mon_exec 都不符的值：不管角色實際解析成哪一個，
+    // loadMonitorEnv 的 expectedRole 同步檢查都會拋出「角色不符」，訊息裡的
+    // expectedRole 就是這裡真正拿到的角色——用這個間接訊號驗證，不需要真的
+    // 連線，也不會意外寫真的 spool 檔（同步拋出發生在 spool 建立之前）。
+    process.env.MON_DB_USER = 'not-a-real-monitor-role'
+    const errorSpy = spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      await expect(
+        writeDemandOutcomeAuthoritative(
+          { runId: 'run-role-check', ticket: 'ALDREQ-9001', outcome: 'timeout', outcomeSource: 'test', finishedAt: new Date().toISOString() },
+          { writerName: 'cli' },
+        ),
+      ).resolves.toBeUndefined() // 全程 best-effort：即使角色宣告/連線建立失敗也不拋出
+      const loggedMessages = errorSpy.mock.calls.map(args => String(args[0]))
+      expect(loggedMessages.some(m => m.includes("要求 'mon_head'"))).toBe(true)
+      expect(loggedMessages.some(m => m.includes("要求 'mon_exec'"))).toBe(false)
+    } finally {
+      errorSpy.mockRestore()
+      if (prevEnabled === undefined) delete process.env.MON_DB_ENABLED
+      else process.env.MON_DB_ENABLED = prevEnabled
+      if (prevUser === undefined) delete process.env.MON_DB_USER
+      else process.env.MON_DB_USER = prevUser
+      if (prevWorker === undefined) delete process.env.CLUSTER_WORKER_NAME
+      else process.env.CLUSTER_WORKER_NAME = prevWorker
+      __resetDeclaredMonitorRoleForTest()
+    }
   })
 })

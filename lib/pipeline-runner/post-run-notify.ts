@@ -5,10 +5,10 @@ import { classifyPipelineResult, type Classification } from './classify-result.t
 import { getTicketNotionUrl, getTicketAiAnalysisStatus } from '../notion-integration/candidate-tickets.ts'
 import { notifyOperator } from '../notify/operator.ts'
 import { submitCreateMr } from './spawn-create-mr.ts'
-import { isMonitorDbEnabled, MON_HOST } from '../monitor-db/env.ts'
+import { declareMonitorRole, isMonitorDbEnabled, MON_HOST } from '../monitor-db/env.ts'
 import { writeRunOutcomeAuthoritative, type MonitorDbExecutor } from '../monitor-db/writes.ts'
 import { createSpoolWriter, type SpoolWriterHandle } from '../monitor-db/spool/writer.ts'
-import { SHORT_LIVED_WRITE_BUDGET_MS, closeLongLivedMonitorPool, tryWriteOrSpool } from '../monitor-db/runtime.ts'
+import { SHORT_LIVED_WRITE_BUDGET_MS, closeLongLivedMonitorPool, monitorRoleForThisHost, tryWriteOrSpool } from '../monitor-db/runtime.ts'
 import type { RunKind } from '../monitor-db/types.ts'
 
 const RESOLVE_REVIEWER_SH = '/Users/user/aladdin/scripts/resolve-reviewer.sh'
@@ -306,8 +306,7 @@ export async function writeAuthoritativeOutcome(
       pool = deps.pool ?? null
     } else {
       const { createMonitorPool } = await import('../monitor-db/pool.ts')
-      const isWorker = !!(process.env.CLUSTER_WORKER_NAME ?? '').trim()
-      pool = createMonitorPool(isWorker ? 'mon_exec' : 'mon_head', { connectionLimit: 1 })
+      pool = createMonitorPool(monitorRoleForThisHost(), { connectionLimit: 1 })
       ownsPool = true
     }
   } catch (err) {
@@ -468,6 +467,15 @@ function executeAutoRetry(ticket: string): void {
  * 任何錯誤處理）。
  */
 async function main(): Promise<void> {
+  // 2026-09-03 補（承 2026-09-02 熱修 183bf5a 明確留下的缺口：本檔當時未升級）：
+  // 本檔固定只在 head 機器上跑（bug pipeline 的 EXIT trap 短命 CLI，spawn 端
+  // 見 spawn-create-mr.ts，只在 head 常駐的 server.ts 觸發，worker 不會執行
+  // 這支 CLI），跟 server.ts/worker-agent.ts 一樣在最早執行處顯式宣告角色——
+  // 之後 writeAuthoritativeOutcome() 內的 monitorRoleForThisHost() 一律用宣告
+  // 值，不再嗅探 process.env.CLUSTER_WORKER_NAME（head .env 殘留這個變數時不
+  // 再誤判成 worker，見 env.ts declareMonitorRole 註解）。
+  declareMonitorRole('mon_head')
+
   const [ticket, exitCodeRaw, stdoutPath] = process.argv.slice(2)
   if (!ticket || !exitCodeRaw || !stdoutPath) {
     log(`參數不足，略過：${process.argv.slice(2).join(' ')}`)

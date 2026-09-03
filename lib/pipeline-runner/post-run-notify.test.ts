@@ -2,6 +2,7 @@ import { describe, expect, mock, test } from 'bun:test'
 import { unlinkSync, writeFileSync } from 'node:fs'
 import { checkPushMismatch, shouldNotify, parseRunningBugTickets, writeAuthoritativeOutcome } from './post-run-notify.ts'
 import { FakeRunsDb } from '../monitor-db/test-support/fake-runs-db.ts'
+import { __resetDeclaredMonitorRoleForTest, declareMonitorRole } from '../monitor-db/env.ts'
 import type { SpoolEntry } from '../monitor-db/spool/types.ts'
 
 const LOG_DIR = '/Users/user/aladdin/telegram-dispatcher/logs'
@@ -119,6 +120,50 @@ describe('writeAuthoritativeOutcome — v3.2 §9 Phase2 bug 終態（權威）�
       else process.env.MON_DB_USER = prevUser
       if (prevWorker === undefined) delete process.env.CLUSTER_WORKER_NAME
       else process.env.CLUSTER_WORKER_NAME = prevWorker
+    }
+  })
+
+  // 2026-09-03 回歸測試：main() 在最早執行處呼叫 declareMonitorRole('mon_head')
+  // 之後（見本檔 main()），writeAuthoritativeOutcome 內的角色判斷（現已改用
+  // monitorRoleForThisHost()）即使遇到 CLUSTER_WORKER_NAME 被汙染成非空字串，
+  // 也必須固定回報 mon_head，不能再被嗅探結果覆蓋——這裡直接呼叫
+  // declareMonitorRole('mon_head') 模擬 main() 的宣告時序，驗證的是
+  // writeAuthoritativeOutcome 實際會執行到的同一段程式碼路徑（跟上面
+  // 「createMonitorPool() 真的 throw」測試同一套手法：故意讓 MON_DB_USER 跟
+  // 「若角色被嗅探成 mon_exec」時會相符的值不一致，藉由 loadMonitorEnv 的
+  // expectedRole 同步檢查間接證明實際解析出的角色是 mon_head，不是 mon_exec
+  // ——若角色判斷退回嗅探（CLUSTER_WORKER_NAME 非空 → mon_exec），
+  // MON_DB_USER='mon_exec' 會通過角色比對、不觸發這個例外，落 spool 的行為
+  // 就不會發生，測試會失敗，藉此把「宣告優先於嗅探」的保證落到這支 CLI 的
+  // 實際程式碼路徑上，不只是 runtime.ts/env.ts 的通用單元測試）。
+  test('main() 已宣告 mon_head 後：即使 CLUSTER_WORKER_NAME 被汙染成非空字串，角色判斷仍固定回報 mon_head', async () => {
+    const prevRunId = process.env.MON_RUN_ID
+    const prevUser = process.env.MON_DB_USER
+    const prevWorker = process.env.CLUSTER_WORKER_NAME
+    __resetDeclaredMonitorRoleForTest()
+    process.env.MON_RUN_ID = '77777777-7777-7777-7777-777777777777'
+    process.env.CLUSTER_WORKER_NAME = 'polluted-worker-name' // 模擬環境變數污染
+    process.env.MON_DB_USER = 'mon_exec' // 若角色仍被嗅探成 mon_exec，這裡會「相符」、不觸發下面的例外
+    declareMonitorRole('mon_head') // 模擬 main() 在最早執行處已做過的宣告
+    try {
+      const fakeSpool = makeFakeSpool()
+      // 刻意只傳 deps.spool、不傳 deps.pool：函式真的執行
+      // createMonitorPool(monitorRoleForThisHost(), ...)，不是被測試繞過。
+      await writeAuthoritativeOutcome('FAQ-9008', 'timeout', 124, '/tmp/FAQ-9008.stdout.log', '/tmp/FAQ-9008.stderr.log', { spool: fakeSpool })
+      // 角色正確解析為 mon_head（跟 MON_DB_USER='mon_exec' 不符）→
+      // loadMonitorEnv 同步拋出「角色不符」→ 外層 catch 把 pool 留在 null →
+      // 落 spool。若角色錯誤解析成 mon_exec，這個 spool 條目就不會出現。
+      expect(fakeSpool.appended.length).toBe(1)
+      expect(fakeSpool.appended[0]!.run_id).toBe('77777777-7777-7777-7777-777777777777')
+      expect(fakeSpool.appended[0]!.fn).toBe('writeRunOutcomeAuthoritative')
+    } finally {
+      if (prevRunId === undefined) delete process.env.MON_RUN_ID
+      else process.env.MON_RUN_ID = prevRunId
+      if (prevUser === undefined) delete process.env.MON_DB_USER
+      else process.env.MON_DB_USER = prevUser
+      if (prevWorker === undefined) delete process.env.CLUSTER_WORKER_NAME
+      else process.env.CLUSTER_WORKER_NAME = prevWorker
+      __resetDeclaredMonitorRoleForTest()
     }
   })
 
