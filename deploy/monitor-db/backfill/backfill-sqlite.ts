@@ -105,6 +105,16 @@ export interface SqliteAgentRun {
   stage: string
   started_at: string
   ended_at: string | null
+  model: string | null
+  input_tokens: number | null
+  output_tokens: number | null
+  cache_read_tokens: number | null
+  cache_create_tokens: number | null
+  cost_usd: number | null
+  num_turns: number | null
+  tool_calls: number | null
+  is_error: number | null
+  result_preview: string | null
 }
 
 export interface SqliteEvent {
@@ -155,6 +165,16 @@ export interface AgentRunsInsertRow {
   agent_name: string | null
   started_at: string | null
   finished_at: string | null
+  model: string | null
+  input_tokens: number | null
+  output_tokens: number | null
+  cache_read_tokens: number | null
+  cache_create_tokens: number | null
+  cost_usd: number | null
+  num_turns: number | null
+  tool_calls: number | null
+  is_error: number | null
+  result_preview: string | null
 }
 
 export interface McpUsageInsertRow {
@@ -177,8 +197,20 @@ export interface ServiceStatusLogInsertRow {
 // mapping：pipeline_runs → runs（§11.2）
 // ─────────────────────────────────────────────────────────────────────────
 
-/** outcome 原值直接沿用（原字串本身就是合法終態）的集合。 */
-const DIRECT_OUTCOMES = new Set(['success', 'failed', 'timeout', 'needs_qa_clarification'])
+/**
+ * outcome 原值直接沿用（原字串本身就是合法終態）的集合。
+ *
+ * 以 `KNOWN_OUTCOME_TIER`（本專案唯一權威值域）為準動態導出，不再另外手抄一份子集——
+ * 原本手抄的四個值（success/failed/timeout/needs_qa_clarification）漏收
+ * `KNOWN_OUTCOME_TIER` 早就承認的其餘合法值（如 cancelled），造成兩處值域定義不同步，
+ * 已知合法值被誤判成 legacy_unmapped（aladdin-1d-D84 附帶發現，2026-09-03）。
+ * `recovered`／`legacy_unmapped`／`unknown_failure` 三者在本函式另有專屬分支（分別對應
+ * tracker reconcile 標記、回填 fallback 輸出值本身、'' 或 null 的特判），不可再被此集合
+ * 直接收錄，否則會繞過各自的專屬處理邏輯。
+ */
+const DIRECT_OUTCOMES = new Set(
+  Object.keys(KNOWN_OUTCOME_TIER).filter((o) => !['recovered', 'legacy_unmapped', 'unknown_failure'].includes(o)),
+)
 
 export interface TimeoutRecompute {
   /** 原 finished_at（可能為 null）與重算值的差（秒）；原值 null 時為 null（無法比較）。 */
@@ -322,6 +354,16 @@ export function buildAgentRunMapper(
       agent_name: agent.stage,
       started_at: isoToMysqlDatetime3OrNull(agent.started_at),
       finished_at: isoToMysqlDatetime3OrNull(agent.ended_at),
+      model: agent.model,
+      input_tokens: agent.input_tokens,
+      output_tokens: agent.output_tokens,
+      cache_read_tokens: agent.cache_read_tokens,
+      cache_create_tokens: agent.cache_create_tokens,
+      cost_usd: agent.cost_usd,
+      num_turns: agent.num_turns,
+      tool_calls: agent.tool_calls,
+      is_error: agent.is_error,
+      result_preview: agent.result_preview,
     }
   }
 
@@ -359,20 +401,17 @@ export function buildAgentRunMapper(
   }
 }
 
-/** schema 無對應欄位、回填時丟棄的 sqlite agent_runs 欄位清單（notes 用）。 */
-export const AGENT_RUNS_DROPPED_COLUMNS = [
-  'model',
-  'input_tokens',
-  'output_tokens',
-  'cache_read_tokens',
-  'cache_create_tokens',
-  'cost_usd',
-  'num_turns',
-  'tool_calls',
-  'is_error',
-  'result_preview',
-  'file_mtime',
-] as const
+/**
+ * schema 無對應欄位、回填時丟棄的 sqlite agent_runs 欄位清單（notes 用）。
+ *
+ * 2026-09-03 訂正（aladdin-1d-D84 附帶發現）：原清單把 model/input_tokens/output_tokens/
+ * cache_read_tokens/cache_create_tokens/cost_usd/num_turns/tool_calls/is_error/
+ * result_preview 十欄都列為「無對應欄位」，但 `DESC pipeline_monitor.agent_runs`
+ * 實查這十欄全部都在——前提是錯的，已改為 `buildRow()` 逐欄映射。
+ * `file_mtime` 是 sqlite 側檔案 mtime（回填離線 CLI 私有狀態，供判斷是否需要重新解析
+ * 用），mysql `agent_runs` 確實無對應欄位，是唯一真正該丟棄的。
+ */
+export const AGENT_RUNS_DROPPED_COLUMNS = ['file_mtime'] as const
 
 // ─────────────────────────────────────────────────────────────────────────
 // mapping：events → mcp_usage、status_log → service_status_log（純映射，無 skip）
@@ -454,8 +493,16 @@ async function writeAgentRunsRow(pool: Pool, row: AgentRunsInsertRow): Promise<b
   return insertIgnoreRow(
     pool,
     'agent_runs',
-    ['run_id', 'path', 'host', 'agent_name', 'started_at', 'finished_at'],
-    [row.run_id, row.path, row.host, row.agent_name, row.started_at, row.finished_at],
+    [
+      'run_id', 'path', 'host', 'agent_name', 'started_at', 'finished_at',
+      'model', 'input_tokens', 'output_tokens', 'cache_read_tokens', 'cache_create_tokens',
+      'cost_usd', 'num_turns', 'tool_calls', 'is_error', 'result_preview',
+    ],
+    [
+      row.run_id, row.path, row.host, row.agent_name, row.started_at, row.finished_at,
+      row.model, row.input_tokens, row.output_tokens, row.cache_read_tokens, row.cache_create_tokens,
+      row.cost_usd, row.num_turns, row.tool_calls, row.is_error, row.result_preview,
+    ],
   )
 }
 
@@ -507,7 +554,13 @@ export async function runBackfill(opts: RunBackfillOptions, deps: RunBackfillDep
          FROM pipeline_runs`,
       )
       .all() as SqlitePipelineRun[]
-    const agentRuns = db.query(`SELECT path, ticket, kind, stage, started_at, ended_at FROM agent_runs`).all() as SqliteAgentRun[]
+    const agentRuns = db
+      .query(
+        `SELECT path, ticket, kind, stage, started_at, ended_at, model, input_tokens, output_tokens,
+                cache_read_tokens, cache_create_tokens, cost_usd, num_turns, tool_calls, is_error, result_preview
+         FROM agent_runs`,
+      )
+      .all() as SqliteAgentRun[]
     const events = db.query(`SELECT service, ts, identity, source_ip, raw FROM events`).all() as SqliteEvent[]
     const statusLogs = db.query(`SELECT service, ts, status, pid, detail FROM status_log`).all() as SqliteStatusLog[]
 

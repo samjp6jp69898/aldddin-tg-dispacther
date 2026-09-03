@@ -257,6 +257,22 @@ describe('mapPipelineRunToRunsRow', () => {
     }
   })
 
+  test('aladdin-1d-D84：cancelled 等 KNOWN_OUTCOME_TIER 已承認的值直接沿用，不落入 legacy_unmapped', () => {
+    // 負面對照：這批值原本手抄的 DIRECT_OUTCOMES 只有 success/failed/timeout/
+    // needs_qa_clarification 四個，cancelled 等值會落到 else 分支變成 legacy_unmapped——
+    // 這條測試釘住修復後的行為，若有人把 DIRECT_OUTCOMES 改回手抄子集，這裡會紅。
+    for (const outcome of [
+      'cancelled', 'already_fixed', 'i18n', 'infra_failure', 'cli_failure',
+      'spawn_error', 'skipped', 'skipped_locked', 'skipped_expired', 'dispatched_to_worker',
+      'unknown_no_writer', 'unknown_reaped', 'lost_on_restart', 'unknown_dispatch_lost',
+    ]) {
+      const r = mapPipelineRunToRunsRow(pipelineRun({ outcome }))
+      expect(r.row!.outcome).toBe(outcome)
+      expect(r.row!.outcome_source).toBe('backfill')
+      expect(r.row!.legacy_outcome_raw).toBeNull()
+    }
+  })
+
   test('recovered：tier=2，source=tracker_reconcile（§11.2 指定）', () => {
     const r = mapPipelineRunToRunsRow(pipelineRun({ outcome: 'recovered' }))
     expect(r.row!.outcome).toBe('recovered')
@@ -391,6 +407,16 @@ describe('buildAgentRunMapper', () => {
       stage: 'repo-scope',
       started_at: '2026-08-21T05:00:00.000Z',
       ended_at: '2026-08-21T05:01:00.000Z',
+      model: null,
+      input_tokens: null,
+      output_tokens: null,
+      cache_read_tokens: null,
+      cache_create_tokens: null,
+      cost_usd: null,
+      num_turns: null,
+      tool_calls: null,
+      is_error: null,
+      result_preview: null,
       ...overrides,
     }
   }
@@ -403,6 +429,39 @@ describe('buildAgentRunMapper', () => {
     expect(r.row!.host).toBe('unknown_pre_migration')
     const direct = mapPipelineRunToRunsRow(bugRun)
     expect(r.row!.run_id).toBe(direct.row!.run_id)
+  })
+
+  test('aladdin-1d-D84：payload 十欄（model/tokens/cost_usd/num_turns/tool_calls/is_error/result_preview）逐欄映射，不再被當成無對應欄位丟棄', () => {
+    const map = buildAgentRunMapper([bugRun, demandEarly, demandLate])
+    const r = map(
+      agentRun({
+        path: bugRun.stdout_path!,
+        ticket: 'FAQ-1',
+        kind: 'bug',
+        stage: 'create-mr',
+        model: 'claude-opus-5, claude-sonnet-5',
+        input_tokens: 28,
+        output_tokens: 8097,
+        cache_read_tokens: 100,
+        cache_create_tokens: 5,
+        cost_usd: 18.7949349,
+        num_turns: 3,
+        tool_calls: 7,
+        is_error: 0,
+        result_preview: 'ok',
+      }),
+    )
+    expect(r.skip).toBe(false)
+    expect(r.row!.model).toBe('claude-opus-5, claude-sonnet-5')
+    expect(r.row!.input_tokens).toBe(28)
+    expect(r.row!.output_tokens).toBe(8097)
+    expect(r.row!.cache_read_tokens).toBe(100)
+    expect(r.row!.cache_create_tokens).toBe(5)
+    expect(r.row!.cost_usd).toBe(18.7949349)
+    expect(r.row!.num_turns).toBe(3)
+    expect(r.row!.tool_calls).toBe(7)
+    expect(r.row!.is_error).toBe(0)
+    expect(r.row!.result_preview).toBe('ok')
   })
 
   test('kind=bug：path 對不到任何 stdout_path → skip', () => {
