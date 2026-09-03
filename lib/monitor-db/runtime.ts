@@ -93,6 +93,43 @@ export function getLongLivedMonitorPool(): Promise<MonitorDbExecutor | null> {
   return monitorPoolPromise
 }
 
+/**
+ * 短命 CLI 的收尾（B-3，review-final-A-dispatcher.md）：本模組的 pool 單例
+ * 假設自己活在長駐行程，從不 `end()`——但 post-run-notify.ts（EXIT trap 裡的
+ * 一次性 CLI）的 timeout 自動重試路徑經 submitCreateMr → spawnCreateMrNow →
+ * dispatchMonitorWrite 會在**短命行程**裡建出這個單例，keep-alive 連線讓 bun
+ * 永不退出（實測 `timeout 12` → exit 124）→ wrapper EXIT trap 卡死 →
+ * spawnDetachedProcess 的 onExit 永不觸發 → 每次 timeout 永久洩漏一個併發
+ * 名額＋一個 active marker。任何短命行程若可能走到 dispatchMonitorWrite，
+ * 結束前必須 await 這支。
+ *
+ * 冪等、pool 從未建立時 no-op；只收長駐單例（monitorPoolPromise），不碰測試
+ * 注入的 override。`pool.end()` 會等使用中的連線把當前查詢跑完再關——與
+ * dispatchMonitorWrite 的 fire-and-forget 併發時，in-flight 寫入要嘛完成、
+ * 要嘛失敗落 spool，正確性不受影響（W 寫入皆冪等/守衛式＋spool 重放）。
+ */
+export async function closeLongLivedMonitorPool(): Promise<void> {
+  const promise = monitorPoolPromise
+  monitorPoolPromise = null
+  if (!promise) return
+  try {
+    const pool = await promise
+    const end = (pool as { end?: () => Promise<void> } | null)?.end
+    if (pool && typeof end === 'function') await end.call(pool)
+  } catch (err) {
+    // best-effort：關閉失敗只 WARN——呼叫端是短命 CLI 的最尾端，沒有比「記下
+    // 來」更好的處置；行程此時仍可能因 keep-alive 連線掛住，訊息要讓人查得到。
+    console.warn(`monitor-db: closeLongLivedMonitorPool 失敗（行程可能因 keep-alive 連線不退出）: ${err}`)
+  }
+}
+
+/** 測試專用：直接注入 monitorPoolPromise，讓 closeLongLivedMonitorPool 可以
+ * 對假 pool 驗證 end() 行為（正常路徑的單例建立要真的連 mysql2，單元測試
+ * 進不去）。 */
+export function __setMonitorPoolPromiseForTest(p: Promise<MonitorDbExecutor | null> | null): void {
+  monitorPoolPromise = p
+}
+
 export function getLongLivedMonitorSpoolWriter(): SpoolWriterHandle {
   if (monitorSpoolWriterOverride !== undefined) return monitorSpoolWriterOverride
   if (!monitorSpoolWriter) {

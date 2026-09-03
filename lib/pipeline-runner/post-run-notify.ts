@@ -8,7 +8,7 @@ import { submitCreateMr } from './spawn-create-mr.ts'
 import { isMonitorDbEnabled, MON_HOST } from '../monitor-db/env.ts'
 import { writeRunOutcomeAuthoritative, type MonitorDbExecutor } from '../monitor-db/writes.ts'
 import { createSpoolWriter, type SpoolWriterHandle } from '../monitor-db/spool/writer.ts'
-import { SHORT_LIVED_WRITE_BUDGET_MS, tryWriteOrSpool } from '../monitor-db/runtime.ts'
+import { SHORT_LIVED_WRITE_BUDGET_MS, closeLongLivedMonitorPool, tryWriteOrSpool } from '../monitor-db/runtime.ts'
 import type { RunKind } from '../monitor-db/types.ts'
 
 const RESOLVE_REVIEWER_SH = '/Users/user/aladdin/scripts/resolve-reviewer.sh'
@@ -457,9 +457,20 @@ async function main(): Promise<void> {
 }
 
 if (import.meta.main) {
-  main().catch(err => {
-    // main() 內部各段已各自 try/catch（best-effort 紀律，見檔頭註解），這裡
-    // 只是最後一道安全網，避免萬一有漏接的例外變成 unhandled rejection。
-    console.error(`post-run-notify: main() 未預期例外: ${err}`)
-  })
+  main()
+    .catch(err => {
+      // main() 內部各段已各自 try/catch（best-effort 紀律，見檔頭註解），這裡
+      // 只是最後一道安全網，避免萬一有漏接的例外變成 unhandled rejection。
+      console.error(`post-run-notify: main() 未預期例外: ${err}`)
+    })
+    .finally(() => {
+      // B-3（review-final-A-dispatcher.md）：timeout 自動重試路徑
+      // （executeAutoRetry → submitCreateMr → spawnCreateMrNow →
+      // dispatchMonitorWrite）會在本 CLI 行程建立 runtime.ts 的長駐 pool 單例，
+      // keep-alive 連線讓 bun 永不退出 → wrapper EXIT trap 卡死 → onExit 永不
+      // 觸發 → 每次 timeout 永久洩漏一個併發名額＋active marker。這裡是本
+      // 行程唯一的出口，無條件收掉那個單例（從未建立時 no-op）。
+      // writeAuthoritativeOutcome 自建自關的短命 pool 不在此列（那段本來就沒問題）。
+      void closeLongLivedMonitorPool().catch(() => {})
+    })
 }
