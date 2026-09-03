@@ -29,7 +29,7 @@ const MAIN_REPOS = ['agrabah', 'abu', 'lago', 'rajah'] as const
 // 跑 git status --short 健檢，一旦有非預期變更立刻記進 log 並在結果裡標記
 // 需要人工介入（見 checkMainReposUntouched）。
 const READONLY_TOOLS = 'Bash,Read,Grep,Glob'
-const AGENT_TIMEOUT_MS = 15 * 60 * 1000 // draft/review/synthesize 各自單輪對話（含多次工具呼叫），15 分鐘足夠，遠低於整條 pipeline 的外層 timeout
+const AGENT_TIMEOUT_MS = 50 * 60 * 1000 // draft/review/synthesize 各自單輪對話（含多次工具呼叫）；ALDREQ-818 實測 15 分鐘不夠（draft agent 900 秒整被 SIGTERM 砍掉，killed:true），改 50 分鐘，仍遠低於整條 pipeline 的外層 timeout（10800 秒）
 const CLASSIFY_TIMEOUT_MS = 60_000 // 零工具、純文字分類，比照 T34/T36 gate 的既有時間量級
 
 function log(msg: string): void {
