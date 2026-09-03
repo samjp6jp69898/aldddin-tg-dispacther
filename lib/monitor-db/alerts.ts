@@ -59,6 +59,7 @@ import type { RowDataPacket } from 'mysql2/promise'
 import { listWorkerMonitorStatuses, type WorkerMonitorStatus } from '../cluster/worker-monitor-status.ts'
 import { getMonitorCounter } from './counters.ts'
 import { withMonitorDeadline } from './deadline.ts'
+import { mysqlDatetimeToIsoOrNull } from './mysql-datetime.ts'
 import { getLongLivedMonitorPool } from './runtime.ts'
 import { readSpoolDepth } from './spool/depth.ts'
 import type { MonitorHeartbeatWriter } from './types.ts'
@@ -170,7 +171,18 @@ export interface MonitorAlertDeps {
 
 function tsToMs(ts: string | Date | null): number | null {
   if (ts === null || ts === undefined) return null
-  const ms = ts instanceof Date ? ts.getTime() : Date.parse(ts)
+  if (ts instanceof Date) {
+    const ms = ts.getTime()
+    return Number.isFinite(ms) ? ms : null
+  }
+  // B-1（review-final-A-dispatcher.md）：pool 是 dateStrings，DATETIME 欄讀出
+  // 的是 `'YYYY-MM-DD HH:MM:SS.mmm'`（無 `T`/`Z`）——這個 production 唯一會
+  // 出現的格式直接餵 `Date.parse()` 會按本機時區解析，Asia/Taipei 上每筆心跳
+  // 都「落後 481 分鐘」→ (a)(d) 開機即 tripped 且永不翻轉＝偵測器失明。值本身
+  // 是 UTC（pool `timezone:'Z'`），先正規化成 ISO 再解析；非 DB 形狀的輸入
+  // （spool oldestTs 等 ISO 字串）原樣通過。
+  const iso = mysqlDatetimeToIsoOrNull(ts)
+  const ms = Date.parse(iso ?? ts)
   return Number.isFinite(ms) ? ms : null
 }
 

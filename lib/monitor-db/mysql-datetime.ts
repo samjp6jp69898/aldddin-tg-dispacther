@@ -41,3 +41,15 @@ export function mysqlDatetimeToIso(value: string): string {
 export function isoToMysqlDatetime3OrNull(iso: string | null | undefined): string | null {
   return iso == null ? null : isoToMysqlDatetime3(iso)
 }
+
+/**
+ * 寬容版：形狀像 MySQL DATETIME 字面字串（`dateStrings` 讀出的原生格式，無
+ * 時區標記）就轉 ISO，否則回 null——供「輸入可能是 DB 讀出值、也可能已經是
+ * ISO」的消費端（如 alerts.ts tsToMs）在解析前正規化。存在的理由（B-1）：
+ * 這個格式餵給 `Date.parse()` 會被按**本機時區**解析，Asia/Taipei 上每個 UTC
+ * 時戳都偏移 8 小時——凡讀 DATETIME 欄餵時間運算，必須先走這裡（或
+ * `mysqlDatetimeToIso`），不得直接 `Date.parse` / `new Date(字串)`。
+ */
+export function mysqlDatetimeToIsoOrNull(value: string): string | null {
+  return MYSQL_DATETIME_RE.test(value.trim()) ? mysqlDatetimeToIso(value) : null
+}

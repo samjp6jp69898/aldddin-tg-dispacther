@@ -116,6 +116,61 @@ describe('(a) head 三個行程的心跳', () => {
     )
     expect(byKey(alerts, 'monitor-db:head-heartbeat:server')!.tripped).toBe(true)
   })
+
+  // ── B-1 迴歸（review-final-A-dispatcher.md）：production 唯一會出現的格式 ──
+  //
+  // pool 是 dateStrings，DATETIME 讀出的是 `'YYYY-MM-DD HH:MM:SS.mmm'`——無
+  // `T`、無 `Z`。這個 bug 活下來有**兩個**原因，缺一不可地都要在這裡堵上：
+  //   1. 本檔 fixture 全用 toISOString()，production 格式一次都沒被行使過；
+  //   2. `bun test` 把行程 TZ 正規化成 UTC（本輪實測 getTimezoneOffset()=0，
+  //      plain bun 為 -480）——在 UTC 下「按本機時區解析」恰好等於正確答案，
+  //      即使 fixture 用了原生格式，未修版也測不紅。production 是 launchd 起的
+  //      plain bun、跑在 Asia/Taipei，兩邊行為不同。
+  // 因此以下兩條**顯式設 TZ=Asia/Taipei**（Bun 支援 runtime 改 TZ，本輪實測
+  // 同字串兩種 TZ 差恰 8h）再評估、結束即還原；未修版在這裡必翻紅。
+  function mysqlTs(msAgo: number): string {
+    // `'2026-09-02T11:59:59.000Z'` → `'2026-09-02 11:59:59.000'`（dateStrings 原樣）
+    return iso(msAgo).replace('T', ' ').replace('Z', '')
+  }
+
+  async function withTaipeiTz<T>(fn: () => Promise<T>): Promise<T> {
+    const orig = process.env.TZ
+    process.env.TZ = 'Asia/Taipei'
+    try {
+      return await fn()
+    } finally {
+      if (orig === undefined) delete process.env.TZ
+      else process.env.TZ = orig
+    }
+  }
+
+  test('B-1：ts 是 mysql2 dateStrings 原生格式（無 T/Z）且新鮮，在 TZ=Asia/Taipei 下 → 不 tripped（未修版誤判落後 8 小時）', async () => {
+    const alerts = await withTaipeiTz(() =>
+      evaluateMonitorDbAlerts(
+        healthyDeps({
+          readHeartbeats: async () => [
+            { host: 'head', writer: 'server', ts: mysqlTs(1000) },
+            { host: 'head', writer: 'tg-monitor', ts: mysqlTs(1000) },
+            { host: 'head', writer: 'log-intake', ts: mysqlTs(1000) },
+            { host: 'w1', writer: 'worker-agent', ts: mysqlTs(1000) },
+          ],
+        }),
+      ),
+    )
+    expect(byKey(alerts, 'monitor-db:head-heartbeat:server')!.tripped).toBe(false)
+    expect(byKey(alerts, 'monitor-db:head-heartbeat:tg-monitor')!.tripped).toBe(false)
+    expect(byKey(alerts, 'monitor-db:head-heartbeat:log-intake')!.tripped).toBe(false)
+    expect(byKey(alerts, 'monitor-db:worker-heartbeat:w1')!.tripped).toBe(false)
+  })
+
+  test('B-1：mysql 原生格式的「真落後」在 TZ=Asia/Taipei 下仍判得出來（格式正規化沒有把所有值都變新鮮）', async () => {
+    const alerts = await withTaipeiTz(() =>
+      evaluateMonitorDbAlerts(
+        healthyDeps({ readHeartbeats: async () => [{ host: 'head', writer: 'server', ts: mysqlTs(HEARTBEAT_STALE_MS + 1000) }] }),
+      ),
+    )
+    expect(byKey(alerts, 'monitor-db:head-heartbeat:server')!.tripped).toBe(true)
+  })
 })
 
 describe('(b) head spool 積壓', () => {
