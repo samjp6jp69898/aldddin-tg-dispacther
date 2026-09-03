@@ -113,6 +113,11 @@ export interface HeartbeatRow {
 
 export interface RosterWorker {
   name: string
+  /** 名冊的 `url`（如 `http://10.0.0.7:8801`）。**worker 名字不是 DNS 名**——
+   * (c) 的 ssh 探測 host 必須由這裡解出（MA-1：拿 name 當 ssh host 會
+   * NXDOMAIN → (c) 永久 tripped 且失明），與 run-monitor-tunnel.sh /
+   * sync-workers.sh 同一條解析慣例（`new URL(url).hostname`）。 */
+  url: string
   registeredAt: string
   disabled: boolean
 }
@@ -146,7 +151,9 @@ export interface MonitorAlertDeps {
   /** worker 名冊（只回 enabled 的）。 */
   listWorkers?: () => RosterWorker[]
   /** 對某台 worker 探 tunnel：true＝通。 */
-  probeTunnel?: (worker: string) => Promise<boolean>
+  /** (c) 的 ssh 探測。引數是**由名冊 url 解出的 host**（MA-1），不是 worker
+   * 名字——名字不是 DNS 名。 */
+  probeTunnel?: (host: string) => Promise<boolean>
   /** head 記憶體中的 worker 主動回報。 */
   readWorkerStatuses?: () => WorkerMonitorStatus[]
   /** §6.3 計數器讀取。 */
@@ -210,27 +217,47 @@ function defaultListWorkers(): RosterWorker[] {
   const parsed = JSON.parse(readFileSync(ROSTER_PATH, 'utf8')) as { workers?: unknown }
   if (!Array.isArray(parsed.workers)) return []
   return parsed.workers
-    .filter((w): w is { name: string; registeredAt?: unknown; disabled?: unknown } => typeof (w as { name?: unknown })?.name === 'string')
+    .filter((w): w is { name: string; url?: unknown; registeredAt?: unknown; disabled?: unknown } => typeof (w as { name?: unknown })?.name === 'string')
     .map(w => ({
       name: w.name,
+      url: typeof w.url === 'string' ? w.url : '',
       registeredAt: typeof w.registeredAt === 'string' ? w.registeredAt : '',
       disabled: w.disabled === true,
     }))
     .filter(w => !w.disabled)
 }
 
+/** MA-1：由名冊 url 解出 ssh 探測 host。名字不是 DNS 名（`host landon2` →
+ * NXDOMAIN），解析慣例與 run-monitor-tunnel.sh 逐字同源：`new URL(url).hostname`；
+ * 解不出回 null（呼叫端視為 tunnel 不通——同一份 url 也是 tunnel job 自己的
+ * 連線目標，url 壞掉時 tunnel job 同樣起不來，「解析不出＝不通」是真話）。 */
+export function tunnelProbeHost(worker: RosterWorker): string | null {
+  try {
+    const host = new URL(worker.url).hostname
+    return host || null
+  } catch {
+    return null
+  }
+}
+
+/** ssh 目的地：沿用 run-monitor-tunnel.sh 的 `${MON_TUNNEL_SSH_USER:-user}@host`。 */
+export function tunnelProbeTarget(host: string): string {
+  return `${(process.env.MON_TUNNEL_SSH_USER ?? '').trim() || 'user'}@${host}`
+}
+
 /**
- * §6.8(c)：`ssh <worker> 'nc -z 127.0.0.1 3307'`。
+ * §6.8(c)：`ssh <user>@<host> 'nc -z 127.0.0.1 3307'`（host 由名冊 url 解出，
+ * MA-1——不是 worker 名字）。
  * `execFile`（非同步）＋ 自帶 5 秒上界；`BatchMode=yes` 是必要的補強——沒有它，
  * 金鑰失效時 ssh 會停在密碼提示上，`timeout` 到期前這條探測會佔著一個子行程。
  * 任何非 0 退出、逾時、spawn 失敗一律回 false（＝翻轉條件），不區分成因：
  * 對「tunnel 到底通不通」這個問題，區分不出來就是不通。
  */
-function defaultProbeTunnel(worker: string): Promise<boolean> {
+function defaultProbeTunnel(host: string): Promise<boolean> {
   return new Promise(resolve => {
     execFile(
       'ssh',
-      ['-o', 'BatchMode=yes', '-o', `ConnectTimeout=${Math.floor(SSH_PROBE_TIMEOUT_MS / 1000)}`, worker, 'nc -z 127.0.0.1 3307'],
+      ['-o', 'BatchMode=yes', '-o', `ConnectTimeout=${Math.floor(SSH_PROBE_TIMEOUT_MS / 1000)}`, tunnelProbeTarget(host), 'nc -z 127.0.0.1 3307'],
       { timeout: SSH_PROBE_TIMEOUT_MS },
       err => resolve(err === null),
     )
@@ -390,7 +417,11 @@ export async function evaluateMonitorDbAlerts(deps: MonitorAlertDeps = {}): Prom
     const probes = await Promise.all(
       workers.map(async w => {
         try {
-          return { worker: w.name, reachable: await probe(w.name) }
+          // MA-1：ssh 目標是名冊 url 解出的 host，**不是 worker 名字**（名字不是
+          // DNS 名，`host landon2` → NXDOMAIN → (c) 永久 tripped 且失明）。
+          const host = tunnelProbeHost(w)
+          if (host === null) return { worker: w.name, reachable: false, badUrl: w.url }
+          return { worker: w.name, reachable: await probe(host), badUrl: null }
         } catch (err) {
           console.error(`monitor-db alerts: (c) worker ${w.name} 的 tunnel 探測拋錯，本輪跳過該台: ${err}`)
           return null
@@ -404,7 +435,10 @@ export async function evaluateMonitorDbAlerts(deps: MonitorAlertDeps = {}): Prom
         label: `worker ${p.worker} 的 monitor DB tunnel`,
         tripped: !p.reachable,
         level: 'error',
-        detail: `worker ${p.worker} 上 \`nc -z 127.0.0.1 3307\` 不通——該台的 SSH tunnel 斷了，它的監控寫入全部只會落 spool`,
+        detail:
+          p.badUrl !== null && p.badUrl !== undefined
+            ? `worker ${p.worker} 的名冊 url "${p.badUrl}" 解析不出 host——tunnel job 用同一份 url，同樣起不來（(c) 判不通）`
+            : `worker ${p.worker} 上 \`nc -z 127.0.0.1 3307\` 不通——該台的 SSH tunnel 斷了，它的監控寫入全部只會落 spool`,
       })
     }
 

@@ -3,6 +3,8 @@ import {
   evaluateMonitorDbAlerts,
   normalizeReadSource,
   probeReadSource,
+  tunnelProbeHost,
+  tunnelProbeTarget,
   HEARTBEAT_STALE_MS,
   NEW_WORKER_GRACE_MS,
   SPOOL_DEPTH_THRESHOLD,
@@ -33,7 +35,7 @@ function healthyDeps(over: MonitorAlertDeps = {}): MonitorAlertDeps {
       { host: 'w1', writer: 'worker-agent', ts: iso(1000) },
     ],
     readSpool: () => ({ depth: 0, oldestTs: null }),
-    listWorkers: () => [{ name: 'w1', registeredAt: iso(NEW_WORKER_GRACE_MS * 2), disabled: false }],
+    listWorkers: () => [{ name: 'w1', url: 'http://10.0.0.9:8801', registeredAt: iso(NEW_WORKER_GRACE_MS * 2), disabled: false }],
     probeTunnel: async () => true,
     readWorkerStatuses: () => [{ worker: 'w1', spoolDepth: 3, oldestAgeS: 5, dbWritable: true, receivedAt: NOW - 1000 }],
     readR1Violations: () => 0,
@@ -219,23 +221,59 @@ describe('(c) tunnel 探測', () => {
     expect(byKey(alerts, 'monitor-db:tunnel:w1')).toBeUndefined()
   })
 
-  test('disabled 的 worker 不列入（名冊讀取器本身就已過濾）；多台各自一條', async () => {
+  // ── MA-1 迴歸（review-final-A-dispatcher.md）：ssh 探測收到的必須是名冊 url
+  // 解出的 hostname，不是 worker 名字——名字不是 DNS 名（`host landon2` →
+  // NXDOMAIN → (c) 永久 tripped 且失明，本機 health-monitor.log 已中招）。
+  // 本測試同時覆蓋舊測「多台各自一條、alert key 仍用名字」的既有語意。
+  test('MA-1：多台 name ≠ host——probe 收到 url 解出的 hostname；alert key 仍用 worker 名字', async () => {
     const probed: string[] = []
     const alerts = await evaluateMonitorDbAlerts(
       healthyDeps({
         listWorkers: () => [
-          { name: 'w1', registeredAt: iso(NEW_WORKER_GRACE_MS * 2), disabled: false },
-          { name: 'w2', registeredAt: iso(NEW_WORKER_GRACE_MS * 2), disabled: false },
+          { name: 'landon2', url: 'http://10.0.0.1:8801', registeredAt: iso(NEW_WORKER_GRACE_MS * 2), disabled: false },
+          { name: 'w2', url: 'http://10.0.0.2:8801', registeredAt: iso(NEW_WORKER_GRACE_MS * 2), disabled: false },
         ],
-        probeTunnel: async w => {
-          probed.push(w)
-          return w === 'w1'
+        probeTunnel: async host => {
+          probed.push(host)
+          return host === '10.0.0.1'
         },
       }),
     )
-    expect(probed.sort()).toEqual(['w1', 'w2'])
-    expect(byKey(alerts, 'monitor-db:tunnel:w1')!.tripped).toBe(false)
+    expect(probed.sort()).toEqual(['10.0.0.1', '10.0.0.2']) // 收到的是 hostname，不是 'landon2'/'w2'
+    expect(byKey(alerts, 'monitor-db:tunnel:landon2')!.tripped).toBe(false)
     expect(byKey(alerts, 'monitor-db:tunnel:w2')!.tripped).toBe(true)
+  })
+
+  test('MA-1：名冊 url 解析不出 host → 不打 ssh、直接判不通（tunnel job 用同一份 url 也起不來）', async () => {
+    const probed: string[] = []
+    const alerts = await evaluateMonitorDbAlerts(
+      healthyDeps({
+        listWorkers: () => [{ name: 'w-bad', url: 'not a url', registeredAt: iso(NEW_WORKER_GRACE_MS * 2), disabled: false }],
+        probeTunnel: async host => {
+          probed.push(host)
+          return true
+        },
+      }),
+    )
+    expect(probed.length).toBe(0)
+    expect(byKey(alerts, 'monitor-db:tunnel:w-bad')!.tripped).toBe(true)
+    expect(byKey(alerts, 'monitor-db:tunnel:w-bad')!.detail).toContain('解析不出 host')
+  })
+
+  test('MA-1：tunnelProbeHost / tunnelProbeTarget——與 run-monitor-tunnel.sh 同一條解析與 ssh 目的地慣例', () => {
+    expect(tunnelProbeHost({ name: 'landon2', url: 'http://10.0.0.1:8801', registeredAt: '', disabled: false })).toBe('10.0.0.1')
+    expect(tunnelProbeHost({ name: 'x', url: '', registeredAt: '', disabled: false })).toBeNull()
+    expect(tunnelProbeHost({ name: 'x', url: '::::', registeredAt: '', disabled: false })).toBeNull()
+    const orig = process.env.MON_TUNNEL_SSH_USER
+    try {
+      delete process.env.MON_TUNNEL_SSH_USER
+      expect(tunnelProbeTarget('10.0.0.1')).toBe('user@10.0.0.1') // 預設 user 與 tunnel 腳本的 ${MON_TUNNEL_SSH_USER:-user} 一致
+      process.env.MON_TUNNEL_SSH_USER = 'ops'
+      expect(tunnelProbeTarget('10.0.0.1')).toBe('ops@10.0.0.1')
+    } finally {
+      if (orig === undefined) delete process.env.MON_TUNNEL_SSH_USER
+      else process.env.MON_TUNNEL_SSH_USER = orig
+    }
   })
 
   test('名冊讀不到 → (c)(d)(e) 整組省略，(a)(b)(f) 照常', async () => {
@@ -279,7 +317,7 @@ describe('(d) worker 心跳', () => {
   test('新 worker 30 分鐘寬限期內完全不評估 (d)(e)', async () => {
     const alerts = await evaluateMonitorDbAlerts(
       healthyDeps({
-        listWorkers: () => [{ name: 'fresh', registeredAt: iso(60_000), disabled: false }],
+        listWorkers: () => [{ name: 'fresh', url: 'http://10.0.0.9:8801', registeredAt: iso(60_000), disabled: false }],
         readHeartbeats: async () => [{ host: 'head', writer: 'server', ts: iso(1000) }],
         readWorkerStatuses: () => [],
       }),
@@ -293,7 +331,7 @@ describe('(d) worker 心跳', () => {
   test('registeredAt 解析不出來 → 不給寬限（寧可誤報一次也不要永久豁免）', async () => {
     const alerts = await evaluateMonitorDbAlerts(
       healthyDeps({
-        listWorkers: () => [{ name: 'w1', registeredAt: 'not-a-date', disabled: false }],
+        listWorkers: () => [{ name: 'w1', url: 'http://10.0.0.9:8801', registeredAt: 'not-a-date', disabled: false }],
         readHeartbeats: async () => [{ host: 'head', writer: 'server', ts: iso(1000) }],
       }),
     )
@@ -571,8 +609,8 @@ describe('永不拋例外的契約：單條件炸掉不得中斷其餘', () => {
     const alerts = await evaluateMonitorDbAlerts(
       healthyDeps({
         listWorkers: () => [
-          { name: 'w1', registeredAt: iso(NEW_WORKER_GRACE_MS * 2), disabled: false },
-          { name: 'w2', registeredAt: iso(NEW_WORKER_GRACE_MS * 2), disabled: false },
+          { name: 'w1', url: 'http://10.0.0.9:8801', registeredAt: iso(NEW_WORKER_GRACE_MS * 2), disabled: false },
+          { name: 'w2', url: 'http://10.0.0.9:8801', registeredAt: iso(NEW_WORKER_GRACE_MS * 2), disabled: false },
         ],
         readHeartbeats: async () => [
           { host: 'head', writer: 'server', ts: iso(1000) },
@@ -605,8 +643,8 @@ describe('onRosterResolved 回呼（呼叫端清理退場 worker 的 key 用）'
     await evaluateMonitorDbAlerts(
       healthyDeps({
         listWorkers: () => [
-          { name: 'w1', registeredAt: iso(NEW_WORKER_GRACE_MS * 2), disabled: false },
-          { name: 'w2', registeredAt: iso(NEW_WORKER_GRACE_MS * 2), disabled: false },
+          { name: 'w1', url: 'http://10.0.0.9:8801', registeredAt: iso(NEW_WORKER_GRACE_MS * 2), disabled: false },
+          { name: 'w2', url: 'http://10.0.0.9:8801', registeredAt: iso(NEW_WORKER_GRACE_MS * 2), disabled: false },
         ],
         onRosterResolved: names => seen.push(names),
       }),

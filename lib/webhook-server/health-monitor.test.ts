@@ -373,7 +373,7 @@ describe('createHealthMonitor — 監控 DB 告警（§6.8(3) a–f）', () => {
       notify,
       registryPaths: [],
       monitorAlerts: deps({
-        listWorkers: () => [{ name: 'w1', registeredAt: '2026-09-01T00:00:00.000Z', disabled: false }],
+        listWorkers: () => [{ name: 'w1', url: 'http://10.0.0.9:8801', registeredAt: '2026-09-01T00:00:00.000Z', disabled: false }],
         readWorkerStatuses: () => [],
       }),
     })
@@ -557,7 +557,7 @@ describe('createHealthMonitor — 退場 worker 的告警 key 生命週期', () 
     process.env.MON_DB_ENABLED = '1'
     readyConnections = 1
     const notify = mock((_t: string) => {})
-    let roster = [{ name: 'w1', registeredAt: old, disabled: false }]
+    let roster = [{ name: 'w1', url: 'http://10.0.0.9:8801', registeredAt: old, disabled: false }]
     const monitor = createHealthMonitor({ apiUrl: `${BASE}/ready`, notify, registryPaths: [], monitorAlerts: deps(() => roster) })
 
     await monitor.runOnce() // w1 tunnel 不通 → 告警一次
@@ -578,7 +578,7 @@ describe('createHealthMonitor — 退場 worker 的告警 key 生命週期', () 
     process.env.MON_DB_ENABLED = '1'
     readyConnections = 1
     const notify = mock((_t: string) => {})
-    let roster = [{ name: 'w1', registeredAt: old, disabled: false }]
+    let roster = [{ name: 'w1', url: 'http://10.0.0.9:8801', registeredAt: old, disabled: false }]
     const monitor = createHealthMonitor({
       apiUrl: `${BASE}/ready`,
       notify,
@@ -599,7 +599,7 @@ describe('createHealthMonitor — 退場 worker 的告警 key 生命週期', () 
     readyConnections = 1
     const notify = mock((_t: string) => {})
     let broken = false
-    const roster = [{ name: 'w1', registeredAt: old, disabled: false }]
+    const roster = [{ name: 'w1', url: 'http://10.0.0.9:8801', registeredAt: old, disabled: false }]
     let tunnelOk = false
     const monitor = createHealthMonitor({
       apiUrl: `${BASE}/ready`,
