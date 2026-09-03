@@ -428,9 +428,19 @@ INSERT INTO dispatch_attempts (dispatch_id, ticket, kind, worker_name, worker_ur
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(3))
 `.trim()
 
+// MA-2（review-final-A-dispatcher.md）：confirmed_at / cleared_at / clear_reason /
+// remote_run_id 與 worker_name/worker_url 一樣是「一次寫定」語意——這些欄位由
+// **不同的 advance 各自帶來**（dispatched 帶 confirmed_at/remote_run_id、
+// job_done/exception 只帶 cleared_at/clear_reason），後續 advance 未帶的欄位
+// 一律傳 null，plain 賦值會把先前寫好的值抹回 NULL（本機實查：status='cleared',
+// clear_reason='job_done' 的列 confirmed_at/remote_run_id 2/2 皆 NULL）。全部
+// 改 COALESCE(col, ?)，只在該欄仍為 NULL 時生效。R4 合規：每條 COALESCE 只讀
+// 自己那一欄的舊值（同 W1 的純 additive 慣例）。
 export const DISPATCH_ATTEMPT_ADVANCE_SQL = `
 UPDATE dispatch_attempts
-   SET status = ?, status_rank = ?, confirmed_at = ?, cleared_at = ?, clear_reason = ?, remote_run_id = ?,
+   SET status = ?, status_rank = ?,
+       confirmed_at = COALESCE(confirmed_at, ?), cleared_at = COALESCE(cleared_at, ?),
+       clear_reason = COALESCE(clear_reason, ?), remote_run_id = COALESCE(remote_run_id, ?),
        worker_name = COALESCE(worker_name, ?), worker_url = COALESCE(worker_url, ?)
  WHERE dispatch_id = ? AND status_rank < ?
 `.trim()
@@ -477,7 +487,12 @@ export interface AdvanceDispatchAttemptInput {
    * 到 'dispatched'/'already_running_remote' 才知道是哪一台——`COALESCE`
    * 只在首次寫入生效（worker 選定後不會再變），未提供時傳 null 不清空既有值
    * （否則 2C 回報的缺口：cleared/exception 等後續 advance 沒帶 worker 資訊，
-   * 會把已經寫好的 worker_name/worker_url 覆蓋回 NULL）。 */
+   * 會把已經寫好的 worker_name/worker_url 覆蓋回 NULL）。
+   *
+   * MA-2（2026-09-03）：同一個「一次寫定」語意擴及 confirmedAt / clearedAt /
+   * clearReason / remoteRunId——2C 當時只修了 worker 兩欄，其餘四欄留著 plain
+   * 賦值，job_done 的 advance 把 dispatched 寫好的 confirmed_at/remote_run_id
+   * 抹回 NULL（本機實查 2/2 列）。八個選填欄現在全部 COALESCE。 */
   workerName?: string | null
   workerUrl?: string | null
 }

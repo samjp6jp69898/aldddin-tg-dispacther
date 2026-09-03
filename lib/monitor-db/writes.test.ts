@@ -308,22 +308,42 @@ interface FakeDispatchRow {
   dispatch_id: string
   status: string
   status_rank: number
+  confirmed_at: string | null
+  cleared_at: string | null
+  clear_reason: string | null
+  remote_run_id: string | null
   worker_name: string | null
   worker_url: string | null
-  remote_run_id: string | null
 }
 
+// MA-2 教訓（review-final-A-dispatcher.md）：**假 DB 比被測 SQL 寬鬆等於沒測**
+// ——舊版對 remote_run_id 寫的是 COALESCE 語意而真 SQL 是 plain 賦值、且完全沒
+// 模型 confirmed_at，於是「job_done advance 抹掉 confirmed_at/remote_run_id」
+// 在測試裡恆綠、在真 DB 上 2/2 列中招。本 fake 現在**逐字對照**
+// DISPATCH_ATTEMPT_ADVANCE_SQL 的每一條賦值；改 SQL 時必須同步改這裡，SQL 的
+// 形狀本身另由下方「SQL 文字釘」測試把 COALESCE 子句釘死（fake 以 sql 字串
+// 全等分派，SQL 被改壞時 fake 不會自己發現）。
 class FakeDispatchAttemptsDb implements MonitorDbExecutor {
   rows = new Map<string, FakeDispatchRow>()
 
   async execute<T = ResultSetHeader>(sql: string, params: unknown[] = []): Promise<[T, unknown]> {
     if (sql === DISPATCH_ATTEMPT_INSERT_SQL) {
       const [dispatchId, , , , , status, statusRank] = params as [string, string, string, string | null, string | null, string, number]
-      this.rows.set(dispatchId, { dispatch_id: dispatchId, status, status_rank: statusRank, worker_name: null, worker_url: null, remote_run_id: null })
+      this.rows.set(dispatchId, {
+        dispatch_id: dispatchId,
+        status,
+        status_rank: statusRank,
+        confirmed_at: null,
+        cleared_at: null,
+        clear_reason: null,
+        remote_run_id: null,
+        worker_name: null,
+        worker_url: null,
+      })
       return [{ affectedRows: 1 } as unknown as T, []]
     }
     if (sql === DISPATCH_ATTEMPT_ADVANCE_SQL) {
-      const [status, statusRank, , , , remoteRunId, workerName, workerUrl, dispatchId, guardRank] = params as [
+      const [status, statusRank, confirmedAt, clearedAt, clearReason, remoteRunId, workerName, workerUrl, dispatchId, guardRank] = params as [
         string,
         number,
         string | null,
@@ -339,8 +359,12 @@ class FakeDispatchAttemptsDb implements MonitorDbExecutor {
       if (!row || !(row.status_rank < guardRank)) {
         return [{ info: 'Rows matched: 0  Changed: 0  Warnings: 0' } as unknown as T, []]
       }
+      // 與 SQL 逐條對照：status/status_rank plain 賦值，其餘八欄 COALESCE(col, ?)。
       row.status = status
       row.status_rank = statusRank
+      row.confirmed_at = row.confirmed_at ?? confirmedAt
+      row.cleared_at = row.cleared_at ?? clearedAt
+      row.clear_reason = row.clear_reason ?? clearReason
       row.remote_run_id = row.remote_run_id ?? remoteRunId
       row.worker_name = row.worker_name ?? workerName
       row.worker_url = row.worker_url ?? workerUrl
@@ -374,5 +398,43 @@ describe('advanceDispatchAttempt — worker_name/worker_url（整合修補：2C 
     expect(r.kind).toBe('applied')
     expect(db.rows.get('d-1')!.worker_name).toBe('w1')
     expect(db.rows.get('d-1')!.worker_url).toBe('http://10.0.0.1:8801')
+  })
+
+  // ── MA-2 迴歸（review-final-A-dispatcher.md）：dispatched 寫好的
+  // confirmed_at/remote_run_id 不得被 job_done 的 advance 抹回 NULL ──
+  test('MA-2：dispatched 帶 confirmedAt/remoteRunId → job_done 只帶 clearedAt/clearReason → 前者保留、後者寫入', async () => {
+    const db = new FakeDispatchAttemptsDb()
+    await createDispatchAttempt(db, { dispatchId: 'd-2', ticket: 'FAQ-2', kind: 'bug', status: 'dispatching', statusRank: 10 })
+    await advanceDispatchAttempt(db, {
+      dispatchId: 'd-2',
+      status: 'dispatched',
+      statusRank: 20,
+      confirmedAt: '2026-09-03T01:00:00.000Z',
+      remoteRunId: 'run-remote-1',
+      workerName: 'w1',
+      workerUrl: 'http://10.0.0.1:8801',
+    })
+    const r = await advanceDispatchAttempt(db, {
+      dispatchId: 'd-2',
+      status: 'cleared',
+      statusRank: 100,
+      clearedAt: '2026-09-03T02:00:00.000Z',
+      clearReason: 'job_done',
+    })
+    expect(r.kind).toBe('applied')
+    const row = db.rows.get('d-2')!
+    expect(row.confirmed_at).toBe('2026-09-03 01:00:00.000') // dt() 轉 mysql 格式後保留，不被 NULL 抹掉
+    expect(row.remote_run_id).toBe('run-remote-1')
+    expect(row.cleared_at).toBe('2026-09-03 02:00:00.000')
+    expect(row.clear_reason).toBe('job_done')
+  })
+
+  // fake 以 sql 字串全等分派、行為寫死——SQL 被改回 plain 賦值時 fake 不會自己
+  // 變紅，所以 COALESCE 子句用 SQL 文字直接釘住（MA-2 教訓：假 DB 比真 SQL
+  // 寬鬆等於沒測，防線必須釘在真 SQL 的形狀上）。
+  test('MA-2 SQL 文字釘：八個選填欄全部是 COALESCE(col, ?)，一次寫定', () => {
+    for (const col of ['confirmed_at', 'cleared_at', 'clear_reason', 'remote_run_id', 'worker_name', 'worker_url']) {
+      expect(DISPATCH_ATTEMPT_ADVANCE_SQL).toContain(`${col} = COALESCE(${col}, ?)`)
+    }
   })
 })
