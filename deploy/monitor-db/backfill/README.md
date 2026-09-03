@@ -99,8 +99,12 @@ WAL 踩坑（impl-constraints-addendum §4）：讀 `monitor.sqlite` **禁止 cp
   2. **一次跑完，不分批跨版本**：`INSERT IGNORE` 的安全性建立在「所有列由同一版
      mapping 寫入」——第一批跑完後若 mapping 被改過再跑第二批，先寫的列用舊 mapping
      且不會被修正、也不會報錯，這是 `INSERT IGNORE` 最陰的失敗模式。
-  3. **events 去重前提探針（b5 對線定案，必跑非引用）**：開跑前執行
-     `bun deploy/monitor-db/backfill/precheck-events-dedup.ts`（唯讀）。它驗的是
+  3. **events 去重前提探針（b5 對線定案，必跑非引用；2026-09-03 已接進
+     `run-backfill.sh` 成阻斷閘門，非僅文件宣稱——review-final-A 指認落差後補）**：
+     非 `--dry-run` 且含 sqlite 來源時，`run-backfill.sh` 自動以 `--gate` 模式執行
+     探針：would-insert=0 放行；非零中止（逐筆判讀無誤後以 `--ack-events-precheck`
+     重跑放行）；**探針自身失敗＝「未評估」依 D42 視同不通過、一律中止**。
+     手動單跑：`bun deploy/monitor-db/backfill/precheck-events-dedup.ts`（唯讀）。它驗的是
      「兩軌 (service, raw) 逐位元一致」這個 `uq_service_raw` 跨寫入者去重的**前提**——
      2026-09-02 實測 1738/1738 全命中、would-insert=0（本探針與 b5 獨立實測逐位一致），
      但那是快照不是恆真：insertAuditLine / audit-ingester 若改了 raw 處理，前提會
