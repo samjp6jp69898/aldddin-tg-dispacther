@@ -227,10 +227,28 @@ if [ -n "$LATEST" ]; then
   else
     err "最新備份已 ${AGE_H}h（> 26h）"
   fi
-  if gunzip -c "$LATEST" | grep -q "CREATE TABLE.*runs"; then
-    ok "備份可解壓且含 CREATE TABLE runs"
+  # 這裡用 grep -c 而不是 grep -q（2026-09-03）。-q 命中即早退，上游 gunzip 會收到
+  # SIGPIPE，而本腳本開著 pipefail —— 整條管線因此判失敗。它只在檔案大到塞滿 pipe
+  # buffer 時才發生：2026-09-02 的備份 2365 bytes 判綠，2026-09-03 的 56403 bytes 就
+  # 判紅（exit 141）。同一份檢查、同一種內容，**只因為備份長大就永久轉紅**，而且紅的
+  # 是檢查不是備份，沒有人看得出差別。
+  # -c 一定讀到 EOF，結構上不可能早退；命中 0 筆時 grep 退 1，由 || true 吸收，判斷
+  # 完全落在計數值上、與退出碼脫鉤。不靠「141 vs 1」去分辨兩種語意——那等於把 SIGPIPE
+  # 這個實作細節當成契約，換個 shell 或管線多一段，數字就變了而且不會有人知道。
+  if gzip -t "$LATEST" 2>/dev/null; then
+    # 加 -a：dump 含二進位欄位資料（有 NUL byte），沒有 -a 的話 grep 走 binary 模式，
+    # 行為會隨「今天的資料剛好有沒有二進位」而變——那是另一個大小/內容相依的假陽性。
+    DDL_HITS=$(gunzip -c "$LATEST" 2>/dev/null | grep -ac "CREATE TABLE.*runs" || true)
+    if [ "$DDL_HITS" -gt 0 ]; then
+      ok "備份可解壓且含 CREATE TABLE runs（命中 ${DDL_HITS} 筆）"
+    else
+      # 空 gzip 是**合法的** gzip（20 bytes），會通過上面的 gzip -t，只有這條抓得到。
+      err "備份可解壓但找不到 CREATE TABLE runs（內容不是有效的 dump）"
+    fi
   else
-    err "備份內容異常，找不到 CREATE TABLE runs"
+    # 命中筆數在這條路徑上**沒有被評估**，所以一個字都不印（D42）：印成 0 會讓人讀成
+    # 「解壓成功但內容沒有 runs」，那是另一種病、另一種處置。
+    err "備份不是完整的 gzip，無法解壓：$LATEST"
   fi
   ls -ld "$BACKUP_DIR" | awk '{print $1}' | grep -q '^drwx------' && ok "備份目錄權限 0700" || warn "備份目錄權限非 0700"
 else
@@ -328,6 +346,27 @@ if [ "${DOCTOR_DEEP:-0}" = "1" ]; then
   esac
 else
   echo "[SKIP]  深度驗收（verify-stream / 雙軌對照）——需要時跑 DOCTOR_DEEP=1 $0"
+fi
+
+echo ""
+echo "=== 12. tg-monitor 最近一次啟動的來源（D48：裸 kickstart 留痕） ==="
+# safe-kickstart.sh 擋不住裸 `launchctl kickstart`，而且**那件事在 run-monitor.sh 這層
+# 結構上就做不到**：啟動後才擋，服務已經被 `kickstart -k` 的 -k 殺掉了；plist 又是
+# KeepAlive=true，擋一次就變成無限重啟迴圈（形狀同 2026-09-02 那次 crash loop）。
+# 阻擋型只會把繞過的**後果**從「載進別人的碼」換成「監控整個停擺」，繞過本身沒被擋。
+# 所以那一層是 fail-open 的「留痕」不是「阻擋」：每次啟動記一行 start，標明來源。
+# 但寫下的痕跡若沒有人讀，就還是一種沒有觀察者的失敗——這一節就是那個讀的人。
+# 判 WARN 不判 ERROR：手動重啟過是**可疑**不是故障，不該污染 ERRORS=0 這條部署硬條件。
+# 覆寫用的環境變數只為了讓這三個分支測得到：kickstart.log 是稽核紀錄，為了測 WARN
+# 分支去偽造幾行再刪掉，等於為了驗證檢查而污染被檢查的證據。正式路徑上沒有人會設它。
+KICKSTART_LOG="${DOCTOR_KICKSTART_LOG:-/Users/user/aladdin/tg-monitor/data/kickstart.log}"
+LAST_START=$(grep ' | start | ' "$KICKSTART_LOG" 2>/dev/null | tail -1)
+if [ -z "$LAST_START" ]; then
+  warn "kickstart.log 找不到任何 start 紀錄（guard 尚未隨服務重啟載入，或 log 被清過）"
+elif echo "$LAST_START" | grep -q 'via=safe-kickstart'; then
+  ok "最近一次啟動經由 safe-kickstart：${LAST_START}"
+else
+  warn "最近一次啟動未經 safe-kickstart（裸 kickstart 或開機自動啟動）：${LAST_START}"
 fi
 
 echo ""
