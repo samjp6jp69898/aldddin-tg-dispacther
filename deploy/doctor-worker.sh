@@ -45,26 +45,31 @@ else
 fi
 command -v timeout >/dev/null 2>&1 && ok "GNU timeout（$(command -v timeout)）" || bad "GNU timeout 缺失（brew install coreutils）"
 command -v git >/dev/null 2>&1 && ok "git" || bad "git 缺失"
-# glab（2026-09-03 改為條件模式）：git 推拉與開 MR 是兩種不同的憑證，體檢不該
-# 混為一談——
+# GitLab 身分（2026-09-03 起 worker 完全不需要 glab）：
 #   - 推拉（push/fetch）走 SSH key，由下面「repo checkout 與遠端連通」那節的
-#     `git ls-remote origin HEAD` 實測，那才是「這台能不能工作」的硬條件。
-#   - 開 MR 走 GitLab **API token**，只有 glab 認證能提供。SSH key（含 .ppk）
-#     再怎麼能推都開不了 MR，2026-09-03 三張單全部卡在這裡實證過。
-# 所以 glab 缺失/未認證降為 warn：這台照樣能跑完分析、修復、推分支，只是
-# MR 要有人事後在 head 補。硬擋上線反而會讓真正的紅燈被一起忽略。
-# host 從 lago 的 origin 推導，不寫死——換 GitLab 站台時這裡自動跟著走。
+#     `git ls-remote origin HEAD` 實測。
+#   - 開 MR 走 **push options over SSH**（見 agents/mr-pusher.md Step 1），
+#     同一把 SSH key、不需要任何 API token。
+# 這裡驗的是「這把 key 對得上 GitLab 帳號」——push 得動不等於 GitLab 認得它，
+# MR 作者就是這個帳號。glab 只有 head 的 /refine-mr 會用（讀寫既有 MR 留言，
+# push options 做不到那件事），worker 只跑 bug/demand 兩種 pipeline，兩者都不
+# 碰 glab，所以這裡刻意不檢查 glab 有沒有裝或有沒有認證。
 GITLAB_HOST="$(git -C "$ALADDIN/lago" remote get-url origin 2>/dev/null | sed -E 's#^[a-z+]+://[^@]*@([^:/]+).*#\1#')"
-if command -v glab >/dev/null 2>&1; then
-  if [ -z "$GITLAB_HOST" ]; then
-    warn "glab 已安裝，但無法從 lago 的 origin 推導 GitLab host，未能驗證認證狀態"
-  elif glab auth status --hostname "$GITLAB_HOST" >/dev/null 2>&1; then
-    ok "glab 已認證 ${GITLAB_HOST}"
-  else
-    warn "glab 已安裝但**未認證** ${GITLAB_HOST}（No token found）→ 這台跑出來的單會停在 failed 或 MR 內容不更新，需事後在 head 補開/補更新。修法：glab auth login --hostname ${GITLAB_HOST}，或把 head 的 ~/Library/Application\\ Support/glab-cli/config.yml scp 過來"
-  fi
+GITLAB_PORT="$(git -C "$ALADDIN/lago" remote get-url origin 2>/dev/null | sed -nE 's#^[a-z+]+://[^@]*@[^:/]+:([0-9]+).*#\1#p')"
+if [ -z "$GITLAB_HOST" ]; then
+  warn "無法從 lago 的 origin 推導 GitLab host，未能驗證 SSH 身分"
 else
-  warn "glab 缺失（brew install glab）→ 同上，分析與推分支不受影響，但開不了 MR"
+  # `-n`（把 ssh 的 stdin 導向 /dev/null）不可省略：本腳本常以
+  # `ssh user@worker 'bash -s' < doctor-worker.sh` 遠端執行，此時腳本自己就是
+  # stdin。ssh 預設會讀 stdin，會把腳本剩下的內容整個吃掉——症狀是體檢跑到
+  # 這一行就無聲中止，後面所有檢查與總結全部不執行（2026-09-03 踩到）。
+  SSH_WHOAMI="$(ssh -n -T -o BatchMode=yes -o ConnectTimeout=8 ${GITLAB_PORT:+-p "$GITLAB_PORT"} "git@${GITLAB_HOST}" 2>&1 | head -1)"
+  case "$SSH_WHOAMI" in
+    *"Welcome to GitLab"*)
+      ok "GitLab SSH 身分：${SSH_WHOAMI#*, }（開 MR 的 push options 用這個身分，MR 作者即為此帳號）" ;;
+    *)
+      bad "GitLab SSH 認證失敗（${GITLAB_HOST}）：${SSH_WHOAMI:-無回應} → 推不了分支也開不了 MR。檢查 ~/.ssh/config 是否把 ${GITLAB_HOST} 指向正確的 key、該 key 是否已加到 GitLab 帳號" ;;
+  esac
 fi
 
 echo "== repo checkout 與遠端連通 =="
