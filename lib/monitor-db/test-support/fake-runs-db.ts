@@ -259,7 +259,23 @@ export class FakeRunsDb implements MonitorDbExecutor {
     let runId: string
     let host: string
     if (variant === 'w2') {
-      const [rId, h, ticket, kind, outcome, outcomeSource, finishedAt, exitCode, legacyKey, stdoutPath, stderrPath, startedAt] = params as [
+      const [
+        rId,
+        h,
+        ticket,
+        kind,
+        outcome,
+        outcomeSource,
+        finishedAt,
+        exitCode,
+        legacyKey,
+        stdoutPath,
+        stderrPath,
+        startedAt,
+        triggerSource,
+        triggeredByEmail,
+        triggeredByName,
+      ] = params as [
         string,
         string,
         string,
@@ -268,6 +284,9 @@ export class FakeRunsDb implements MonitorDbExecutor {
         string,
         string,
         number | null,
+        string | null,
+        string | null,
+        string | null,
         string | null,
         string | null,
         string | null,
@@ -287,6 +306,9 @@ export class FakeRunsDb implements MonitorDbExecutor {
         stdout_path: stdoutPath,
         stderr_path: stderrPath,
         started_at: startedAt,
+        trigger_source: triggerSource,
+        triggered_by_email: triggeredByEmail,
+        triggered_by_name: triggeredByName,
       })
     } else if (variant === 'w3') {
       const [rId, h, ticket, kind, outcome, outcomeSource, finishedAt] = params as [string, string, string, string, string, string, string]

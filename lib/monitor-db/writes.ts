@@ -169,8 +169,8 @@ UPDATE runs
 // `pipeline_runs.started_at` 完全同構（兩邊都是從同一個 log 檔名時間戳反推，
 // 見 switch-readiness.ts 檔頭「`started_at` 的兩軌容差」說明），不是臆測值。
 export const W2_INSERT_SQL = `
-INSERT INTO runs (run_id, host, ticket, kind, lifecycle_rank, outcome, outcome_tier, outcome_source, finished_at, exit_code, legacy_key, stdout_path, stderr_path, started_at, created_at)
-VALUES (?, ?, ?, ?, 100, ?, 2, ?, ?, ?, ?, ?, ?, ?, NOW(3))
+INSERT INTO runs (run_id, host, ticket, kind, lifecycle_rank, outcome, outcome_tier, outcome_source, finished_at, exit_code, legacy_key, stdout_path, stderr_path, started_at, trigger_source, triggered_by_email, triggered_by_name, created_at)
+VALUES (?, ?, ?, ?, 100, ?, 2, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(3))
 `.trim()
 
 export const RUNS_COLD_PATH_TERMINAL_SQL = 'SELECT host, outcome, outcome_tier FROM runs WHERE run_id = ?'
@@ -197,6 +197,15 @@ export interface WriteRunOutcomeAuthoritativeInput extends RunIdentity {
    * `RUNS_LIST_WHERE`／C4 的說明。
    */
   startedAt?: string | null
+  /**
+   * 2026-09-03 根因修復追加（post-run-notify.ts 補列路徑讀 triggered-by.json）：
+   * 同上，只在 INSERT fallback 用得到——UPDATE 路徑的列已存在（多半是 W1
+   * 寫的），這三欄早已由 W1 補齊。呼叫端沒有值就傳 undefined/null，不硬填
+   * 假值。
+   */
+  triggerSource?: string | null
+  triggeredByEmail?: string | null
+  triggeredByName?: string | null
 }
 
 /**
@@ -239,6 +248,9 @@ export async function writeRunOutcomeAuthoritative(
       input.stdoutPath ?? null,
       input.stderrPath ?? null,
       dt(input.startedAt),
+      input.triggerSource ?? null,
+      input.triggeredByEmail ?? null,
+      input.triggeredByName ?? null,
     ])
     return { kind: 'inserted' }
   } catch (err) {

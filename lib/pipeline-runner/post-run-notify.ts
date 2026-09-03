@@ -212,6 +212,40 @@ function deriveStartedAtFromLegacyKey(legacyKey: string, ticket: string): string
 }
 
 /**
+ * 2026-09-03 根因修復追加：補列路徑（W2 INSERT fallback）沒有 in-memory 的
+ * `entry.triggeredBy` 可用——唯一還原得到的來源是 spawn 當時同一個 base
+ * 寫的 sidecar 檔（見 spawn-create-mr.ts spawnCreateMrNow：只有
+ * `entry.triggeredBy` 存在時才會寫這個檔，因此檔案存在 ⟺ 這一輪原本就是
+ * `trigger_source='telegram'`，跟 spawn-create-mr.ts 的
+ * `triggerSource: entry.triggeredBy ? 'telegram' : 'cli'` 同構）。
+ *
+ * 檔案不存在時無法分辨「本來就是 cli 觸發（正常，不寫檔）」還是「telegram
+ * 觸發但檔案也一併遺失」——回傳 null，呼叫端讓三欄維持 NULL，不猜一個可能
+ * 錯誤的 'cli'（寧可留白也不誤植假值）。JSON 損毀視同讀不到，同樣回傳
+ * null 並記 log；全程 best-effort，不拋例外。
+ */
+function readTriggeredBy(legacyKey: string): { email: string; name: string } | null {
+  const path = join(LOG_DIR, `${legacyKey}.triggered-by.json`)
+  let raw: string
+  try {
+    raw = readFileSync(path, 'utf8')
+  } catch {
+    return null
+  }
+  try {
+    const parsed = JSON.parse(raw) as { name?: unknown; email?: unknown }
+    if (typeof parsed.email !== 'string' || typeof parsed.name !== 'string') {
+      log(`${legacyKey} triggered-by.json 格式不符預期（缺 email/name），略過: ${path}`)
+      return null
+    }
+    return { email: parsed.email, name: parsed.name }
+  } catch (err) {
+    log(`${legacyKey} triggered-by.json 解析失敗，略過: ${path}: ${err}`)
+    return null
+  }
+}
+
+/**
  * 【plan-db-as-truth-v3.2.md §9 Phase2】bug 終態（權威，tier2）：本檔是
  * WRAPPER_SCRIPT 的 EXIT trap 子行程，`process.env.MON_RUN_ID` 繼承自
  * spawn 時顯式覆寫的值（見 spawn-create-mr.ts 的 spawnCreateMrNow），正是
@@ -247,6 +281,7 @@ export async function writeAuthoritativeOutcome(
 
   const finishedAt = new Date().toISOString()
   const legacyKey = deriveLegacyKeyFromStdoutPath(stdoutPath)
+  const triggeredBy = readTriggeredBy(legacyKey)
   const input = {
     runId,
     ticket,
@@ -259,6 +294,9 @@ export async function writeAuthoritativeOutcome(
     stdoutPath,
     stderrPath,
     startedAt: deriveStartedAtFromLegacyKey(legacyKey, ticket),
+    triggerSource: triggeredBy ? 'telegram' : null,
+    triggeredByEmail: triggeredBy?.email ?? null,
+    triggeredByName: triggeredBy?.name ?? null,
   }
 
   let pool: MonitorDbExecutor | null = null

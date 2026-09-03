@@ -1,7 +1,10 @@
 import { describe, expect, mock, test } from 'bun:test'
+import { unlinkSync, writeFileSync } from 'node:fs'
 import { checkPushMismatch, shouldNotify, parseRunningBugTickets, writeAuthoritativeOutcome } from './post-run-notify.ts'
 import { FakeRunsDb } from '../monitor-db/test-support/fake-runs-db.ts'
 import type { SpoolEntry } from '../monitor-db/spool/types.ts'
+
+const LOG_DIR = '/Users/user/aladdin/telegram-dispatcher/logs'
 
 /** 假 spool writer：只記錄 append 呼叫，不碰真的檔案系統。 */
 function makeFakeSpool() {
@@ -90,6 +93,54 @@ describe('writeAuthoritativeOutcome — v3.2 §9 Phase2 bug 終態（權威）�
       ).resolves.toBeUndefined()
       expect(fakeSpool.appended.length).toBe(1)
       expect(fakeSpool.appended[0]!.run_id).toBe('33333333-3333-3333-3333-333333333333')
+    } finally {
+      if (prev === undefined) delete process.env.MON_RUN_ID
+      else process.env.MON_RUN_ID = prev
+    }
+  })
+
+  // 2026-09-03 根因修復：補列路徑（W1 遺失、走 W2 INSERT fallback）原本完全
+  // 沒讀 `logs/<legacy_key>.triggered-by.json`，即使該檔跟 stdout/stderr log
+  // 同一個 key 前綴、資料齊全——見 readTriggeredBy（post-run-notify.ts）。
+  test('triggered-by.json 存在（事後補列情境）→ trigger_source/triggered_by_email/triggered_by_name 正確填值', async () => {
+    const prev = process.env.MON_RUN_ID
+    process.env.MON_RUN_ID = '44444444-4444-4444-4444-444444444444'
+    const legacyKey = 'FAQ-9005.2026-09-03T00-00-01-000Z'
+    const stdoutPath = `${LOG_DIR}/${legacyKey}.stdout.log`
+    const stderrPath = `${LOG_DIR}/${legacyKey}.stderr.log`
+    const triggeredByPath = `${LOG_DIR}/${legacyKey}.triggered-by.json`
+    writeFileSync(triggeredByPath, JSON.stringify({ name: '測試員', email: 'tester@example.com', at: new Date().toISOString() }))
+    try {
+      const fakeDb = new FakeRunsDb()
+      const fakeSpool = makeFakeSpool()
+      await writeAuthoritativeOutcome('FAQ-9005', 'infra_failure', 1, stdoutPath, stderrPath, { pool: fakeDb, spool: fakeSpool })
+      const row = fakeDb.rows.get('44444444-4444-4444-4444-444444444444')
+      expect(row).not.toBeUndefined()
+      expect(row!.trigger_source).toBe('telegram')
+      expect(row!.triggered_by_email).toBe('tester@example.com')
+      expect(row!.triggered_by_name).toBe('測試員')
+    } finally {
+      unlinkSync(triggeredByPath)
+      if (prev === undefined) delete process.env.MON_RUN_ID
+      else process.env.MON_RUN_ID = prev
+    }
+  })
+
+  test('triggered-by.json 不存在（例如本來就是 cli 觸發）→ 三欄維持 NULL，不拋錯、不誤植假值', async () => {
+    const prev = process.env.MON_RUN_ID
+    process.env.MON_RUN_ID = '55555555-5555-5555-5555-555555555555'
+    const legacyKey = 'FAQ-9006.2026-09-03T00-00-02-000Z'
+    const stdoutPath = `${LOG_DIR}/${legacyKey}.stdout.log`
+    const stderrPath = `${LOG_DIR}/${legacyKey}.stderr.log`
+    try {
+      const fakeDb = new FakeRunsDb()
+      const fakeSpool = makeFakeSpool()
+      await expect(writeAuthoritativeOutcome('FAQ-9006', 'infra_failure', 1, stdoutPath, stderrPath, { pool: fakeDb, spool: fakeSpool })).resolves.toBeUndefined()
+      const row = fakeDb.rows.get('55555555-5555-5555-5555-555555555555')
+      expect(row).not.toBeUndefined()
+      expect(row!.trigger_source).toBeNull()
+      expect(row!.triggered_by_email).toBeNull()
+      expect(row!.triggered_by_name).toBeNull()
     } finally {
       if (prev === undefined) delete process.env.MON_RUN_ID
       else process.env.MON_RUN_ID = prev
