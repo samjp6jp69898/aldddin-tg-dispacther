@@ -15,6 +15,10 @@ describe('isAllowedTracePath — 白名單逐字比照 tg-monitor/lib/services.t
     expect(isAllowedTracePath(`${DISPATCHER_LOG_DIR}/FAQ-1.2026-09-04T00-00-00-000Z.stdout.log`)).toBe(true)
   })
 
+  test('logs 目錄下的 .stderr.log 放行（task 1，2026-09-04：/api/log/tail、/api/log/since host-aware 化新增）', () => {
+    expect(isAllowedTracePath(`${DISPATCHER_LOG_DIR}/FAQ-1.2026-09-04T00-00-00-000Z.stderr.log`)).toBe(true)
+  })
+
   test('.. 一律拒絕（path traversal）', () => {
     expect(isAllowedTracePath(`${AGENT_TRACE_DIR}/../../etc/passwd`)).toBe(false)
   })

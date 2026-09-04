@@ -19,6 +19,10 @@
 //                       原始資料（2026-09-04 新增，task 1：head 的
 //                       computeBugStages() 組裝用；見
 //                       lib/pipeline-runner/local-stage-files.ts）
+//   GET  /jobs/:ticket/current-stage  這張 bug 票此刻正在跑哪個 stage／哪位
+//                       agent 的即時推定（2026-09-04 新增，task 2：head 的
+//                       computeBugStages() 組裝「running」那一列用；見
+//                       lib/pipeline-runner/local-current-stage.ts）
 // 其餘路徑一律 uniform 401。
 //
 // 完成回報（事件驅動，不輪詢）：任一背景 pipeline 真的結束（pipeline-queue
@@ -70,6 +74,7 @@ import { createJobDoneQueue, retryJobDoneQueue } from './lib/cluster/job-done-qu
 import { cancelLocalPipeline } from './lib/pipeline-runner/local-cancel.ts'
 import { readLocalTraceFile } from './lib/pipeline-runner/local-trace-read.ts'
 import { readLocalStageFiles } from './lib/pipeline-runner/local-stage-files.ts'
+import { inferCurrentBugStage } from './lib/pipeline-runner/local-current-stage.ts'
 import type { SubmitResult } from './lib/pipeline-runner/pipeline-queue.ts'
 import type { TechUser } from './lib/user-resolution/tech-user.ts'
 
@@ -527,6 +532,20 @@ app.get('/jobs/:ticket/stage-files', guard, c => {
   const ticket = c.req.param('ticket')
   if (!BUG_TICKET_RE.test(ticket)) return c.json({ ok: false, reason: 'bad_request' }, 400)
   return c.json({ ok: true, ...readLocalStageFiles(ticket) })
+})
+
+// 這張 bug 票此刻正在跑哪個 stage／哪位 agent（2026-09-04 新增，task 2）：
+// head 的 computeBugStages() 靠這支端點把 running 那一列標出來——本機
+// inferCurrentBugStage() 掃的是本機 `~/.claude/projects/...` transcript，只有
+// 執行機自己讀得到，見 lib/pipeline-runner/local-current-stage.ts 檔頭。
+// `startedAt` 必須是這次 run 的 started_at（ISO 字串），用來錨定應該掃哪一份
+// transcript——格式不對就當沒帶（安全回退成 stage:null，不擋請求）。
+app.get('/jobs/:ticket/current-stage', guard, c => {
+  const ticket = c.req.param('ticket')
+  if (!BUG_TICKET_RE.test(ticket)) return c.json({ ok: false, reason: 'bad_request' }, 400)
+  const startedAt = c.req.query('startedAt') ?? ''
+  if (!startedAt || Number.isNaN(Date.parse(startedAt))) return c.json({ ok: false, reason: 'bad_request' }, 400)
+  return c.json({ ok: true, stage: inferCurrentBugStage(ticket, startedAt) })
 })
 
 app.all('*', c => respondUniform401(c))

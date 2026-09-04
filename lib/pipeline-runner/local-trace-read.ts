@@ -12,17 +12,26 @@
 // 白名單規則**逐字比照** tg-monitor/lib/services.ts 的 isAllowedTracePath——
 // 兩邊都是同一套 /Users/user/aladdin 目錄慣例（worker 機上的 telegram-dispatcher
 // checkout 固定在這個路徑，見 worker-agent.ts LOG_DIR 註解），刻意不放寬。
+//
+// task 1（2026-09-04）擴充：原本只放行 .stdout.log（agent-trace 用途），
+// tg-monitor `/api/log/tail`、`/api/log/since` host-aware 化後也會用同一支
+// `GET /files` 讀 worker 執行的票的 .stderr.log——補上這一種副檔名，安全等級
+// 不變（仍只認 DISPATCHER_LOG_DIR 底下、無 `..`、固定副檔名），沒有放寬到能讀
+// 任意檔案。tg-monitor 端 `isAllowedLogPath()` 對 dispatcher 目錄的規則本來就
+// 是任意 `.log`（不限 stdout/stderr），這裡刻意維持比它更窄的子集——worker
+// 只需要服務這兩種既有 pipeline log 格式，不需要對外暴露到那麼寬。
 
 import { existsSync, readFileSync } from 'node:fs'
 
 const DISPATCHER_LOG_DIR = '/Users/user/aladdin/telegram-dispatcher/logs'
 const AGENT_TRACE_DIR = `${DISPATCHER_LOG_DIR}/agent-traces`
 
-/** 逐字比照 tg-monitor/lib/services.ts 的 isAllowedTracePath——改動任一邊都要同步。 */
+/** 逐字比照 tg-monitor/lib/services.ts 的 isAllowedTracePath 的 .json 分支；
+ * .stdout.log／.stderr.log 兩種副檔名見上方 task 1 擴充註解——改動任一邊都要同步。 */
 export function isAllowedTracePath(p: string): boolean {
   if (p.includes('..')) return false
   if (p.startsWith(`${AGENT_TRACE_DIR}/`) && p.endsWith('.json')) return true
-  return p.startsWith(`${DISPATCHER_LOG_DIR}/`) && p.endsWith('.stdout.log')
+  return p.startsWith(`${DISPATCHER_LOG_DIR}/`) && (p.endsWith('.stdout.log') || p.endsWith('.stderr.log'))
 }
 
 export type ReadLocalTraceResult = { ok: true; content: string } | { ok: false; reason: 'not_allowed' | 'missing' | 'read_failed'; detail?: string }
