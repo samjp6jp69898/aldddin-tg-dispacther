@@ -80,7 +80,9 @@ const RUN_CREATE_MR_PROC_RE = /^bash -c [\s\S]*\brun-create-mr\s+([A-Z]+-\d+)\s+
 // 直接通知 Landon（見 checkPushMismatch），不透過 NEEDS_NOTIFY／assignee 那條
 // 既有路徑——這是給維運者的基礎設施層級警示，不是給 ticket 指派人的一般
 // 補發通知。
-const NEEDS_NOTIFY = new Set<Classification>(['skipped', 'timeout', 'infra_failure', 'cli_failure', 'unknown_failure'])
+// 2026-09-04：session_limit（見 classify-result.ts 檔頭「2026-09-04 研究
+// 補充」）跟其他四類同源——create-mr 完全沒機會通知，一併納入補發範圍。
+const NEEDS_NOTIFY = new Set<Classification>(['skipped', 'timeout', 'infra_failure', 'cli_failure', 'unknown_failure', 'session_limit'])
 
 export function shouldNotify(classification: Classification): boolean {
   return NEEDS_NOTIFY.has(classification)
@@ -119,17 +121,132 @@ function resolveAssigneeEmail(ticket: string): string | null {
   }
 }
 
-function buildNotifyText(ticket: string, classification: Classification, stdoutPath: string, stderrPath: string, retryNote: string): string {
-  if (classification === 'timeout') {
-    return `⚠️ [需人工檢查] ${ticket}
-/create-mr 背景流程逾時（超過 spawn-create-mr.ts 設定的 180 分鐘上限）被強制中止，沒有進入正常的成功/失敗/待釐清出口。${retryNote}請人工檢查 log：
-${stdoutPath}
-${stderrPath}`
+/** 預設的 email 通知管道：tg-notify.sh 失敗只回傳 false，不拋例外（跟 notifyOperator 同一套 best-effort 慣例）。 */
+function notifyViaEmail(email: string, text: string): boolean {
+  try {
+    execFileSync('bash', [TG_NOTIFY_SH, '--email', email, '--text', text], { encoding: 'utf8', timeout: EXEC_TIMEOUT_MS })
+    return true
+  } catch {
+    return false
   }
-  return `⚠️ [需人工檢查] ${ticket}
+}
+
+/**
+ * 2026-09-04 bug 修復：原本 resolveAssigneeEmail() 解析失敗（Notion 查詢失敗
+ * ／指派人非 tech／例外）時只印一行 log，完全不發任何 TG 通知——只有
+ * classification==='timeout' 才有強制升級給 TIMEOUT_ESCALATION_EMAIL 的保底
+ * 機制，其餘分類（session_limit/infra_failure/cli_failure/unknown_failure/
+ * skipped）沒有，等於補發通知路徑本身可能靜默失敗。現在不管哪個分類，只要
+ * 走到這裡（見 main() 呼叫處，NEEDS_NOTIFY 已篩過），最終一定會嘗試發給
+ * 一個人：優先嘗試 ticket 的當前指派 tech，解析失敗/通知失敗都退回發給同一個
+ * TIMEOUT_ESCALATION_EMAIL（沿用既有常數，不另開新的）。
+ *
+ * classification==='timeout' 是唯一例外：main() 在呼叫這個函式之前已經無
+ * 條件對 TIMEOUT_ESCALATION_EMAIL 發過一次強制升級通知（見該處註解），這裡
+ * 的 escalate() 對 timeout 分類直接跳過，避免同一個人收到兩則幾乎一樣的
+ * 訊息——不是漏做，是刻意不重複。
+ *
+ * deps 可覆寫（測試用，不必真的打 Notion/Telegram API）。
+ */
+export function notifyAssigneeOrEscalate(
+  ticket: string,
+  classification: Classification,
+  text: string,
+  deps: { resolveEmail?: (ticket: string) => string | null; notify?: (email: string, text: string) => boolean } = {},
+): void {
+  const resolveEmail = deps.resolveEmail ?? resolveAssigneeEmail
+  const notify = deps.notify ?? notifyViaEmail
+
+  const escalate = (reason: string): void => {
+    if (classification === 'timeout') {
+      log(`${ticket} classification=timeout，保底聯絡人已在強制升級區塊處理過，不重複發（${reason}）`)
+      return
+    }
+    if (notify(TIMEOUT_ESCALATION_EMAIL, text)) {
+      log(`${ticket} 已改發保底聯絡人 ${TIMEOUT_ESCALATION_EMAIL}（原因：${reason}）`)
+    } else {
+      log(`${ticket} 保底聯絡人 ${TIMEOUT_ESCALATION_EMAIL} 通知也失敗（原因：${reason}）`)
+    }
+  }
+
+  let email: string | null
+  try {
+    email = resolveEmail(ticket)
+  } catch (err) {
+    log(`${ticket} assignee 解析例外: ${err}`)
+    escalate('assignee 解析例外')
+    return
+  }
+
+  if (!email) {
+    log(`${ticket} 需要補發通知但找不到 tech assignee email（Notion 當前指派可能已變更或非 tech）`)
+    escalate('找不到 tech assignee email')
+    return
+  }
+
+  if (classification === 'timeout' && email === TIMEOUT_ESCALATION_EMAIL) {
+    // classification==='timeout' 且 email 剛好等於 Landon 時，上面已經發過
+    // 同一份文字給同一個人，這裡跳過避免重複發送。
+    return
+  }
+
+  if (notify(email, text)) {
+    log(`${ticket} 已補發通知給 ${email}`)
+  } else {
+    log(`${ticket} 補發通知給 ${email} 失敗`)
+    escalate('補發給 assignee 失敗')
+  }
+}
+
+/**
+ * 2026-09-04：逐一檢查每種需要補發通知的分類，確保收到訊息的人一眼就能看出
+ * 是哪種結束方式——不能共用同一段泛用文字（改動前只有 timeout 有專屬文字，
+ * 其餘四類全部共用同一句「異常結束（分類：xxx）」，只在括號裡塞分類代號，
+ * 對非技術 assignee 不夠一眼看懂）。每個分支的第一行方括號標籤故意互不相同。
+ */
+export function buildNotifyText(ticket: string, classification: Classification, stdoutPath: string, stderrPath: string, retryNote: string): string {
+  const logLines = `${stdoutPath}\n${stderrPath}`
+
+  switch (classification) {
+    case 'timeout':
+      return `⚠️ [逾時中止] ${ticket}
+/create-mr 背景流程逾時（超過 spawn-create-mr.ts 設定的 180 分鐘上限）被強制中止，沒有進入正常的成功/失敗/待釐清出口。${retryNote}請人工檢查 log：
+${logLines}`
+
+    case 'session_limit':
+      // 見 classify-result.ts 檔頭「2026-09-04 研究補充」：這是低信心度字串
+      // 比對，不是官方保證的訊號，文字必須用「疑似」，不能斷言為事實。
+      return `⚠️ [疑似 Claude 額度用盡] ${ticket}
+/create-mr 背景流程異常結束，log 內容疑似出現 Claude session/usage limit（5 小時或週上限）已用盡的訊息——這是低信心度的文字特徵比對，不保證正確，請人工核實：若確認是額度問題，可等額度重置後手動重試（或用 resume 模式重跑）；若判斷有誤，請依下方 log 內容自行歸類為其他問題：
+${logLines}`
+
+    case 'skipped':
+      return `⚠️ [提早結束] ${ticket}
+/create-mr 在正式分析前的前置檢查就判定這張票不可認領（例如已被鎖定、或當前指派不在 tech 名單）而提早結束，沒有進入正常的成功/失敗/待釐清出口。請確認這張票是否需要人工介入，log：
+${logLines}`
+
+    case 'infra_failure':
+      return `⚠️ [CLI 執行環境異常] ${ticket}
+/create-mr 背景流程的外層執行環境本身以非 0 exit code 結束（非逾時），代表 claude -p 這層可能根本沒能正常啟動或跑完（例如指令找不到、環境設定錯誤），沒有進入正常的成功/失敗/待釐清出口。請人工檢查 log：
+${logLines}`
+
+    case 'cli_failure':
+      return `⚠️ [CLI 回報失敗] ${ticket}
+/create-mr 的 claude -p 有執行完畢，但輸出結果被 CLI 自己標記為失敗（is_error 或非 success 狀態），沒有進入正常的成功/失敗/待釐清出口。請人工檢查 log：
+${logLines}`
+
+    case 'unknown_failure':
+      return `⚠️ [輸出無法辨識] ${ticket}
+/create-mr 的 claude -p 有執行完畢且 CLI 層級回報成功，但輸出內容裡找不到可辨識的 Pipeline status（可能是報告格式被改寫、或輸出了非預期內容），沒有進入正常的成功/失敗/待釐清出口。請人工檢查 log：
+${logLines}`
+
+    default:
+      // success/needs_qa_clarification/failed 這三類不會走到補發通知路徑
+      // （見上方 NEEDS_NOTIFY），這裡只是保底分支，理論上不會被呼叫到。
+      return `⚠️ [需人工檢查] ${ticket}
 /create-mr 背景流程異常結束（分類：${classification}），沒有進入正常的成功/失敗/待釐清出口，請人工檢查 log：
-${stdoutPath}
-${stderrPath}`
+${logLines}`
+  }
 }
 
 /**
@@ -560,24 +677,10 @@ async function main(): Promise<void> {
     }
   }
 
-  // assignee 解析＋通知整段包一層 try/catch（不只是 resolveAssigneeEmail 內部
-  // 那個只護到 execFileSync 的 try——getTicketNotionUrl 這段例外會從
-  // resolveAssigneeEmail 直接穿出來，見上面的說明），確保就算這裡意外拋例外，
-  // 也不會影響上面已經送出的 Landon 升級通知（本來就已經送完了），且能把
-  // 例外記進 log 而不是讓整個 process 帶著非 0 exit code 消失不留痕跡。
-  try {
-    const email = resolveAssigneeEmail(ticket)
-    if (!email) {
-      log(`${ticket} 需要補發通知但找不到 tech assignee email（Notion 當前指派可能已變更或非 tech），略過`)
-    } else if (classification !== 'timeout' || email !== TIMEOUT_ESCALATION_EMAIL) {
-      // classification==='timeout' 且 email 剛好等於 Landon 時，上面已經發過
-      // 同一份文字給同一個人，這裡跳過避免重複發送。
-      execFileSync('bash', [TG_NOTIFY_SH, '--email', email, '--text', text], { encoding: 'utf8', timeout: EXEC_TIMEOUT_MS })
-      log(`${ticket} 已補發通知給 ${email}`)
-    }
-  } catch (err) {
-    log(`${ticket} assignee 通知失敗（含解析階段例外）: ${err}`)
-  }
+  // assignee 解析＋通知＋（解析/發送失敗時的）保底升級，全部收斂進
+  // notifyAssigneeOrEscalate（見該函式檔頭 2026-09-04 bug 修復說明）：不管
+  // 哪個分類，走到這裡最終一定會有人收到通知，不會再只印 log 就結束。
+  notifyAssigneeOrEscalate(ticket, classification, text)
 }
 
 if (import.meta.main) {

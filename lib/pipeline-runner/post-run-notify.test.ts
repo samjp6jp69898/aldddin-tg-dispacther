@@ -2,7 +2,8 @@ import { describe, expect, mock, test } from 'bun:test'
 import { unlinkSync, writeFileSync, mkdtempSync, readFileSync, rmSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { checkPushMismatch, shouldNotify, parseRunningBugTickets, writeAuthoritativeOutcome } from './post-run-notify.ts'
+import { checkPushMismatch, shouldNotify, parseRunningBugTickets, writeAuthoritativeOutcome, buildNotifyText, notifyAssigneeOrEscalate } from './post-run-notify.ts'
+import type { Classification } from './classify-result.ts'
 import { FakeRunsDb } from '../monitor-db/test-support/fake-runs-db.ts'
 import { __resetDeclaredMonitorRoleForTest, declareMonitorRole } from '../monitor-db/env.ts'
 import type { SpoolEntry } from '../monitor-db/spool/types.ts'
@@ -338,5 +339,94 @@ describe('parseRunningBugTickets — 排除自己的 wrapper（2026-08-26 aladdi
   test('沒有任何 bug pipeline wrapper 時回傳空陣列', () => {
     const psOutput = ['1 /sbin/launchd', '42 /usr/sbin/cron'].join('\n')
     expect(parseRunningBugTickets(psOutput, 99999)).toEqual([])
+  })
+})
+
+describe('buildNotifyText — 2026-09-04：每種分類的通知文字要一眼看出是哪種結束方式（不能共用同一句泛用文字）', () => {
+  const NOTIFY_CLASSIFICATIONS: Classification[] = ['skipped', 'timeout', 'infra_failure', 'cli_failure', 'unknown_failure', 'session_limit']
+
+  test('六種需要補發通知的分類，文字彼此互不相同（不共用同一句話）', () => {
+    const texts = NOTIFY_CLASSIFICATIONS.map(c => buildNotifyText('FAQ-1', c, '/tmp/x.stdout.log', '/tmp/x.stderr.log', ''))
+    expect(new Set(texts).size).toBe(NOTIFY_CLASSIFICATIONS.length)
+  })
+
+  test('每種分類的方括號標籤彼此互不相同', () => {
+    const labels = NOTIFY_CLASSIFICATIONS.map(c => {
+      const text = buildNotifyText('FAQ-1', c, 'out.log', 'err.log', '')
+      const m = /^⚠️ \[(.+?)\]/.exec(text)
+      return m ? m[1] : null
+    })
+    expect(labels.every(l => l !== null)).toBe(true)
+    expect(new Set(labels).size).toBe(labels.length)
+  })
+
+  test('session_limit：文字含「疑似」（低信心度 heuristic，不能斷言為事實）且提及額度用盡', () => {
+    const text = buildNotifyText('FAQ-1', 'session_limit', 'out.log', 'err.log', '')
+    expect(text).toContain('疑似')
+    expect(text).toContain('額度')
+  })
+
+  test('timeout：retryNote 有插入文字裡', () => {
+    const text = buildNotifyText('FAQ-1', 'timeout', 'out.log', 'err.log', '已觸發第 1 次自動重試——')
+    expect(text).toContain('已觸發第 1 次自動重試——')
+  })
+
+  test('log 路徑都會出現在文字裡', () => {
+    for (const c of NOTIFY_CLASSIFICATIONS) {
+      const text = buildNotifyText('FAQ-1', c, '/tmp/a.stdout.log', '/tmp/a.stderr.log', '')
+      expect(text).toContain('/tmp/a.stdout.log')
+      expect(text).toContain('/tmp/a.stderr.log')
+    }
+  })
+})
+
+describe('notifyAssigneeOrEscalate — 2026-09-04 bug 修復：assignee 解析/通知失敗時不能只印 log，最終一定要有人收到通知', () => {
+  test('正常情境：assignee 解析成功、通知成功 → 只發一次給 assignee，不觸發保底', () => {
+    const notify = mock((_email: string, _text: string) => true)
+    const resolveEmail = mock((_t: string) => 'tech@example.com')
+    notifyAssigneeOrEscalate('FAQ-1', 'infra_failure', 'text', { resolveEmail, notify })
+    expect(notify).toHaveBeenCalledTimes(1)
+    expect(notify.mock.calls[0]![0]).toBe('tech@example.com')
+  })
+
+  test('找不到 assignee email（回傳 null）→ 非 timeout 分類要退回發給保底聯絡人，不能只印 log 就結束', () => {
+    const notify = mock((_email: string, _text: string) => true)
+    const resolveEmail = mock((_t: string) => null)
+    notifyAssigneeOrEscalate('FAQ-1', 'infra_failure', 'text', { resolveEmail, notify })
+    expect(notify).toHaveBeenCalledTimes(1)
+    expect(notify.mock.calls[0]![0]).toBe('pkh_samjp6jp69898@photons.com.tw')
+  })
+
+  test('resolveEmail 拋例外 → 非 timeout 分類仍要退回發給保底聯絡人', () => {
+    const notify = mock((_email: string, _text: string) => true)
+    const resolveEmail = mock((_t: string) => {
+      throw new Error('Notion API 掛了')
+    })
+    expect(() => notifyAssigneeOrEscalate('FAQ-1', 'cli_failure', 'text', { resolveEmail, notify })).not.toThrow()
+    expect(notify).toHaveBeenCalledTimes(1)
+    expect(notify.mock.calls[0]![0]).toBe('pkh_samjp6jp69898@photons.com.tw')
+  })
+
+  test('對 assignee 發送失敗（notify 回傳 false）→ 非 timeout 分類仍要退回發給保底聯絡人', () => {
+    const notify = mock((email: string, _text: string) => email !== 'tech@example.com')
+    const resolveEmail = mock((_t: string) => 'tech@example.com')
+    notifyAssigneeOrEscalate('FAQ-1', 'session_limit', 'text', { resolveEmail, notify })
+    expect(notify).toHaveBeenCalledTimes(2)
+    expect(notify.mock.calls[0]![0]).toBe('tech@example.com')
+    expect(notify.mock.calls[1]![0]).toBe('pkh_samjp6jp69898@photons.com.tw')
+  })
+
+  test('classification===timeout 且找不到 assignee → 不重複發保底聯絡人（main() 已在此之前無條件發過一次）', () => {
+    const notify = mock((_email: string, _text: string) => true)
+    const resolveEmail = mock((_t: string) => null)
+    notifyAssigneeOrEscalate('FAQ-1', 'timeout', 'text', { resolveEmail, notify })
+    expect(notify).not.toHaveBeenCalled()
+  })
+
+  test('classification===timeout 且 assignee 剛好就是保底聯絡人 → 不重複發（避免同一人收到兩則幾乎一樣的訊息）', () => {
+    const notify = mock((_email: string, _text: string) => true)
+    const resolveEmail = mock((_t: string) => 'pkh_samjp6jp69898@photons.com.tw')
+    notifyAssigneeOrEscalate('FAQ-1', 'timeout', 'text', { resolveEmail, notify })
+    expect(notify).not.toHaveBeenCalled()
   })
 })

@@ -59,6 +59,31 @@ describe('classifyPipelineResult — 七種分類（T12 acceptance criteria）',
   })
 })
 
+describe('classifyPipelineResult — session_limit（2026-09-04 新增，低信心度 stdout 字串特徵比對）', () => {
+  test('exit code 非 0 且 stdout 含已知額度用盡字串 → session_limit（優先於 infra_failure）', () => {
+    expect(classifyPipelineResult(1, "Error: You've hit your session limit · resets 2am (Europe/Zurich)")).toBe('session_limit')
+    expect(classifyPipelineResult(1, 'Claude usage limit reached. Resets at 2pm')).toBe('session_limit')
+  })
+
+  test('exit code 0、stdout 不是合法 JSON 但含已知字串 → session_limit（優先於 cli_failure）', () => {
+    expect(classifyPipelineResult(0, "5-hour limit reached - resets 3pm (UTC)")).toBe('session_limit')
+  })
+
+  test('is_error=true 且 result 文字含已知字串 → session_limit（優先於 cli_failure）', () => {
+    expect(classifyPipelineResult(0, fakeStdout({ is_error: true, subtype: 'error_during_execution', result: "You've hit your weekly limit · resets Oct 9, 10am" }))).toBe('session_limit')
+    expect(classifyPipelineResult(0, fakeStdout({ is_error: true, subtype: 'error_during_execution', result: 'Credit balance is too low' }))).toBe('session_limit')
+  })
+
+  test('不該誤判：一般 rate limit（429）／暫時限流字樣不算額度用盡，仍走既有分類', () => {
+    expect(classifyPipelineResult(1, 'Server is temporarily limiting requests')).toBe('infra_failure')
+    expect(classifyPipelineResult(0, fakeStdout({ is_error: true, subtype: 'error_during_execution', result: 'Request rejected (429)' }))).toBe('cli_failure')
+  })
+
+  test('exitCode===124（timeout）不受 session_limit 偵測影響，仍固定回傳 timeout', () => {
+    expect(classifyPipelineResult(124, "You've hit your session limit")).toBe('timeout')
+  })
+})
+
 describe('classifyPipelineResult — 兩個獨立 review agent 都抓到的真實 bug 回歸測試', () => {
   test('完整報告裡的「chat_id 同步: SKIPPED」不該蓋掉真正的 Pipeline status', () => {
     const fullReportSuccess = [
