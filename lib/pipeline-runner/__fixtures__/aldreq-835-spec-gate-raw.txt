@@ -1,0 +1,3 @@
+已經確認：`agrabah/src/servers/message_board/services/message_board.ts:1657` 的 `methodRemovePost` 正是需求單描述的「前台會員自行刪除發文」入口（doc comment 明寫「C 端 lago 貼文詳情頁『刪除』按鈕觸發」「只能刪除自己的貼文」），而同檔案內發文（271 行）、留言（346 行）、送禮（2235 行）等動作都已用同一套既有模式在成功後呼叫 `trackEvent(context, context.userId, EventCategoryEnum.messageboard, EventActionIdEnum.xxx, EventStatusCodeEnum.success)`，該 helper（`common_services/event_log.ts`）會自動帶入 userId、identifier（帳號）、IP、device、deviceId、時間戳，寫入 `events` 表供 `EventBackOffice.ListUserBehaviorLogs`（會員日誌）查詢——即需求單列的全部欄位都已由既有機制涵蓋。`EventActionIdEnum` 目前 messageboard 系列（601–607）中沒有「刪除發文」對應值，但比照既有連號慣例新增一個即可，且 `methodRemovePost` 目前確實缺這行呼叫，與 Notion 描述的現況（後台查無記錄）完全吻合。
+
+{"sufficient": true}

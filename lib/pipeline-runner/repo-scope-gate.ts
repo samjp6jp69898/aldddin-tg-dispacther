@@ -1,4 +1,5 @@
 import { execClaudeWithStdin } from './claude-exec.ts'
+import { extractLastJsonObject } from './extract-json-object.ts'
 
 const CLAUDE_EXEC_TIMEOUT_MS = 120_000
 const MAIN_REPOS = ['agrabah', 'abu', 'lago', 'rajah'] as const
@@ -72,7 +73,13 @@ ${comments.length > 0 ? comments.join('\n') : '（沒有留言）'}
   try {
     parsed = JSON.parse(raw)
   } catch {
-    throw new Error(`claude -p 輸出的 result 不是合法 JSON: ${raw.slice(0, 500)}`)
+    // 2026-09-04 新增：模型自由文字偶爾會在真正的 JSON 前多寫推理段落，見
+    // spec-sufficiency-gate.ts 同款救援步驟的完整理由（extract-json-object.ts）。
+    const rescued = extractLastJsonObject(raw)
+    if (rescued === undefined) {
+      throw new Error(`claude -p 輸出的 result 不是合法 JSON: ${raw.slice(0, 500)}`)
+    }
+    parsed = rescued
   }
 
   const repos = (parsed as any)?.repos

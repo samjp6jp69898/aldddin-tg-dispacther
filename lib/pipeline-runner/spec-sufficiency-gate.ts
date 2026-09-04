@@ -2,6 +2,7 @@ import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { getDemandTicketNotionUrl } from '../notion-integration/demand-pool-tickets.ts'
 import { execClaudeWithStdin } from './claude-exec.ts'
+import { extractLastJsonObject } from './extract-json-object.ts'
 
 const execFileAsync = promisify(execFile)
 const NOTION_SH = '/Users/user/aladdin/scripts/notion.sh'
@@ -211,15 +212,26 @@ async function askClaude(prompt: string, ticket: string): Promise<{ sufficient: 
     throw new Error(`claude -p 輸出找不到 type=result 事件: ${stdout.slice(0, 500)}`)
   }
 
-  // 防禦性處理：模型偶爾還是會不小心包一層 markdown code fence，先剝掉再
-  // 解析，剝不掉也不強行用正則去猜 JSON 邊界（跟 T12 classify-result.ts
-  // 同樣的紀律：解析失敗就是失敗，不要用脆弱的 fallback 硬湊出一個答案）。
+  // 防禦性處理：模型偶爾還是會不小心包一層 markdown code fence，先剝掉再解析。
   const raw = resultEvent.result.trim().replace(/^```(?:json)?\n?/, '').replace(/```$/, '').trim()
   let verdict: unknown
   try {
     verdict = JSON.parse(raw)
   } catch {
-    throw new Error(`claude -p 輸出的 result 不是合法 JSON: ${raw.slice(0, 500)}`)
+    // 2026-09-04 新增（ALDREQ-835 真實案例）：模型偶爾會在真正的 JSON 前多寫
+    // 一段推理文字才收尾（判斷本身是對的，純粹格式沒完全照『只回 JSON』的
+    // 指令）。跟 classify-result.ts extractResultEvent() 拒絕的「正則猜邊界」
+    // 不是同一件事——那裡解析的是 claude -p CLI 自己印出的 event envelope
+    // （機器產生、理論上永遠乾淨，過去真的因為 stdout/stderr 混流出過 bug，
+    // 已用「檔案分離」從結構上根治，不該在那層加解析端救援）；這裡解析的是
+    // 模型自由文字，且救援步驟只接受完整合法的 JSON 物件（extractLastJsonObject
+    // 找不到就回 undefined，不修補、不猜測破損內容），找不到時走跟以前完全
+    // 一樣的 fail-loud 錯誤，不會改變既有行為。見 extract-json-object.ts 檔頭。
+    const rescued = extractLastJsonObject(raw)
+    if (rescued === undefined) {
+      throw new Error(`claude -p 輸出的 result 不是合法 JSON: ${raw.slice(0, 500)}`)
+    }
+    verdict = rescued
   }
 
   if (typeof verdict !== 'object' || verdict === null || typeof (verdict as any).sufficient !== 'boolean') {
