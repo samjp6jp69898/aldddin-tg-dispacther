@@ -80,6 +80,33 @@ export function getDeclaredMonitorRole(): DeclarableMonitorRole | null {
   return declaredRole
 }
 
+/**
+ * 短命 CLI 專用：從本機 `process.env.MON_DB_USER` 判斷這個行程實際跑在哪台
+ * 機器上，宣告對應角色——不猜「這種 pipeline 通常在哪台機器跑」。
+ *
+ * 2026-09-04 事故（ALDREQ-834）：post-run-notify.ts／demand-monitor-writes.ts
+ * 曾寫死呼叫 `declareMonitorRole('mon_head')`，理由是「這兩支短命 CLI 固定
+ * 只在 head 機器上跑」——但 `lib/cluster/dispatch.ts` 的派工機制其實會把
+ * bug/demand pipeline 都派去 worker 執行，這個假設不成立。worker 上
+ * `MON_DB_USER` 是 `mon_exec`，跟寫死的 `mon_head` 不符，
+ * `loadMonitorEnv()` 的 `expectedRole` 斷言因此必然拋出，又被呼叫端一律
+ * best-effort 的 try/catch 默默吞掉，權威結果永遠寫不進監控 DB，事後被
+ * sweeper 貼成 `unknown_no_writer`。
+ *
+ * 依 MAJOR-F9 的裁定，每台機器的 `.env` 只放該機器該用的那一個帳號
+ * （head=mon_head、worker=mon_exec）——讓 `.env`（由 Bun 於行程啟動時自動
+ * 載入進 `process.env`）本身說了算，不用猜。`MON_DB_USER` 不是合法的可宣告
+ * 角色時保持未宣告，交回 `declareMonitorRole()` 原有的 CLUSTER_WORKER_NAME
+ * 嗅探 fallback（`.env` 缺漏、`mon_ui` 等本函式不涉及的角色、或測試環境
+ * 未設）。
+ */
+export function declareMonitorRoleFromLocalEnv(): void {
+  const user = (process.env.MON_DB_USER ?? '').trim()
+  if (user === 'mon_head' || user === 'mon_exec') {
+    declareMonitorRole(user)
+  }
+}
+
 /** 測試專用：重置宣告狀態與 MON_HOST，回到「嗅探環境變數」的預設行為。 */
 export function __resetDeclaredMonitorRoleForTest(): void {
   declaredRole = null

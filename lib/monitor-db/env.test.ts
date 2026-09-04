@@ -7,7 +7,7 @@
 // head 因此被誤判成 worker：monitor-db 連線要求 mon_exec 帳號，但 .env 只有
 // mon_head 密碼，連線池建立失敗（loadMonitorEnv 的角色不符例外）。
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { __resetDeclaredMonitorRoleForTest, declareMonitorRole, getDeclaredMonitorRole } from './env.ts'
+import { __resetDeclaredMonitorRoleForTest, declareMonitorRole, declareMonitorRoleFromLocalEnv, getDeclaredMonitorRole } from './env.ts'
 // 動態讀 MON_HOST：它是 `export let`（ESM live binding），每次直接引用
 // `MON_HOST` 識別字就能看到宣告後的最新值——這裡刻意每次都重新 import 同一個
 // 模組實例（bun test 同一個 process 內模組快取不變，import 多次拿到同一份）
@@ -62,5 +62,54 @@ describe('declareMonitorRole — 顯式宣告角色（不再嗅探 CLUSTER_WORKE
   test('重複宣告成同一個角色 → 允許（冪等，不拋例外）', () => {
     declareMonitorRole('mon_head')
     expect(() => declareMonitorRole('mon_head')).not.toThrow()
+  })
+})
+
+// 2026-09-04 事故回歸測試（ALDREQ-834）：post-run-notify.ts／
+// demand-monitor-writes.ts 曾寫死 declareMonitorRole('mon_head')，理由是
+// 「這兩支短命 CLI 固定只在 head 機器上跑」——但 dispatch.ts 的派工機制其實
+// 會把 bug/demand pipeline 都派去 worker 執行，worker 的 MON_DB_USER 是
+// mon_exec，跟寫死的 mon_head 不符，loadMonitorEnv() 的 expectedRole 斷言
+// 必然拋出，被呼叫端一律 best-effort 的 try/catch 默默吞掉，權威結果永遠
+// 寫不進監控 DB。declareMonitorRoleFromLocalEnv() 改讓 .env 的 MON_DB_USER
+// 本身說了算，不猜。
+describe('declareMonitorRoleFromLocalEnv — 依本機 .env 的 MON_DB_USER 宣告角色，不猜測', () => {
+  let prevUser: string | undefined
+  let prevWorkerName: string | undefined
+
+  beforeEach(() => {
+    prevUser = process.env.MON_DB_USER
+    prevWorkerName = process.env.CLUSTER_WORKER_NAME
+    __resetDeclaredMonitorRoleForTest()
+  })
+
+  afterEach(() => {
+    if (prevUser === undefined) delete process.env.MON_DB_USER
+    else process.env.MON_DB_USER = prevUser
+    if (prevWorkerName === undefined) delete process.env.CLUSTER_WORKER_NAME
+    else process.env.CLUSTER_WORKER_NAME = prevWorkerName
+    __resetDeclaredMonitorRoleForTest()
+  })
+
+  test('ALDREQ-834 核心回歸案例：MON_DB_USER=mon_exec（worker 環境）→ 宣告 mon_exec，不再被寫死宣告成 mon_head', () => {
+    process.env.MON_DB_USER = 'mon_exec'
+    process.env.CLUSTER_WORKER_NAME = 'landon2'
+    declareMonitorRoleFromLocalEnv()
+    expect(getDeclaredMonitorRole()).toBe('mon_exec')
+    expect(liveMonHost).toBe('landon2')
+  })
+
+  test('MON_DB_USER=mon_head（head 環境）→ 宣告 mon_head，就算 CLUSTER_WORKER_NAME 被污染殘留也不受影響', () => {
+    process.env.MON_DB_USER = 'mon_head'
+    process.env.CLUSTER_WORKER_NAME = 'polluted-worker-name'
+    declareMonitorRoleFromLocalEnv()
+    expect(getDeclaredMonitorRole()).toBe('mon_head')
+    expect(liveMonHost).toBe('head')
+  })
+
+  test('MON_DB_USER 不是合法可宣告角色（缺漏／mon_ui／測試環境未設）→ 保持未宣告，交回舊嗅探 fallback', () => {
+    delete process.env.MON_DB_USER
+    declareMonitorRoleFromLocalEnv()
+    expect(getDeclaredMonitorRole()).toBeNull()
   })
 })

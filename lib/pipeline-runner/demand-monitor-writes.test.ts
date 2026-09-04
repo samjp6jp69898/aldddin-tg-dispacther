@@ -13,7 +13,7 @@ import { describe, expect, spyOn, test, afterEach } from 'bun:test'
 import { FakeRunsDb } from '../monitor-db/test-support/fake-runs-db.ts'
 import { W1_SQL } from '../monitor-db/writes.ts'
 import { mintRunId, readInheritedRunId, tryWriteOrSpool, writeDemandOutcomeAuthoritative } from './demand-monitor-writes.ts'
-import { __resetDeclaredMonitorRoleForTest } from '../monitor-db/env.ts'
+import { __resetDeclaredMonitorRoleForTest, getDeclaredMonitorRole } from '../monitor-db/env.ts'
 import type { SpoolEntry } from '../monitor-db/spool/types.ts'
 
 const ORIGINAL_MON_RUN_ID = process.env.MON_RUN_ID
@@ -162,34 +162,44 @@ describe('flag 關閉（MON_DB_ENABLED 未設）→ 公開函式零副作用', (
   })
 })
 
-// 2026-09-03 回歸測試：本檔的兩個實際呼叫端（post-run-demand.ts 的 trap 側、
-// run-demand-pipeline.ts 的 finalize()）都固定只在 head 機器上跑，
-// writeDemandOutcomeAuthoritative 現已在最早執行點顯式宣告 declareMonitorRole
-// ('mon_head')（見本檔該函式），之後角色判斷不再嗅探 CLUSTER_WORKER_NAME。
-describe('writeDemandOutcomeAuthoritative — 顯式宣告角色，不再嗅探 CLUSTER_WORKER_NAME', () => {
-  test('即使 CLUSTER_WORKER_NAME 被汙染成非空字串，角色判斷仍固定回報 mon_head', async () => {
+// 2026-09-04 回歸測試（ALDREQ-834 事故）：本檔的兩個實際呼叫端
+// （post-run-demand.ts 的 trap 側、run-demand-pipeline.ts 的 finalize()）
+// 不是固定只在 head 機器上跑——dispatch.ts 的派工機制會把 demand pipeline
+// 派去 worker 執行。writeDemandOutcomeAuthoritative 曾在最早執行點顯式寫死
+// declareMonitorRole('mon_head')，worker 上 .env 的 MON_DB_USER 卻是
+// mon_exec，跟寫死值不符，loadMonitorEnv 的 expectedRole 斷言必然拋出、被
+// best-effort 吞掉，權威結果永遠寫不進 DB。現已改用
+// declareMonitorRoleFromLocalEnv()（見 env.ts），依本機 .env 的 MON_DB_USER
+// 判斷角色，不猜。
+describe('writeDemandOutcomeAuthoritative — 依本機 .env 宣告角色，不再寫死 mon_head', () => {
+  test('ALDREQ-834 核心回歸案例：worker 環境（MON_DB_USER=mon_exec）→ 正確宣告 mon_exec，不再被寫死宣告成 mon_head', async () => {
     const prevEnabled = process.env.MON_DB_ENABLED
     const prevUser = process.env.MON_DB_USER
     const prevWorker = process.env.CLUSTER_WORKER_NAME
+    const prevHost = process.env.MON_DB_HOST
     __resetDeclaredMonitorRoleForTest()
     process.env.MON_DB_ENABLED = '1'
-    process.env.CLUSTER_WORKER_NAME = 'polluted-worker-name' // 模擬環境變數污染（舊嗅探邏輯會誤判成 worker）
-    // 故意設成跟 mon_head、mon_exec 都不符的值：不管角色實際解析成哪一個，
-    // loadMonitorEnv 的 expectedRole 同步檢查都會拋出「角色不符」，訊息裡的
-    // expectedRole 就是這裡真正拿到的角色——用這個間接訊號驗證，不需要真的
-    // 連線，也不會意外寫真的 spool 檔（同步拋出發生在 spool 建立之前）。
-    process.env.MON_DB_USER = 'not-a-real-monitor-role'
+    process.env.MON_DB_USER = 'mon_exec' // 真實案例：landon2 的 .env
+    process.env.CLUSTER_WORKER_NAME = 'landon2'
+    // 故意指到不可路由的位址：這則測試只關心角色宣告本身是否正確，不依賴
+    // 任何真的 monitor DB 是否在跑——pool.ts 的 connectTimeout（500ms）讓
+    // 連線嘗試確定性地快速失敗，不是靠等待解決正確性問題。
+    process.env.MON_DB_HOST = '10.255.255.1'
     const errorSpy = spyOn(console, 'error').mockImplementation(() => {})
     try {
       await expect(
         writeDemandOutcomeAuthoritative(
-          { runId: 'run-role-check', ticket: 'ALDREQ-9001', outcome: 'timeout', outcomeSource: 'test', finishedAt: new Date().toISOString() },
+          { runId: 'run-role-check', ticket: 'ALDREQ-834', outcome: 'success', outcomeSource: 'test', finishedAt: new Date().toISOString() },
           { writerName: 'cli' },
         ),
-      ).resolves.toBeUndefined() // 全程 best-effort：即使角色宣告/連線建立失敗也不拋出
+      ).resolves.toBeUndefined() // 全程 best-effort：即使連線建立失敗也不拋出
+      // 核心斷言：角色正確解析為 mon_exec（跟本機 MON_DB_USER 一致）——這正是
+      // ALDREQ-834 的根因修復，舊版寫死 mon_head 這裡會斷言失敗。
+      expect(getDeclaredMonitorRole()).toBe('mon_exec')
+      // 連帶證明：不再出現「角色不符」這種自我矛盾的例外（舊 bug 的症狀，
+      // 由呼叫端自己寫死的角色跟 .env 打架造成，不是真的連線問題）。
       const loggedMessages = errorSpy.mock.calls.map(args => String(args[0]))
-      expect(loggedMessages.some(m => m.includes("要求 'mon_head'"))).toBe(true)
-      expect(loggedMessages.some(m => m.includes("要求 'mon_exec'"))).toBe(false)
+      expect(loggedMessages.some(m => m.includes('角色不符'))).toBe(false)
     } finally {
       errorSpy.mockRestore()
       if (prevEnabled === undefined) delete process.env.MON_DB_ENABLED
@@ -198,6 +208,8 @@ describe('writeDemandOutcomeAuthoritative — 顯式宣告角色，不再嗅探 
       else process.env.MON_DB_USER = prevUser
       if (prevWorker === undefined) delete process.env.CLUSTER_WORKER_NAME
       else process.env.CLUSTER_WORKER_NAME = prevWorker
+      if (prevHost === undefined) delete process.env.MON_DB_HOST
+      else process.env.MON_DB_HOST = prevHost
       __resetDeclaredMonitorRoleForTest()
     }
   })

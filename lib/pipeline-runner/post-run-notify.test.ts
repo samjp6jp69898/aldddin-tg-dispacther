@@ -5,7 +5,7 @@ import { join } from 'node:path'
 import { checkPushMismatch, shouldNotify, parseRunningBugTickets, writeAuthoritativeOutcome, buildNotifyText, notifyAssigneeOrEscalate } from './post-run-notify.ts'
 import type { Classification } from './classify-result.ts'
 import { FakeRunsDb } from '../monitor-db/test-support/fake-runs-db.ts'
-import { __resetDeclaredMonitorRoleForTest, declareMonitorRole } from '../monitor-db/env.ts'
+import { __resetDeclaredMonitorRoleForTest, declareMonitorRoleFromLocalEnv, getDeclaredMonitorRole } from '../monitor-db/env.ts'
 import type { SpoolEntry } from '../monitor-db/spool/types.ts'
 
 const LOG_DIR = '/Users/user/aladdin/telegram-dispatcher/logs'
@@ -141,28 +141,30 @@ describe('writeAuthoritativeOutcome — v3.2 §9 Phase2 bug 終態（權威）�
     }
   })
 
-  // 2026-09-03 回歸測試：main() 在最早執行處呼叫 declareMonitorRole('mon_head')
-  // 之後（見本檔 main()），writeAuthoritativeOutcome 內的角色判斷（現已改用
-  // monitorRoleForThisHost()）即使遇到 CLUSTER_WORKER_NAME 被汙染成非空字串，
-  // 也必須固定回報 mon_head，不能再被嗅探結果覆蓋——這裡直接呼叫
-  // declareMonitorRole('mon_head') 模擬 main() 的宣告時序，驗證的是
-  // writeAuthoritativeOutcome 實際會執行到的同一段程式碼路徑（跟上面
-  // 「createMonitorPool() 真的 throw」測試同一套手法：故意讓 MON_DB_USER 跟
-  // 「若角色被嗅探成 mon_exec」時會相符的值不一致，藉由 loadMonitorEnv 的
-  // expectedRole 同步檢查間接證明實際解析出的角色是 mon_head，不是 mon_exec
-  // ——若角色判斷退回嗅探（CLUSTER_WORKER_NAME 非空 → mon_exec），
-  // MON_DB_USER='mon_exec' 會通過角色比對、不觸發這個例外，落 spool 的行為
-  // 就不會發生，測試會失敗，藉此把「宣告優先於嗅探」的保證落到這支 CLI 的
-  // 實際程式碼路徑上，不只是 runtime.ts/env.ts 的通用單元測試）。
-  test('main() 已宣告 mon_head 後：即使 CLUSTER_WORKER_NAME 被汙染成非空字串，角色判斷仍固定回報 mon_head，且不污染生產 log', async () => {
+  // 2026-09-04 回歸測試（ALDREQ-834 事故）：main() 過去在最早執行處寫死呼叫
+  // declareMonitorRole('mon_head')，理由是「這支短命 CLI 固定只在 head 機器
+  // 上跑」——但 dispatch.ts 的派工機制其實會把 bug pipeline 派去 worker
+  // 執行，worker 上 .env 的 MON_DB_USER 是 mon_exec，跟寫死值不符，
+  // loadMonitorEnv 的 expectedRole 斷言因此必然拋出、被 best-effort 吞掉，
+  // 權威結果永遠寫不進 DB。main() 現已改呼叫 declareMonitorRoleFromLocalEnv()
+  // （見 env.ts），依本機 .env 的 MON_DB_USER 判斷角色。main() 本身不是可
+  // 匯出的函式，這裡直接呼叫 declareMonitorRoleFromLocalEnv() 模擬 main() 的
+  // 宣告時序，驗證 writeAuthoritativeOutcome 實際會執行到的同一段程式碼路徑
+  // 正確解析出 mon_exec（不是舊版寫死的 mon_head）。
+  test('worker 環境（MON_DB_USER=mon_exec）→ main() 現在正確宣告 mon_exec，不再被寫死宣告成 mon_head，且不污染生產 log', async () => {
     const prevRunId = process.env.MON_RUN_ID
     const prevUser = process.env.MON_DB_USER
     const prevWorker = process.env.CLUSTER_WORKER_NAME
+    const prevHost = process.env.MON_DB_HOST
     __resetDeclaredMonitorRoleForTest()
     process.env.MON_RUN_ID = '77777777-7777-7777-7777-777777777777'
-    process.env.CLUSTER_WORKER_NAME = 'polluted-worker-name' // 模擬環境變數污染
-    process.env.MON_DB_USER = 'mon_exec' // 若角色仍被嗅探成 mon_exec，這裡會「相符」、不觸發下面的例外
-    declareMonitorRole('mon_head') // 模擬 main() 在最早執行處已做過的宣告
+    process.env.MON_DB_USER = 'mon_exec' // 真實案例：landon2 的 .env
+    process.env.CLUSTER_WORKER_NAME = 'landon2'
+    // 故意指到不可路由的位址：這則測試只關心角色宣告本身是否正確，不依賴
+    // 任何真的 monitor DB 是否在跑——pool.ts 的 connectTimeout（500ms）讓
+    // 連線嘗試確定性地快速失敗，不是靠等待解決正確性問題。
+    process.env.MON_DB_HOST = '10.255.255.1'
+    declareMonitorRoleFromLocalEnv() // 模擬 main() 在最早執行處已做過的宣告
     // 2026-09-04 污染源修復：同上一條測試理由，這條也會真的觸發 log()。
     const tmpDir = mkdtempSync(join(tmpdir(), 'post-run-notify-log-'))
     const tmpLogPath = join(tmpDir, 'test.log')
@@ -172,14 +174,17 @@ describe('writeAuthoritativeOutcome — v3.2 §9 Phase2 bug 終態（權威）�
       // 刻意只傳 deps.spool、不傳 deps.pool：函式真的執行
       // createMonitorPool(monitorRoleForThisHost(), ...)，不是被測試繞過。
       await writeAuthoritativeOutcome('FAQ-9008', 'timeout', 124, '/tmp/FAQ-9008.stdout.log', '/tmp/FAQ-9008.stderr.log', { spool: fakeSpool, logPath: tmpLogPath })
-      // 角色正確解析為 mon_head（跟 MON_DB_USER='mon_exec' 不符）→
-      // loadMonitorEnv 同步拋出「角色不符」→ 外層 catch 把 pool 留在 null →
-      // 落 spool。若角色錯誤解析成 mon_exec，這個 spool 條目就不會出現。
+      // 核心斷言：角色正確解析為 mon_exec（跟本機 MON_DB_USER 一致）——這正是
+      // ALDREQ-834 的根因修復，舊版寫死 mon_head 這裡會斷言失敗。
+      expect(getDeclaredMonitorRole()).toBe('mon_exec')
+      // 角色正確、loadMonitorEnv 不再拋出，createMonitorPool() 這一關就不會
+      // 失敗——連線目標不可路由，最終仍會在真正嘗試寫入時落 spool
+      // （best-effort），但不再是「角色不符」這種自我矛盾的例外。
       expect(fakeSpool.appended.length).toBe(1)
       expect(fakeSpool.appended[0]!.run_id).toBe('77777777-7777-7777-7777-777777777777')
       expect(fakeSpool.appended[0]!.fn).toBe('writeRunOutcomeAuthoritative')
-      expect(existsSync(tmpLogPath)).toBe(true)
-      expect(readFileSync(tmpLogPath, 'utf8')).toContain('FAQ-9008 監控 DB 連線建立失敗')
+      const logContent = existsSync(tmpLogPath) ? readFileSync(tmpLogPath, 'utf8') : ''
+      expect(logContent).not.toContain('角色不符')
       const prodLogAfter = existsSync(PROD_LOG) ? readFileSync(PROD_LOG, 'utf8') : null
       expect(prodLogAfter).toBe(prodLogBefore)
     } finally {
@@ -190,6 +195,8 @@ describe('writeAuthoritativeOutcome — v3.2 §9 Phase2 bug 終態（權威）�
       else process.env.MON_DB_USER = prevUser
       if (prevWorker === undefined) delete process.env.CLUSTER_WORKER_NAME
       else process.env.CLUSTER_WORKER_NAME = prevWorker
+      if (prevHost === undefined) delete process.env.MON_DB_HOST
+      else process.env.MON_DB_HOST = prevHost
       __resetDeclaredMonitorRoleForTest()
     }
   })
