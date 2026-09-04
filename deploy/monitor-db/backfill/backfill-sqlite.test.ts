@@ -28,6 +28,7 @@ import {
   type SqlitePipelineRun,
   type SqliteStatusLog,
 } from './backfill-sqlite.ts'
+import { deriveRunId } from './lib/run-id.ts'
 import { compareCounts, snapshotSqlite } from './lib/sqlite-snapshot.ts'
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -50,6 +51,8 @@ function pipelineRun(overrides: Partial<SqlitePipelineRun> = {}): SqlitePipeline
     outcome: 'success',
     cancelled_at: null,
     triggered_by: 'KHH Landon Lo',
+    review_rounds: null,
+    final_review_rounds: null,
     ...overrides,
   }
 }
@@ -78,9 +81,13 @@ function createFixtureDb(dir: string, name = 'source.sqlite'): string {
   db.run(`CREATE TABLE file_offsets (path TEXT PRIMARY KEY, inode INTEGER NOT NULL, offset INTEGER NOT NULL)`)
 
   db.run(
-    `INSERT INTO pipeline_runs (key, kind, ticket, started_at, stdout_path, finished_at, outcome, triggered_by)
+    `INSERT INTO pipeline_runs
+       (key, kind, ticket, started_at, stdout_path, stderr_path, finished_at, outcome, triggered_by,
+        review_rounds, final_review_rounds)
      VALUES ('FAQ-1.2026-08-25T01-00-00-000Z','bug','FAQ-1','2026-08-25T01:00:00.000Z',
-             '/logs/FAQ-1.2026-08-25T01-00-00-000Z.stdout.log','2026-08-25T01:10:00.000Z','success','洋蔥')`,
+             '/logs/FAQ-1.2026-08-25T01-00-00-000Z.stdout.log',
+             '/logs/FAQ-1.2026-08-25T01-00-00-000Z.stderr.log',
+             '2026-08-25T01:10:00.000Z','success','洋蔥',2,3)`,
   )
   db.run(
     `INSERT INTO agent_runs (path, ticket, kind, stage, started_at, ended_at, file_mtime)
@@ -97,9 +104,94 @@ function createFixtureDb(dir: string, name = 'source.sqlite'): string {
   return dbPath
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// 既存防撞守衛（guard）測試專用最小 fixture——內容由呼叫端逐案指定，
+// 三案（有重疊 / 無重疊 / 級聯）彼此不共用同一份資料，符合 D14 一次一個故障。
+// ─────────────────────────────────────────────────────────────────────────
+
+interface GuardPipelineRun {
+  key: string
+  ticket: string
+  stdoutPath: string | null
+  /** 預設 'success'；傳 null 模擬「仍在跑」（需同時傳 finishedAt: null）。 */
+  outcome?: string | null
+  /** 預設 '2026-08-25T01:10:00.000Z'；傳 null 模擬「仍在跑」（需同時傳 outcome: null）。 */
+  finishedAt?: string | null
+}
+
+interface GuardAgentRun {
+  path: string
+  ticket: string
+  startedAt: string
+  endedAt: string | null
+}
+
+function createGuardFixtureDb(dir: string, pipelineRuns: GuardPipelineRun[], agentRuns: GuardAgentRun[] = []): string {
+  const dbPath = path.join(dir, 'source.sqlite')
+  const db = new Database(dbPath)
+  db.run(`PRAGMA journal_mode = WAL`)
+  db.run(`CREATE TABLE pipeline_runs (
+    key TEXT PRIMARY KEY, kind TEXT NOT NULL, ticket TEXT NOT NULL, started_at TEXT NOT NULL,
+    stdout_path TEXT, stderr_path TEXT, finished_at TEXT, outcome TEXT,
+    cancelled_at TEXT, triggered_by TEXT, review_rounds INTEGER, final_review_rounds INTEGER)`)
+  db.run(`CREATE TABLE agent_runs (
+    path TEXT PRIMARY KEY, ticket TEXT NOT NULL, kind TEXT NOT NULL, stage TEXT NOT NULL,
+    started_at TEXT NOT NULL, ended_at TEXT, model TEXT, input_tokens INTEGER, output_tokens INTEGER,
+    cache_read_tokens INTEGER, cache_create_tokens INTEGER, cost_usd REAL, num_turns INTEGER,
+    tool_calls INTEGER, is_error INTEGER NOT NULL DEFAULT 0, result_preview TEXT, file_mtime TEXT NOT NULL)`)
+  db.run(`CREATE TABLE events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, service TEXT NOT NULL, ts TEXT NOT NULL, event TEXT NOT NULL,
+    identity TEXT, source_ip TEXT, method TEXT, path TEXT, tool TEXT, result TEXT,
+    agrabah_identifier TEXT, duration_ms INTEGER, reason TEXT, raw TEXT NOT NULL, UNIQUE(service, raw))`)
+  db.run(`CREATE TABLE status_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, service TEXT NOT NULL, ts TEXT NOT NULL, status TEXT NOT NULL,
+    pid INTEGER, detail TEXT)`)
+  db.run(`CREATE TABLE file_offsets (path TEXT PRIMARY KEY, inode INTEGER NOT NULL, offset INTEGER NOT NULL)`)
+
+  const insertRun = db.query(
+    `INSERT INTO pipeline_runs (key, kind, ticket, started_at, stdout_path, finished_at, outcome, triggered_by)
+     VALUES (?, 'bug', ?, '2026-08-25T01:00:00.000Z', ?, ?, ?, NULL)`,
+  )
+  for (const pr of pipelineRuns) {
+    const finishedAt = pr.finishedAt === undefined ? '2026-08-25T01:10:00.000Z' : pr.finishedAt
+    const outcome = pr.outcome === undefined ? 'success' : pr.outcome
+    insertRun.run(pr.key, pr.ticket, pr.stdoutPath, finishedAt, outcome)
+  }
+
+  const insertAgent = db.query(
+    `INSERT INTO agent_runs (path, ticket, kind, stage, started_at, ended_at, file_mtime)
+     VALUES (?, ?, 'bug', 'create-mr', ?, ?, ?)`,
+  )
+  for (const ar of agentRuns) insertAgent.run(ar.path, ar.ticket, ar.startedAt, ar.endedAt, ar.startedAt)
+
+  db.close()
+  return dbPath
+}
+
 class FakeMonitorPool {
   calls: Array<{ sql: string; params: unknown[] }> = []
   private seen = new Map<string, Set<string>>()
+  /**
+   * `runs.legacy_key → run_id` 的目前狀態，供既存防撞守衛的唯讀查詢使用。
+   * 建構時可預先塞入「模擬 live 路徑已經寫過的列」（legacyKey/runId 不等於
+   * deriveRunId(legacyKey)）；`execute()` 每次真的成功 INSERT IGNORE INTO runs
+   * 時也會把 (legacy_key, run_id) 併進來——這樣同一個 pool 實例在第二次
+   * runBackfill() 呼叫時，query() 能如實反映「第一輪回填自己寫過的列」，
+   * 才能測「重跑冪等」情境（不需要額外手動配置）。
+   */
+  private legacyKeyToRunId = new Map<string, string>()
+
+  constructor(preExistingRuns: Array<{ legacyKey: string; runId: string }> = []) {
+    for (const r of preExistingRuns) this.legacyKeyToRunId.set(r.legacyKey, r.runId)
+  }
+
+  async query(sql: string, params: unknown[] = []): Promise<[Array<{ legacy_key: string; run_id: string }>, unknown]> {
+    this.calls.push({ sql, params })
+    if (/^SELECT legacy_key, run_id FROM runs WHERE legacy_key IS NOT NULL$/.test(sql.trim())) {
+      return [[...this.legacyKeyToRunId.entries()].map(([legacy_key, run_id]) => ({ legacy_key, run_id })), []]
+    }
+    throw new Error(`FakeMonitorPool.query: 無法辨識的 SQL 形狀：${sql}`)
+  }
 
   async execute(sql: string, params: unknown[] = []): Promise<[{ affectedRows: number }, unknown]> {
     this.calls.push({ sql, params })
@@ -111,7 +203,15 @@ class FakeMonitorPool {
       const keyCols = UNIQUE_KEY_COLUMNS[table]
       if (!keyCols) throw new Error(`FakeMonitorPool: 未知 table 的 unique key：${table}`)
       const keyValues = keyCols.map((kc) => params[cols.indexOf(kc)])
-      return this.dedupe(table, keyValues)
+      const result = this.dedupe(table, keyValues)
+      if (table === 'runs' && result[0].affectedRows >= 1) {
+        const runIdIdx = cols.indexOf('run_id')
+        const legacyKeyIdx = cols.indexOf('legacy_key')
+        const runId = runIdIdx >= 0 ? (params[runIdIdx] as string) : undefined
+        const legacyKey = legacyKeyIdx >= 0 ? (params[legacyKeyIdx] as string | null) : undefined
+        if (runId !== undefined && legacyKey) this.legacyKeyToRunId.set(legacyKey, runId)
+      }
+      return result
     }
 
     const neMatch = /^INSERT INTO (\S+) \(([^)]+)\) SELECT[\s\S]*WHERE NOT EXISTS/.exec(sql)
@@ -152,6 +252,22 @@ describe('mapPipelineRunToRunsRow', () => {
       expect(r.skip).toBe(false)
       expect(r.row!.outcome).toBe(outcome)
       expect(r.row!.outcome_tier).toBe(2)
+      expect(r.row!.outcome_source).toBe('backfill')
+      expect(r.row!.legacy_outcome_raw).toBeNull()
+    }
+  })
+
+  test('aladdin-1d-D84：cancelled 等 KNOWN_OUTCOME_TIER 已承認的值直接沿用，不落入 legacy_unmapped', () => {
+    // 負面對照：這批值原本手抄的 DIRECT_OUTCOMES 只有 success/failed/timeout/
+    // needs_qa_clarification 四個，cancelled 等值會落到 else 分支變成 legacy_unmapped——
+    // 這條測試釘住修復後的行為，若有人把 DIRECT_OUTCOMES 改回手抄子集，這裡會紅。
+    for (const outcome of [
+      'cancelled', 'already_fixed', 'i18n', 'infra_failure', 'cli_failure',
+      'spawn_error', 'skipped', 'skipped_locked', 'skipped_expired', 'dispatched_to_worker',
+      'unknown_no_writer', 'unknown_reaped', 'lost_on_restart', 'unknown_dispatch_lost',
+    ]) {
+      const r = mapPipelineRunToRunsRow(pipelineRun({ outcome }))
+      expect(r.row!.outcome).toBe(outcome)
       expect(r.row!.outcome_source).toBe('backfill')
       expect(r.row!.legacy_outcome_raw).toBeNull()
     }
@@ -239,6 +355,22 @@ describe('mapPipelineRunToRunsRow', () => {
     expect(r.row!.triggered_by_email).toBe('KHH Landon Lo')
     expect(r.row!.host).toBe('unknown_pre_migration')
   })
+
+  test('stderr_path/review_rounds/final_review_rounds：來源有值 → 直接映射（migration 004 補欄）', () => {
+    const r = mapPipelineRunToRunsRow(
+      pipelineRun({ stderr_path: '/logs/FAQ-2.2026-08-25T01-00-00-000Z.stderr.log', review_rounds: 2, final_review_rounds: 3 }),
+    )
+    expect(r.row!.stderr_path).toBe('/logs/FAQ-2.2026-08-25T01-00-00-000Z.stderr.log')
+    expect(r.row!.review_rounds).toBe(2)
+    expect(r.row!.final_review_rounds).toBe(3)
+  })
+
+  test('stderr_path/review_rounds/final_review_rounds：來源缺值 → NULL，不造數', () => {
+    const r = mapPipelineRunToRunsRow(pipelineRun({ stderr_path: null, review_rounds: null, final_review_rounds: null }))
+    expect(r.row!.stderr_path).toBeNull()
+    expect(r.row!.review_rounds).toBeNull()
+    expect(r.row!.final_review_rounds).toBeNull()
+  })
 })
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -275,6 +407,16 @@ describe('buildAgentRunMapper', () => {
       stage: 'repo-scope',
       started_at: '2026-08-21T05:00:00.000Z',
       ended_at: '2026-08-21T05:01:00.000Z',
+      model: null,
+      input_tokens: null,
+      output_tokens: null,
+      cache_read_tokens: null,
+      cache_create_tokens: null,
+      cost_usd: null,
+      num_turns: null,
+      tool_calls: null,
+      is_error: null,
+      result_preview: null,
       ...overrides,
     }
   }
@@ -287,6 +429,39 @@ describe('buildAgentRunMapper', () => {
     expect(r.row!.host).toBe('unknown_pre_migration')
     const direct = mapPipelineRunToRunsRow(bugRun)
     expect(r.row!.run_id).toBe(direct.row!.run_id)
+  })
+
+  test('aladdin-1d-D84：payload 十欄（model/tokens/cost_usd/num_turns/tool_calls/is_error/result_preview）逐欄映射，不再被當成無對應欄位丟棄', () => {
+    const map = buildAgentRunMapper([bugRun, demandEarly, demandLate])
+    const r = map(
+      agentRun({
+        path: bugRun.stdout_path!,
+        ticket: 'FAQ-1',
+        kind: 'bug',
+        stage: 'create-mr',
+        model: 'claude-opus-5, claude-sonnet-5',
+        input_tokens: 28,
+        output_tokens: 8097,
+        cache_read_tokens: 100,
+        cache_create_tokens: 5,
+        cost_usd: 18.7949349,
+        num_turns: 3,
+        tool_calls: 7,
+        is_error: 0,
+        result_preview: 'ok',
+      }),
+    )
+    expect(r.skip).toBe(false)
+    expect(r.row!.model).toBe('claude-opus-5, claude-sonnet-5')
+    expect(r.row!.input_tokens).toBe(28)
+    expect(r.row!.output_tokens).toBe(8097)
+    expect(r.row!.cache_read_tokens).toBe(100)
+    expect(r.row!.cache_create_tokens).toBe(5)
+    expect(r.row!.cost_usd).toBe(18.7949349)
+    expect(r.row!.num_turns).toBe(3)
+    expect(r.row!.tool_calls).toBe(7)
+    expect(r.row!.is_error).toBe(0)
+    expect(r.row!.result_preview).toBe('ok')
   })
 
   test('kind=bug：path 對不到任何 stdout_path → skip', () => {
@@ -475,5 +650,227 @@ describe('runBackfill', () => {
       const agentRunsCalls = fake.calls.filter((c) => c.sql.startsWith('INSERT IGNORE INTO agent_runs'))
       expect(agentRunsCalls.length).toBeGreaterThan(0)
     })
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────
+// 既存防撞守衛（總指揮裁定新增）：live 路徑用 randomUUID 鑄 run_id、回填路徑用
+// deriveRunId(legacy_key) 導出 run_id——雙軌重疊的同一支歷史 run 因 run_id 不同，
+// INSERT IGNORE 偵測不到重複，會被插成兩列且零警告（實測重疊：FAQ-4771/FAQ-4855）。
+// 三案分開、互不共用 fixture（D14 一次一個故障）。
+// ─────────────────────────────────────────────────────────────────────────
+
+describe('既存防撞守衛（runs.legacy_key 命中 mysql 既有集合 → skip，並級聯 agent_runs）', () => {
+  test('(a) 有重疊：sqlite key 命中 mysql runs.legacy_key → 該列 skip，統計數字正確、且完全不進寫入層', async () => {
+    const dir = tmpDir()
+    try {
+      const overlapKey = 'FAQ-4771.2026-08-20T00-00-00-000Z'
+      const dbPath = createGuardFixtureDb(dir, [{ key: overlapKey, ticket: 'FAQ-4771', stdoutPath: '/logs/FAQ-4771.stdout.log' }])
+      // run_id 刻意跟 deriveRunId(overlapKey) 不同——代表 live 路徑用 randomUUID() 鑄的另一支列，真衝突。
+      const fake = new FakeMonitorPool([{ legacyKey: overlapKey, runId: '11111111-1111-5111-8111-111111111111' }])
+      const pool = fake as unknown as Pool
+
+      const [runsReport] = await runBackfill({ snapshotPath: dbPath, dryRun: false }, { pool })
+
+      expect(runsReport.sourceRows).toBe(1)
+      expect(runsReport.skipped).toBe(1)
+      expect(runsReport.attempted).toBe(0)
+      expect(runsReport.inserted).toBe(0)
+      expect(runsReport.notes).toContain(`已存在於 mysql（live 寫入）：key=${overlapKey}`)
+      expect(runsReport.notes.some((n) => n.includes('既存防撞守衛：略過 1 列'))).toBe(true)
+
+      const runsInsertCalls = fake.calls.filter((c) => c.sql.startsWith('INSERT IGNORE INTO runs'))
+      expect(runsInsertCalls.length).toBe(0)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('(b) 無重疊：零誤 skip，行為與現行完全相同（正常映射、正常寫入）', async () => {
+    const dir = tmpDir()
+    try {
+      const key = 'FAQ-9001.2026-08-21T00-00-00-000Z'
+      const dbPath = createGuardFixtureDb(dir, [{ key, ticket: 'FAQ-9001', stdoutPath: '/logs/FAQ-9001.stdout.log' }])
+      // 既存集合裡有值，但與這列的 key 完全不重疊。
+      const fake = new FakeMonitorPool([{ legacyKey: 'FAQ-0000.2026-01-01T00-00-00-000Z', runId: '22222222-2222-5222-8222-222222222222' }])
+      const pool = fake as unknown as Pool
+
+      const [runsReport] = await runBackfill({ snapshotPath: dbPath, dryRun: false }, { pool })
+
+      expect(runsReport.sourceRows).toBe(1)
+      expect(runsReport.skipped).toBe(0)
+      expect(runsReport.attempted).toBe(1)
+      expect(runsReport.inserted).toBe(1)
+      // a7-D42：實測 0 要明講是實測值，不是沉默、更不是未評估。
+      expect(runsReport.notes.some((n) => n.includes('既存防撞守衛：略過 0 列') && n.includes('此數字為實測值'))).toBe(true)
+      expect(runsReport.notes.some((n) => n.includes('未評估'))).toBe(false)
+
+      const runsInsertCalls = fake.calls.filter((c) => c.sql.startsWith('INSERT IGNORE INTO runs'))
+      expect(runsInsertCalls.length).toBe(1)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('(d) a7-D42：無 pool（--dry-run 不連 MySQL）→ 守衛印「未評估」，不得印成 0', async () => {
+    const dir = tmpDir()
+    try {
+      const key = 'FAQ-9002.2026-08-22T00-00-00-000Z'
+      const dbPath = createGuardFixtureDb(dir, [{ key, ticket: 'FAQ-9002', stdoutPath: '/logs/FAQ-9002.stdout.log' }])
+
+      const [runsReport] = await runBackfill({ snapshotPath: dbPath, dryRun: true }, { pool: undefined })
+
+      // 未評估 ≠ 實測 0：必須有「未評估」字樣與「僅真跑時可得」警語，且不得出現「略過 N 列」的實測措辭。
+      expect(runsReport.notes.some((n) => n.includes('既存防撞守衛：未評估') && n.includes('僅真跑時可得'))).toBe(true)
+      expect(runsReport.notes.some((n) => n.includes('既存防撞守衛：略過'))).toBe(false)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('(c) 級聯 skip：重疊 run 帶 agent_runs → agent_runs 也被跳過，且無孤兒列（寫入的 agent_runs 全部能 join 回寫入的 runs）', async () => {
+    const dir = tmpDir()
+    try {
+      const overlapKey = 'FAQ-4855.2026-08-22T00-00-00-000Z'
+      const cleanKey = 'FAQ-4856.2026-08-22T01-00-00-000Z'
+      const dbPath = createGuardFixtureDb(
+        dir,
+        [
+          { key: overlapKey, ticket: 'FAQ-4855', stdoutPath: '/logs/FAQ-4855.stdout.log' },
+          { key: cleanKey, ticket: 'FAQ-4856', stdoutPath: '/logs/FAQ-4856.stdout.log' },
+        ],
+        [
+          { path: '/logs/FAQ-4855.stdout.log', ticket: 'FAQ-4855', startedAt: '2026-08-22T00:00:01.000Z', endedAt: '2026-08-22T00:09:00.000Z' },
+          { path: '/logs/FAQ-4856.stdout.log', ticket: 'FAQ-4856', startedAt: '2026-08-22T01:00:01.000Z', endedAt: '2026-08-22T01:09:00.000Z' },
+        ],
+      )
+      // run_id 刻意跟 deriveRunId(overlapKey) 不同——代表 live 路徑用 randomUUID() 鑄的另一支列，真衝突。
+      const fake = new FakeMonitorPool([{ legacyKey: overlapKey, runId: '33333333-3333-5333-8333-333333333333' }])
+      const pool = fake as unknown as Pool
+
+      const [runsReport, agentRunsReport] = await runBackfill({ snapshotPath: dbPath, dryRun: false }, { pool })
+
+      // run 層：重疊列被跳過，未重疊列正常寫入。
+      expect(runsReport.skipped).toBe(1)
+      expect(runsReport.attempted).toBe(1)
+      expect(runsReport.inserted).toBe(1)
+
+      // agent_runs 層：重疊 run 對應的 agent_run 被級聯跳過（統一機制，skipReason 附上歸因），未重疊的正常寫入。
+      expect(agentRunsReport.sourceRows).toBe(2)
+      expect(agentRunsReport.skipped).toBe(1)
+      expect(agentRunsReport.attempted).toBe(1)
+      expect(agentRunsReport.inserted).toBe(1)
+      expect(
+        agentRunsReport.notes.some(
+          (n) => n.includes('agent_run 級聯跳過') && n.includes('已存在於 mysql（live 寫入）') && n.includes(overlapKey),
+        ),
+      ).toBe(true)
+      expect(agentRunsReport.notes.some((n) => n.includes('parent run 不在 target，級聯略過 1 列 agent_runs'))).toBe(true)
+
+      // 驗收斷言：無孤兒列——實際寫入的 agent_runs.run_id 必須全部屬於實際寫入的 runs.run_id 集合。
+      const insertedRunIds = new Set(
+        fake.calls.filter((c) => c.sql.startsWith('INSERT IGNORE INTO runs')).map((c) => c.params[0] as string),
+      )
+      const insertedAgentRunIds = fake.calls
+        .filter((c) => c.sql.startsWith('INSERT IGNORE INTO agent_runs'))
+        .map((c) => c.params[0] as string)
+
+      expect(insertedAgentRunIds.length).toBe(1)
+      for (const runId of insertedAgentRunIds) {
+        expect(insertedRunIds.has(runId)).toBe(true)
+      }
+      // 且被守衛跳過的 run 的 run_id（其 agent_run 若誤寫入即為孤兒）完全沒有出現在寫入的 agent_runs 裡。
+      const skippedRunId = deriveRunId(overlapKey)
+      expect(insertedAgentRunIds).not.toContain(skippedRunId)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────
+// 統一級聯機制的姊妹缺口修復（總指揮 2026-09-03 真 DB 全鏈路實測回報）：
+// 舊版級聯只認 guardSkippedKeys，「仍在跑」（outcome/finished_at 皆 NULL）等
+// mapPipelineRunToRunsRow 自身語意 skip 沒有被級聯，臨時 schema 實測出 4 筆
+// 孤兒 agent_runs（run_id＝被 skip 的 still-running pipeline runs 的導出 UUID）。
+// 現改為以 presentKeys（統一「target 中該 key 是否實際存在」判準）驅動級聯，
+// 一個機制蓋掉所有「parent 不在 target」情形。與既存防撞守衛案分開（D14）。
+// ─────────────────────────────────────────────────────────────────────────
+
+describe('統一級聯機制：parent 不在 target 一律 skip agent_runs（不限於既存防撞守衛）', () => {
+  test('仍在跑（outcome 與 finished_at 皆 NULL）的 pipeline_run 帶 agent_run → 級聯 skip，無孤兒列', async () => {
+    const dir = tmpDir()
+    try {
+      const stillRunningKey = 'FAQ-5001.2026-08-23T00-00-00-000Z'
+      const dbPath = createGuardFixtureDb(
+        dir,
+        [{ key: stillRunningKey, ticket: 'FAQ-5001', stdoutPath: '/logs/FAQ-5001.stdout.log', outcome: null, finishedAt: null }],
+        [{ path: '/logs/FAQ-5001.stdout.log', ticket: 'FAQ-5001', startedAt: '2026-08-23T00:00:01.000Z', endedAt: '2026-08-23T00:09:00.000Z' }],
+      )
+      const fake = new FakeMonitorPool() // 無既存防撞守衛干擾，純粹測「仍在跑」這條路徑
+      const pool = fake as unknown as Pool
+
+      const [runsReport, agentRunsReport] = await runBackfill({ snapshotPath: dbPath, dryRun: false }, { pool })
+
+      // run 層：仍在跑 → skip（既有語意，這裡只是前提條件，不是本次修的內容）。
+      expect(runsReport.skipped).toBe(1)
+      expect(runsReport.attempted).toBe(0)
+
+      // agent_runs 層（本次修的姊妹缺口）：對應的 agent_run 必須被級聯 skip，不能誤寫成孤兒列。
+      expect(agentRunsReport.sourceRows).toBe(1)
+      expect(agentRunsReport.skipped).toBe(1)
+      expect(agentRunsReport.attempted).toBe(0)
+      expect(agentRunsReport.inserted).toBe(0)
+      expect(agentRunsReport.notes.some((n) => n.includes('agent_run 級聯跳過') && n.includes('仍在跑'))).toBe(true)
+
+      // 驗收斷言：完全沒有 agent_runs 的 INSERT IGNORE 呼叫（沒有孤兒列）。
+      const agentRunsInsertCalls = fake.calls.filter((c) => c.sql.startsWith('INSERT IGNORE INTO agent_runs'))
+      expect(agentRunsInsertCalls.length).toBe(0)
+
+      // 且「仍在跑」run 的導出 UUID 完全沒有出現在任何寫入呼叫的 run_id 位置（無孤兒可 join）。
+      const orphanRunId = deriveRunId(stillRunningKey)
+      const anyInsertedRunIds = fake.calls.filter((c) => c.sql.startsWith('INSERT IGNORE INTO')).map((c) => c.params[0] as string)
+      expect(anyInsertedRunIds).not.toContain(orphanRunId)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('重跑冪等：round1 已插入的 run，round2（同一個 pool）其 agent_runs 仍能對上（不誤殺）', async () => {
+    const dir = tmpDir()
+    try {
+      const key = 'FAQ-6001.2026-08-24T00-00-00-000Z'
+      const dbPath = createGuardFixtureDb(
+        dir,
+        [{ key, ticket: 'FAQ-6001', stdoutPath: '/logs/FAQ-6001.stdout.log' }],
+        [{ path: '/logs/FAQ-6001.stdout.log', ticket: 'FAQ-6001', startedAt: '2026-08-24T00:00:01.000Z', endedAt: '2026-08-24T00:09:00.000Z' }],
+      )
+      const fake = new FakeMonitorPool() // 空白起點，模擬第一次真的回填
+      const pool = fake as unknown as Pool
+
+      const [round1Runs, round1AgentRuns] = await runBackfill({ snapshotPath: dbPath, dryRun: false }, { pool })
+      expect(round1Runs.inserted).toBe(1)
+      expect(round1Runs.skipped).toBe(0)
+      expect(round1AgentRuns.inserted).toBe(1)
+      expect(round1AgentRuns.skipped).toBe(0)
+
+      // round2：同一個 pool（帶著 round1 真的寫入的 legacy_key→run_id），模擬「重跑」。
+      const [round2Runs, round2AgentRuns] = await runBackfill({ snapshotPath: dbPath, dryRun: false }, { pool })
+
+      // runs 層：run_id 與回填自己導出的值相符 → 不是既存防撞守衛的衝突對象，照常走
+      // INSERT IGNORE，回報 ignored 而不是 skipped（不能被守衛誤殺）。
+      expect(round2Runs.skipped).toBe(0)
+      expect(round2Runs.attempted).toBe(1)
+      expect(round2Runs.inserted).toBe(0)
+      expect(round2Runs.ignored).toBe(1)
+
+      // agent_runs 層（本次要保住的行為）：不誤殺——仍然 attempted，INSERT IGNORE 對回
+      // 同一個 run_id，回報 ignored 而不是被級聯 skip。
+      expect(round2AgentRuns.skipped).toBe(0)
+      expect(round2AgentRuns.attempted).toBe(1)
+      expect(round2AgentRuns.ignored).toBe(1)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
   })
 })

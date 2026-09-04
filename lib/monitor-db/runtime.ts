@@ -12,6 +12,7 @@
 // 為「整合期任務」（見兩檔各自檔頭）。本檔把兩組（長駐、短命）各自收斂成
 // 單一實作，spawn-create-mr.ts / demand-monitor-writes.ts / post-run-notify.ts
 // 改為 import，行為不變。
+import { noteWriteOutcome } from './counters.ts'
 import { getDeclaredMonitorRole, isMonitorDbEnabled, MON_HOST, type MonitorRole } from './env.ts'
 import { createSpoolWriter, type SpoolWriterHandle } from './spool/writer.ts'
 import type { MonitorDbExecutor } from './writes.ts'
@@ -92,6 +93,43 @@ export function getLongLivedMonitorPool(): Promise<MonitorDbExecutor | null> {
   return monitorPoolPromise
 }
 
+/**
+ * 短命 CLI 的收尾（B-3，review-final-A-dispatcher.md）：本模組的 pool 單例
+ * 假設自己活在長駐行程，從不 `end()`——但 post-run-notify.ts（EXIT trap 裡的
+ * 一次性 CLI）的 timeout 自動重試路徑經 submitCreateMr → spawnCreateMrNow →
+ * dispatchMonitorWrite 會在**短命行程**裡建出這個單例，keep-alive 連線讓 bun
+ * 永不退出（實測 `timeout 12` → exit 124）→ wrapper EXIT trap 卡死 →
+ * spawnDetachedProcess 的 onExit 永不觸發 → 每次 timeout 永久洩漏一個併發
+ * 名額＋一個 active marker。任何短命行程若可能走到 dispatchMonitorWrite，
+ * 結束前必須 await 這支。
+ *
+ * 冪等、pool 從未建立時 no-op；只收長駐單例（monitorPoolPromise），不碰測試
+ * 注入的 override。`pool.end()` 會等使用中的連線把當前查詢跑完再關——與
+ * dispatchMonitorWrite 的 fire-and-forget 併發時，in-flight 寫入要嘛完成、
+ * 要嘛失敗落 spool，正確性不受影響（W 寫入皆冪等/守衛式＋spool 重放）。
+ */
+export async function closeLongLivedMonitorPool(): Promise<void> {
+  const promise = monitorPoolPromise
+  monitorPoolPromise = null
+  if (!promise) return
+  try {
+    const pool = await promise
+    const end = (pool as { end?: () => Promise<void> } | null)?.end
+    if (pool && typeof end === 'function') await end.call(pool)
+  } catch (err) {
+    // best-effort：關閉失敗只 WARN——呼叫端是短命 CLI 的最尾端，沒有比「記下
+    // 來」更好的處置；行程此時仍可能因 keep-alive 連線掛住，訊息要讓人查得到。
+    console.warn(`monitor-db: closeLongLivedMonitorPool 失敗（行程可能因 keep-alive 連線不退出）: ${err}`)
+  }
+}
+
+/** 測試專用：直接注入 monitorPoolPromise，讓 closeLongLivedMonitorPool 可以
+ * 對假 pool 驗證 end() 行為（正常路徑的單例建立要真的連 mysql2，單元測試
+ * 進不去）。 */
+export function __setMonitorPoolPromiseForTest(p: Promise<MonitorDbExecutor | null> | null): void {
+  monitorPoolPromise = p
+}
+
 export function getLongLivedMonitorSpoolWriter(): SpoolWriterHandle {
   if (monitorSpoolWriterOverride !== undefined) return monitorSpoolWriterOverride
   if (!monitorSpoolWriter) {
@@ -109,16 +147,26 @@ export function getLongLivedMonitorSpoolWriter(): SpoolWriterHandle {
  * 就是 `input` 本身）。呼叫端永遠不 await 這個函式——回傳 `Promise<void>`
  * 只是為了讓測試能確定性地等它跑完（`await`），不是要呼叫端真的接住它；
  * production 呼叫點一律不接回傳值。
+ *
+ * 2026-09-02 裁定（Phase 4）：`run_id` 硬規則改為 per-fn（見 spool/types.ts 與
+ * spool/writer.ts 的 `RUN_SCOPED_SPOOL_FNS`）。因此本函式的輸入型別放寬成
+ * 「`runId` 可有可無」——`file_offsets` / `mcp_usage` 這類**結構上沒有
+ * run_id** 的寫入才寫得進 spool。runs/agent_runs 類的 fn 仍由 writer.ts 當場
+ * 拒收空 run_id，防線沒有降低。
  */
-export function dispatchMonitorWrite<A extends { runId: string }>(fn: string, input: A, call: (pool: MonitorDbExecutor) => Promise<unknown>): Promise<void> {
+export function dispatchMonitorWrite<A extends { runId?: string | null }>(
+  fn: string,
+  input: A,
+  call: (pool: MonitorDbExecutor) => Promise<unknown>,
+): Promise<void> {
   return (async () => {
     const enabled = isMonitorDbEnabled() || monitorPoolOverride !== undefined
     if (!enabled) return
     const fallbackToSpool = (reason: unknown) => {
       try {
-        getLongLivedMonitorSpoolWriter().append({ ts: new Date().toISOString(), host: MON_HOST, run_id: input.runId, fn, args: [input] })
+        getLongLivedMonitorSpoolWriter().append({ ts: new Date().toISOString(), host: MON_HOST, run_id: input.runId ?? null, fn, args: [input] })
       } catch (spoolErr) {
-        console.error(`monitor-db: ${fn}(run_id=${input.runId}) 寫入與落 spool 都失敗，本次寫入遺失: ${reason} / ${spoolErr}`)
+        console.error(`monitor-db: ${fn}(run_id=${input.runId ?? 'n/a'}) 寫入與落 spool 都失敗，本次寫入遺失: ${reason} / ${spoolErr}`)
       }
     }
     const pool = await getLongLivedMonitorPool()
@@ -127,10 +175,15 @@ export function dispatchMonitorWrite<A extends { runId: string }>(fn: string, in
       return
     }
     try {
-      await Promise.race([
+      // §6.3 的計數器記錄點（見 counters.ts 檔頭）：`writes.ts` 早就算好了
+      // `WriteOutcome.guardedReason`，但這裡原本把回傳值整個丟掉，
+      // `r1_violation` 因此沒有任何可讀面。接住它、+1，其餘一切不變
+      // （noteWriteOutcome 對非 WriteOutcome 的值靜默忽略、永不拋）。
+      const outcome = await Promise.race([
         call(pool),
         new Promise((_resolve, reject) => setTimeout(() => reject(new Error(`monitor-db 寫入逾時（${LONG_LIVED_WRITE_TIMEOUT_MS}ms）`)), LONG_LIVED_WRITE_TIMEOUT_MS)),
       ])
+      noteWriteOutcome(outcome)
     } catch (err) {
       fallbackToSpool(err)
     }
@@ -155,17 +208,20 @@ export async function tryWriteOrSpool(opts: {
   budgetMs: number
   pool: MonitorDbExecutor
   spool: SpoolWriterHandle
-  runId: string
+  /** runs/agent_runs 類的 fn 必為非空字串；其餘表允許 null（per-fn 硬規則見 spool/writer.ts）。 */
+  runId: string | null
   fn: string
   args: unknown[]
   attempt: (pool: MonitorDbExecutor) => Promise<unknown>
   onFailLabel: string
 }): Promise<void> {
   try {
-    await Promise.race([
+    // 同 dispatchMonitorWrite：接住 WriteOutcome 記進 §6.3 計數器（見 counters.ts）。
+    const outcome = await Promise.race([
       opts.attempt(opts.pool),
       new Promise<never>((_, reject) => setTimeout(() => reject(new Error(`${opts.onFailLabel}: 逾時`)), opts.budgetMs)),
     ])
+    noteWriteOutcome(outcome)
   } catch (err) {
     try {
       opts.spool.append({ ts: new Date().toISOString(), host: MON_HOST, run_id: opts.runId, fn: opts.fn, args: opts.args })

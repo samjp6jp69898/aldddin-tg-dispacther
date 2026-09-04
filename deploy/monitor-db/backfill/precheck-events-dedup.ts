@@ -1,0 +1,97 @@
+// precheck-events-dedup.ts — Phase 6 回填的必跑前置探針（唯讀，b5 對線定案 2026-09-02）。
+//
+// 回答的問題：sqlite events 的每一筆 (service, raw) 進 mysql `mcp_usage` 時，會被
+// `uq_service_raw (service, raw_sha256)` 正確去重、還是會以新列插入？
+//
+// 為什麼要每次跑而不是引用 2026-09-02 那次「1738/1738 全命中」的結論：那是快照不是
+// 恆真——若 insertAuditLine / audit-ingester 在回填前改了 raw 的處理（trim、重新序列化、
+// 欄位順序），跨寫入者去重會**無聲地**失效：uq 擋不住、不報錯，同一事件變兩列。
+// 本探針把「前提還成立嗎」變成回填當天的實測，不是歷史結論。
+//
+// 輸出三個數字＋would-insert 明細（service / ts / identity / raw 前綴）供人工判讀：
+// would-insert 非零不必然是錯（sqlite 真的可能累積了 mysql 沒有的事件，例如 ingester
+// 停過一段時間），但**每一筆都該能被解釋**；解釋不了的（mysql 明明有同一事件、只是
+// raw 不再逐位元相同）＝ 去重前提已破，停下上呈，不得直接回填。
+//
+// 用法：bun precheck-events-dedup.ts [--schema <name>] [--snapshot <path>] [--gate]
+//   --schema   查詢目標 schema（預設走 openBackfillPool 的預設，即正式 pipeline_monitor）
+//   --snapshot 已存在的 sqlite 快照路徑；未給時自動 VACUUM INTO 到暫存（WAL 紀律，禁 cp）
+//   --gate     閘門模式（run-backfill.sh 前置用）：exit 0＝would-insert=0 可回填；
+//              exit 2＝would-insert>0，需操作者逐筆判讀後以 --ack-events-precheck 放行；
+//              exit 1＝探針自身失敗——依 D42 視同「未評估」，不得當成「沒問題」。
+// 純唯讀：對 mysql 只 SELECT，對 sqlite 只讀快照。無 --gate 時 exit 0＝探針執行完成
+// （判讀交給人），exit 1＝探針自身失敗（連不上等）。
+
+import { createHash } from 'node:crypto'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { Database } from 'bun:sqlite'
+import { openBackfillPool } from './lib/db.ts'
+import { snapshotSqlite } from './lib/sqlite-snapshot.ts'
+
+const LIVE_SQLITE = '/Users/user/aladdin/tg-monitor/data/monitor.sqlite'
+
+function argValue(flag: string): string | undefined {
+  const i = process.argv.indexOf(flag)
+  return i >= 0 ? process.argv[i + 1] : undefined
+}
+
+async function main(): Promise<void> {
+  const schema = argValue('--schema')
+  let snapshotPath = argValue('--snapshot')
+  let tmpDir: string | null = null
+  if (!snapshotPath) {
+    tmpDir = mkdtempSync(join(tmpdir(), 'events-precheck-'))
+    snapshotPath = join(tmpDir, 'monitor.snapshot.sqlite')
+    snapshotSqlite(LIVE_SQLITE, snapshotPath)
+  }
+
+  const db = new Database(snapshotPath, { readonly: true })
+  const rows = db
+    .query('SELECT service, ts, identity, raw FROM events')
+    .all() as Array<{ service: string; ts: string; identity: string | null; raw: string }>
+  db.close()
+
+  const pool = openBackfillPool()
+  try {
+    if (schema) await pool.query(`USE \`${schema.replace(/[^A-Za-z0-9_]/g, '')}\``)
+    const [mysqlRows] = await pool.execute<Array<{ service: string; h: string }>>(
+      'SELECT service, HEX(raw_sha256) AS h FROM mcp_usage',
+      [],
+    )
+    const existing = new Set((mysqlRows as Array<{ service: string; h: string }>).map((r) => `${r.service}\0${r.h}`))
+
+    let dedup = 0
+    const wouldInsert: typeof rows = []
+    for (const r of rows) {
+      const h = createHash('sha256').update(r.raw).digest('hex').toUpperCase()
+      if (existing.has(`${r.service}\0${h}`)) dedup++
+      else wouldInsert.push(r)
+    }
+
+    console.log(`sqlite events 列數：${rows.length}`)
+    console.log(`回填時會被 uq_service_raw 擋掉（正確去重）：${dedup}`)
+    console.log(`回填時會插入新列（would-insert）：${wouldInsert.length}`)
+    if (wouldInsert.length > 0) {
+      console.log('--- would-insert 明細（每一筆都該能被解釋；解釋不了＝去重前提已破，停下上呈）---')
+      for (const r of wouldInsert) {
+        console.log(`  ${r.service}  ${r.ts}  ${r.identity ?? '(null)'}  ${r.raw.slice(0, 80)}`)
+      }
+    }
+    if (process.argv.includes('--gate') && wouldInsert.length > 0) {
+      console.log('GATE: would-insert 非零，exit 2（需操作者逐筆判讀後以 --ack-events-precheck 放行）')
+      process.exitCode = 2
+    }
+  } finally {
+    await pool.end()
+    if (tmpDir) rmSync(tmpDir, { recursive: true, force: true })
+  }
+}
+
+try {
+  await main()
+} catch (err) {
+  console.error(`precheck-events-dedup 探針自身失敗：${err instanceof Error ? err.message : String(err)}`)
+  process.exit(1)
+}

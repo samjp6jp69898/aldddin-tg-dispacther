@@ -96,7 +96,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?)
 `.trim()
 
 /**
- * 步驟 2（issue）：**upsert 語意**。
+ * 步驟 2（issue）：**守衛式 upsert 語意**（審查報告 §B.2(4)(甲) 採納）。
  *
  * toolsmith 的 `manage-tokens.ts --rotate` 與 make-starter-kit 的
  * `ensureToolsmithIssued` 都把重簽委派到 `issueToken()`（不另設 'rotate' op），
@@ -106,16 +106,34 @@ VALUES (?, ?, ?, ?, ?, ?, ?)
  * `revoked_at` **刻意不在 ODKU 的賦值清單裡**：DB 是權威，已撤銷的列不該被一次
  * 重簽默默復活。若真的撞上「檔案還有、DB 已撤銷」的列，投影會少一筆 → 閘門以
  * 未預期 removed 擋下並告警（那正是要被人看見的狀態，不是要被自動抹平的）。
+ *
+ * 四個賦值欄位各自包一層 `IF(revoked_at IS NULL, new.x, x)`：撞上已撤銷列時，
+ * `token_enc` / `token_bidx` / `issued_at` / `display_name` 全部維持列的**現值**
+ * 不被覆寫——舊密文、bidx、原核發時間不再因為一次 rotate 而永久遺失（R1/R2 消解，
+ * 見 deploy/monitor-db/README.md 的 fail-safe 段）。行為方向完全不變：`revoked_at`
+ * 仍不重設、投影仍少這一筆、閘門仍以未預期 removed 中止、alert 仍發。
+ *
+ * 張力點（照裁定實作，如實記錄）：計畫 R4 規則講的是「守衛放 WHERE 不放 SET」，
+ * 但 `ON DUPLICATE KEY UPDATE` 語法本身沒有 WHERE 子句可用——守衛只能表達在
+ * SET 的賦值運算式內（`IF(...)`），這是 ODKU 語法的結構性限制，不是本檔選擇偏離
+ * R4 的精神（R4 要防的是「WHERE 條件被誤放進看似無條件的地方」，這裡的 IF 守衛
+ * 條件與 R4 的 WHERE 守衛條件語意等價，只是語法位置被 ODKU 逼到 SET 裡）。
+ *
+ * 欄名必須全限定（`mcp_tokens.x`）：用了 row alias `AS new` 後，SET 運算式裡的
+ * 未限定欄名同時可解析成表欄與 alias 欄，MySQL 8.4.6 直接 ERROR 1052 ambiguous
+ * （2026-09-02 dry-run 真 DB 實測抓到；fake executor 不 parse SQL 測不到這類）。
+ * 本 SQL 逐字通過真 mon-mysql 驗證：撞未撤銷列 affected=2 四欄更新、撞已撤銷列
+ * affected=0 四欄 byte 不變（scratchpad p5dry/odku-probe2.sql 為最小重現）。
  */
 export const ISSUE_UPSERT_SQL = `
 INSERT INTO mcp_tokens
   (server, env, token_id, token_enc, token_bidx, issued_at, display_name)
 VALUES (?, ?, ?, ?, ?, ?, ?) AS new
 ON DUPLICATE KEY UPDATE
-  token_enc = new.token_enc,
-  token_bidx = new.token_bidx,
-  issued_at = new.issued_at,
-  display_name = new.display_name
+  token_enc = IF(mcp_tokens.revoked_at IS NULL, new.token_enc, mcp_tokens.token_enc),
+  token_bidx = IF(mcp_tokens.revoked_at IS NULL, new.token_bidx, mcp_tokens.token_bidx),
+  issued_at = IF(mcp_tokens.revoked_at IS NULL, new.issued_at, mcp_tokens.issued_at),
+  display_name = IF(mcp_tokens.revoked_at IS NULL, new.display_name, mcp_tokens.display_name)
 `.trim()
 
 /**
@@ -738,7 +756,14 @@ async function runRegistryOperation(intent: RegistryIntent, deps: RegistryDeps):
     return { written, issued }
   } catch (err) {
     // 單一告警點：整條流程任一步中止都在這裡 alert 恰一次（訊息不含 token 明文）。
-    d.alert(`[token-registry] op='${intent.op}' 中止：${(err as Error).message}`)
+    // 自癒指引（F-1，2026-09-02 dry-run 實證）：步驟 2 寫 DB 在步驟 4 閘門之前，
+    // 中止後 DB 可能已領先檔案，該 (server, env) 的後續任何 intent（含純
+    // reconcile）都會持續中止；唯一自癒方式是排除中止原因後**重放同一個 intent**
+    // （DB 側冪等，重放成功即重新收斂）。
+    d.alert(
+      `[token-registry] op='${intent.op}' 中止：${(err as Error).message}` +
+        `（若 DB 已領先檔案，該名冊後續操作將持續中止；排除原因後重放同一 intent 即自癒）`,
+    )
     throw err
   } finally {
     if (pool) await pool.end()

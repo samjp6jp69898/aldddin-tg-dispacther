@@ -10,11 +10,11 @@
 // §3.3(e) 的 host 覆寫）。
 //
 // 範圍聲明（誠實記錄，不在本檔內、留給後續工項）：
-// - worker 端實際的檔案 tailing + 遮罩（lib/log-shipper/redaction.ts）+
-//   常駐 shipper 迴圈**不在本檔**——那是 worker-agent.ts 的工項，且遮罩模組
-//   （§7.3 的 11 條 regex）尚未存在。派工 prompt 明訂「若計畫歸 Phase 7 就
-//   只留介面不實作」，本輪判斷：完整遮罩規則需要獨立驗證（L1/L2 兩層關門
-//   條件），不應由本檔憑空杜撰，留待該模組就位後再串接。
+// - worker 端實際的檔案 tailing + 遮罩 + 常駐 shipper 迴圈不在本檔——那是
+//   worker-agent.ts 的工項。**（2026-09-03 更新：redaction.ts 已就位，worker
+//   端迴圈也已於 worker-agent.ts 掛載；本檔則在檔尾掛上 head 自己的那一份。
+//   兩邊共用 mount.ts，差別只有 sink：head 直寫 VictoriaLogs，worker 經
+//   cluster-sink 走 9429 到這裡。）**
 // - §7.3 明訂「head 端不再信任 worker 已遮罩、再套一次」——這一步依賴同一支
 //   尚不存在的 redaction.ts，本檔目前**未對收到的內容做二次遮罩**，是已知
 //   缺口，不是遺漏，見下方 forwardToVictoriaLogs 的註解。
@@ -27,7 +27,19 @@ import { getClusterSecret, WORKER_NAME_RE } from '../cluster/cluster-env.ts'
 import { createClusterAuthGuard } from '../cluster/cluster-auth.ts'
 import { createWorkerRegistry } from '../cluster/worker-registry.ts'
 import { respondUniform401 } from '../security/uniform-401.ts'
-import { MON_HOST } from '../monitor-db/env.ts'
+import { declareMonitorRole, MON_HOST } from '../monitor-db/env.ts'
+import { startMonitorHeartbeat } from '../monitor-db/heartbeat.ts'
+import { startLogShipperLoop, listDispatcherLogFiles } from './mount.ts'
+import { createVLDirectSink } from './vl-sink.ts'
+
+// 【183bf5a 同原則，總指揮 2026-09-02 裁定】進入點顯式宣告角色：本行程是
+// head only 的 log intake，MON_HOST 必須釘死 'head'，不得依賴環境嗅探——
+// head .env 殘留 CLUSTER_WORKER_NAME 時，嗅探值會污染下方 POST /cluster/logs
+// 的 `worker === MON_HOST` 拒絕判準（擋錯對象）。放在 module init 最前端是
+// 結構保證（先於 serve 與任何 monitor 引用），不繫於 heartbeat 啟動時序；
+// heartbeat.ts 內對 log-intake 的條件補宣告（9551686）由 Phase 4 側後續
+// 清理 commit 移除。
+declareMonitorRole('mon_head')
 
 const IDENTITY = 'com.aladdin.monitor-log-intake'
 const LOG_DIR = '/Users/user/aladdin/telegram-dispatcher/logs'
@@ -126,7 +138,17 @@ function getWorkerBuckets(worker: string): { req: AmountBucket; bytes: AmountBuc
 const DEDUP_CAPACITY = 1_000_000
 
 export interface LruDedupSet {
-  /** 命中即回 true（並把該 id touch 到最新）；未命中則記錄下來並回 false。 */
+  /**
+   * 命中即回 true（並把該 id touch 到最新）；未命中**只回 false、不登記**。
+   * B-2（review-final-A-dispatcher.md）：登記與查詢必須分離——「已看過」只能
+   * 在「已持久化到 VL」之後寫下，否則一次 VL 暫時失敗＋worker 重送就會被誤判
+   * 全重複而永久遺失該批（違反 §3.3(d)「只重複、不缺口」）。
+   */
+  has: (id: string) => boolean
+  /** 登記一個 id（含滿載淘汰）。只在 VL 回 2xx 之後呼叫。 */
+  add: (id: string) => void
+  /** 舊語意（查＋未命中即登記）——僅供既有單元測試驗 LRU 行為，處理路徑
+   * 已不再使用（見 B-2 註解）。 */
   isDuplicate: (id: string) => boolean
   size: () => number
 }
@@ -134,19 +156,27 @@ export interface LruDedupSet {
 /** capacity 可注入，供測試用小容量驗證滿載淘汰行為，不用真的塞 100 萬筆。 */
 export function createLruDedupSet(capacity: number = DEDUP_CAPACITY): LruDedupSet {
   const seen = new Map<string, true>()
+  function has(id: string): boolean {
+    if (!seen.has(id)) return false
+    // LRU touch：刪了再插回去，讓它排到 Map 迭代順序的最後（最新）。
+    seen.delete(id)
+    seen.set(id, true)
+    return true
+  }
+  function add(id: string): void {
+    seen.delete(id)
+    seen.set(id, true)
+    if (seen.size > capacity) {
+      const oldest = seen.keys().next().value
+      if (oldest !== undefined) seen.delete(oldest)
+    }
+  }
   return {
+    has,
+    add,
     isDuplicate(id: string): boolean {
-      if (seen.has(id)) {
-        // LRU touch：刪了再插回去，讓它排到 Map 迭代順序的最後（最新）。
-        seen.delete(id)
-        seen.set(id, true)
-        return true
-      }
-      seen.set(id, true)
-      if (seen.size > capacity) {
-        const oldest = seen.keys().next().value
-        if (oldest !== undefined) seen.delete(oldest)
-      }
+      if (has(id)) return true
+      add(id)
       return false
     },
     size: () => seen.size,
@@ -310,26 +340,97 @@ app.post(
     if (lines.length === 0) return c.json({ ok: false, reason: 'bad_request' }, 400)
     for (const line of lines) enforceLineSizeLimit(line)
 
-    // §3.3(d) 去重：全部重複時仍回 200/accepted:0（worker 才會推進 offset；
-    // 對它而言這批已經送達過，不推進會造成無窮重送）。
-    const deduped = lines.filter(line => !dedupSet.isDuplicate(computeLineId(worker, line.path, line.inode, line.offset)))
-    if (deduped.length === 0) {
-      return c.json({ ok: true, accepted: 0 })
-    }
-
-    // §3.3(d)：「回 2xx 的語意明訂為『已持久化到 VictoriaLogs』」——intake
-    // 必須先寫成 9428 再回 200；9428 寫入失敗即回 503（worker 因此不推進
-    // offset，下一輪從同一 offset 重送——兩條通道故障域不同，結構上只會
-    // 產生重複，不會產生缺口）。
-    const written = await forwardToVictoriaLogs(worker, deduped)
-    if (!written) return c.text('Service Unavailable', 503)
-    return c.json({ ok: true, accepted: deduped.length })
+    const result = await acceptLogBatch(worker, lines)
+    if (result.status === 503) return c.text('Service Unavailable', 503)
+    return c.json({ ok: true, accepted: result.accepted })
   },
 )
+
+export interface AcceptLogBatchDeps {
+  dedup?: LruDedupSet
+  forward?: (host: string, lines: LogLineIn[]) => Promise<boolean>
+}
+
+/**
+ * 去重＋轉寫核心（route handler 只做驗簽/限流/形狀檢查後呼叫這裡；deps 可注入
+ * 供測試，production 用模組級 dedupSet 與 forwardToVictoriaLogs）。
+ *
+ * B-2（review-final-A-dispatcher.md）：順序必須是**先查（不登記）→ 寫 VL →
+ * VL 回成功才登記**。舊版在 filter 時就把 id 登記進 LRU，於是一次 VL 暫時失敗
+ * （503，worker 正確地不推進 offset）之後，worker 原封重送、intake 卻判「全部
+ * 重複」回 200/accepted:0 → worker 推進 offset → 該批永久遺失——恰好製造了
+ * §3.3(d) 明訂結構上不會發生的那一半（缺口）。改成登記後置之後：VL 失敗 →
+ * id 未登記 → 重送照常轉寫；「寫入 VL 成功但登記前崩潰」的殘餘窗口落在允許的
+ * 那一半（重複），不是缺口。
+ *
+ * 批內重複（同一批出現相同 id）沿用舊行為只轉寫第一份：batchSeen 承接舊版
+ * 「filter 過程中即時登記」順帶提供的批內去重，避免行為迴歸。
+ */
+export async function acceptLogBatch(
+  worker: string,
+  lines: LogLineIn[],
+  deps: AcceptLogBatchDeps = {},
+): Promise<{ status: 200 | 503; accepted: number }> {
+  const dedup = deps.dedup ?? dedupSet
+  const forward = deps.forward ?? forwardToVictoriaLogs
+
+  // §3.3(d) 去重：全部重複時仍回 200/accepted:0（worker 才會推進 offset；
+  // 對它而言這批已經送達過，不推進會造成無窮重送）。
+  const fresh: { id: string; line: LogLineIn }[] = []
+  const batchSeen = new Set<string>()
+  for (const line of lines) {
+    const id = computeLineId(worker, line.path, line.inode, line.offset)
+    if (dedup.has(id) || batchSeen.has(id)) continue
+    batchSeen.add(id)
+    fresh.push({ id, line })
+  }
+  if (fresh.length === 0) return { status: 200, accepted: 0 }
+
+  // §3.3(d)：「回 2xx 的語意明訂為『已持久化到 VictoriaLogs』」——intake
+  // 必須先寫成 9428 再回 200；9428 寫入失敗即回 503（worker 因此不推進
+  // offset，下一輪從同一 offset 重送——兩條通道故障域不同，結構上只會
+  // 產生重複，不會產生缺口）。
+  const written = await forward(worker, fresh.map(f => f.line))
+  if (!written) return { status: 503, accepted: 0 }
+  for (const f of fresh) dedup.add(f.id)
+  return { status: 200, accepted: fresh.length }
+}
 
 // POST /cluster/logs 以外的一律 uniform 401（與其餘未知路徑無法區分，維持
 // 既有拒絕不變式，比照 worker-agent.ts）。
 app.all('*', c => respondUniform401(c))
+
+// 【plan §6.8(1)(2)】monitor_heartbeat：writer='log-intake'（migration 002 的
+// PK 是 (host, writer)——head 上三個監控寫入行程各自一列，server.ts 還活著時
+// 也看得出 log-intake 死了）。啟動打一拍 + 每 60 秒一拍，pool/spool 的取得與
+// 失敗處置（只 WARN + 落 spool，絕不影響本行程）全部封在 heartbeat.ts 內；
+// isMonitorDbEnabled()=false 時整段 no-op。本檔僅此一處改動。
+startMonitorHeartbeat({ writer: 'log-intake' })
+
+// 【plan §7.2/§7.4，Phase 7 整合】head 端的 log shipping 常駐迴圈。
+// library（shipper.ts）2026-09-02 就完成了，但在此之前**沒有任何行程呼叫過
+// runOneCycle()**——VictoriaLogs 因此一直沒有新資料進來。那不是驗證缺口，
+// 是整合工項從未開始，2026-09-03 由本次補上。
+//
+// 掛在 log-intake 而不是 server.ts：本行程就是 head 的 log 專責行程，
+// 而且它已經持有 MON_VL_* 三個環境變數（run-log-intake.sh 的匯出白名單），
+// server.ts 沒有。head 直寫 9428 不繞自己的 9429——同一行程內 HTTP 迴圈一趟
+// 只是多一個可壞的環節，去重與 host 覆寫對 head 自己的檔案也不需要。
+startLogShipperLoop({
+  label: 'log-intake',
+  listSourceFiles: listDispatcherLogFiles,
+  createSink: () => {
+    const vlUrl = (process.env.MON_VL_URL ?? '').trim()
+    const vlUser = process.env.MON_VL_USER ?? ''
+    const vlPassword = process.env.MON_VL_PASSWORD ?? ''
+    if (!vlUrl || !vlUser || !vlPassword) {
+      // 出聲再放棄：靜靜不啟動就是一個沒有觀察者的失敗。
+      console.error('log-intake: MON_VL_URL/MON_VL_USER/MON_VL_PASSWORD 未設定，log-shipper 不啟動')
+      return null
+    }
+    return createVLDirectSink({ vlUrl, vlUser, vlPassword })
+  },
+})
 
 export default {
   fetch: app.fetch,

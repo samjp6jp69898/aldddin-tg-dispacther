@@ -24,6 +24,30 @@ import { SPOOL_DIR, buildSpoolFileName, type SpoolEntry, type SpoolWriterName } 
  * 不做。 */
 const DEFAULT_MAX_FILE_BYTES = 64 * 1024 * 1024
 
+/**
+ * 「寫入目標的 row 身分帶 `run_id`」的具名寫入函式（`runs` 與 `agent_runs`
+ * 兩張表的全部寫入者，對照 `lib/monitor-db/apply-entry.ts` 的分派表）。
+ * 只有這些 fn 的 spool 條目強制要求非空 `run_id`；其餘 fn（`upsertFileOffset`
+ * / `insertMcpUsage` / `upsertMonitorHeartbeat` / `insertStatusLogRow` /
+ * `insertTgUnknownSender` / `dispatch_attempts` 三支）的列結構上沒有 run_id，
+ * 允許 `null`（2026-09-02 指揮官裁定，理由見 types.ts 的 SpoolEntry 說明）。
+ *
+ * 刻意用「白名單 + 未知 fn 視為非 run 類」而不是黑名單：apply-entry.ts 對
+ * 未知 fn 本來就回 `{ok:false}` 而不是拋例外，寫入端沒有理由比重放端更嚴格。
+ */
+export const RUN_SCOPED_SPOOL_FNS: ReadonlySet<string> = new Set([
+  'writeRunProgress',
+  'writeRunOutcomeAuthoritative',
+  'writeRunOutcomeProvisional',
+  'writeCancelFlag',
+  'fixCancelLateOutcome',
+  'upsertAgentRun',
+])
+
+export function isRunScopedSpoolFn(fn: string): boolean {
+  return RUN_SCOPED_SPOOL_FNS.has(fn)
+}
+
 export interface SpoolWriterHandle {
   /** 對自己那一檔 append 一條（等同 appendBatch([entry])）。 */
   append(entry: Omit<SpoolEntry, 'seq'>): void
@@ -77,12 +101,18 @@ export function createSpoolWriter(opts: CreateSpoolWriterOpts): SpoolWriterHandl
     rotateIfNeeded()
     let payload = ''
     for (const e of entries) {
-      // 【G:MJ-G2】的一般化硬規則：run_id 不得為空、不得留給重放時再解析。
-      // 任何寫 spool 的路徑（含 cancel 旗標）都必須在寫入當下就持有一個確定
-      // 的 run_id——這裡是全案唯一的落地檢查點，寧可讓呼叫端當場炸掉，也不
-      // 要讓一條無主的條目躺進 spool 等重放時才發現解析不出來。
-      if (!e.run_id) {
-        throw new Error(`spool writer(${opts.writer}): 條目缺少 run_id，拒絕寫入（v3.2 §6.5(a) 硬規則 / 【G:MJ-G2】）`)
+      // 【G:MJ-G2】的硬規則（2026-09-02 裁定後改為 per-fn，見 types.ts 的
+      // SpoolEntry 說明）：**寫入目標的 row 身分帶 run_id 的 fn**（runs /
+      // agent_runs）條目，run_id 不得為空、不得留給重放時再解析——這裡是全案
+      // 唯一的落地檢查點，寧可讓呼叫端當場炸掉，也不要讓一條無主的條目躺進
+      // spool 等重放時才發現解析不出來。其餘表（file_offsets / mcp_usage /
+      // monitor_heartbeat / *_log / tg_unknown_senders）結構上沒有 run_id，
+      // 允許 null。
+      if (isRunScopedSpoolFn(e.fn) && !e.run_id) {
+        throw new Error(
+          `spool writer(${opts.writer}): fn='${e.fn}' 是 runs/agent_runs 類寫入，條目缺少 run_id，拒絕寫入` +
+            `（v3.2 §6.5(a) 硬規則 / 【G:MJ-G2】，per-fn 適用範圍見 spool/types.ts）`,
+        )
       }
       seq += 1
       const record: SpoolEntry = { seq, ...e }

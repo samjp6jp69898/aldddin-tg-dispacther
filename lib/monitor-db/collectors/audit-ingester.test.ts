@@ -1,0 +1,428 @@
+import { describe, expect, test } from 'bun:test'
+import { appendFileSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import type { ResultSetHeader } from 'mysql2/promise'
+import * as W from '../writes.ts'
+import type { MonitorDbExecutor } from '../writes.ts'
+import { FILE_OFFSET_SELECT_SQL, createAuditIngester, parseAuditLine, startAuditIngester } from './audit-ingester.ts'
+
+function okHeader(affectedRows: number, info = ''): ResultSetHeader {
+  return { affectedRows, fieldCount: 0, insertId: 0, info, serverStatus: 0, warningStatus: 0 } as unknown as ResultSetHeader
+}
+
+function updateHeader(matched: number, changed: number): ResultSetHeader {
+  return okHeader(matched, `Rows matched: ${matched}  Changed: ${changed}  Warnings: 0`)
+}
+
+/**
+ * 記憶體版 mcp_usage + file_offsets，照 writes.ts 的守衛語意模擬
+ * （比照 test-support/fake-runs-db.ts：以「SQL 常數參照相等」分派）。
+ */
+class FakeAuditDb implements MonitorDbExecutor {
+  usage: Array<{ service: string; identity: string | null; sourceIp: string | null; raw: string; ts: string }> = []
+  offsets = new Map<string, { inode: number; offset: number; eventSeq: number }>()
+  calls: Array<{ sql: string; params: unknown[] }> = []
+  /** >0 時，接下來這麼多次 insertMcpUsage 會拋例外（模擬 DB 寫入失敗）。 */
+  failInserts = 0
+  failOffsetSelect = false
+
+  private seen = new Set<string>()
+
+  async execute<T = ResultSetHeader>(sql: string, params: unknown[] = []): Promise<[T, unknown]> {
+    this.calls.push({ sql, params })
+
+    if (sql === FILE_OFFSET_SELECT_SQL) {
+      if (this.failOffsetSelect) throw new Error('DB 不可達（測試注入）')
+      const row = this.offsets.get(String(params[1]))
+      return [(row ? [{ inode: row.inode, offset: row.offset }] : []) as unknown as T, []]
+    }
+
+    if (sql === W.MCP_USAGE_INSERT_IGNORE_SQL) {
+      if (this.failInserts > 0) {
+        this.failInserts--
+        throw new Error('mcp_usage 寫入失敗（測試注入）')
+      }
+      const [service, identity, sourceIp, raw, ts] = params as [string, string | null, string | null, string, string]
+      const key = `${service}\u0000${raw}` // UNIQUE(service, raw_sha256) 的等價模擬
+      if (this.seen.has(key)) return [okHeader(0) as unknown as T, []]
+      this.seen.add(key)
+      this.usage.push({ service, identity, sourceIp, raw, ts })
+      return [okHeader(1) as unknown as T, []]
+    }
+
+    if (sql === W.FILE_OFFSET_UPDATE_SQL) {
+      const [offset, inode, eventSeq, , path, guardSeq] = params as [number, number, number, string, string, number]
+      const cur = this.offsets.get(path)
+      if (!cur || cur.eventSeq >= guardSeq) return [updateHeader(cur ? 1 : 0, 0) as unknown as T, []]
+      this.offsets.set(path, { inode, offset, eventSeq })
+      return [updateHeader(1, 1) as unknown as T, []]
+    }
+
+    if (sql === W.FILE_OFFSET_INSERT_SQL) {
+      const [, path, inode, offset, eventSeq] = params as [string, string, number, number, number]
+      this.offsets.set(path, { inode, offset, eventSeq })
+      return [okHeader(1) as unknown as T, []]
+    }
+
+    throw new Error(`FakeAuditDb: 未預期的 SQL：${sql}`)
+  }
+}
+
+function tmpAuditFile(): string {
+  return join(mkdtempSync(join(tmpdir(), 'audit-ingester-')), 'audit.jsonl')
+}
+
+function line(ts: string, identity: string, extra: Record<string, unknown> = {}): string {
+  return `${JSON.stringify({ ts, event: 'request', identity, sourceIp: '127.0.0.1', ...extra })}\n`
+}
+
+function ingesterFor(path: string, db: MonitorDbExecutor | null) {
+  return createAuditIngester({
+    getExecutor: async () => db,
+    sources: [{ service: 'toolsmith', path }],
+    host: 'head',
+  })
+}
+
+describe('parseAuditLine', () => {
+  test('缺 ts / 非 JSON / ts 不合法 → null；合法行取出 identity 與 sourceIp', () => {
+    expect(parseAuditLine('not json')).toBeNull()
+    expect(parseAuditLine('{"identity":"a"}')).toBeNull()
+    expect(parseAuditLine('{"ts":"not-a-date"}')).toBeNull()
+    expect(parseAuditLine('{"ts":"2026-09-01T00:00:00.000Z","identity":"a","sourceIp":"1.2.3.4"}')).toEqual({
+      ts: '2026-09-01T00:00:00.000Z',
+      identity: 'a',
+      sourceIp: '1.2.3.4',
+    })
+  })
+})
+
+describe('audit ingester：逐行增量讀 + file_offsets 續讀游標', () => {
+  test('首次讀取整檔，逐行寫 mcp_usage，並把 (inode, offset) 寫進 file_offsets', async () => {
+    const path = tmpAuditFile()
+    writeFileSync(path, line('2026-09-01T00:00:00.000Z', 'a') + line('2026-09-01T00:00:01.000Z', 'b'), 'utf8')
+    const db = new FakeAuditDb()
+
+    const stats = await ingesterFor(path, db).runOnce()
+
+    expect(stats.linesInserted).toBe(2)
+    expect(db.usage.map(u => u.identity)).toEqual(['a', 'b'])
+    // ts 由 writes.ts 的 dt() 在 SQL 邊界轉成 MySQL DATETIME(3) 字面字串（見 mysql-datetime.ts）。
+    expect(db.usage[0]).toMatchObject({ service: 'toolsmith', sourceIp: '127.0.0.1', ts: '2026-09-01 00:00:00.000' })
+    const st = statSync(path)
+    expect(db.offsets.get(path)).toMatchObject({ inode: Number(st.ino), offset: st.size })
+  })
+
+  test('第二輪只讀新增的行（記憶體游標）；重啟後由 file_offsets 還原、不重讀整檔', async () => {
+    const path = tmpAuditFile()
+    writeFileSync(path, line('2026-09-01T00:00:00.000Z', 'a'), 'utf8')
+    const db = new FakeAuditDb()
+    const first = ingesterFor(path, db)
+    await first.runOnce()
+
+    appendFileSync(path, line('2026-09-01T00:00:02.000Z', 'b'))
+    await first.runOnce()
+    expect(db.usage.map(u => u.identity)).toEqual(['a', 'b'])
+
+    // 「重啟」＝換一個新的 ingester 實例（記憶體游標歸零），只靠 file_offsets 續讀。
+    appendFileSync(path, line('2026-09-01T00:00:03.000Z', 'c'))
+    const afterRestart = ingesterFor(path, db)
+    const stats = await afterRestart.runOnce()
+
+    expect(stats.linesInserted).toBe(1)
+    expect(db.usage.map(u => u.identity)).toEqual(['a', 'b', 'c'])
+    expect(db.calls.some(c => c.sql === FILE_OFFSET_SELECT_SQL && c.params[0] === 'head')).toBe(true)
+  })
+
+  test('半行留待下次：沒有換行結尾的尾段不消耗，補完後才寫入', async () => {
+    const path = tmpAuditFile()
+    writeFileSync(path, `${line('2026-09-01T00:00:00.000Z', 'a')}{"ts":"2026-09-01T00:00:04.000Z","identity":"half`, 'utf8')
+    const db = new FakeAuditDb()
+    const ing = ingesterFor(path, db)
+
+    await ing.runOnce()
+    expect(db.usage.map(u => u.identity)).toEqual(['a'])
+
+    appendFileSync(path, '","sourceIp":"127.0.0.1"}\n')
+    await ing.runOnce()
+    expect(db.usage.map(u => u.identity)).toEqual(['a', 'half'])
+  })
+
+  test('inode rotate：換檔後 offset 歸零、整份新檔重讀（守衛不擋，因為 event_seq 單調遞增）', async () => {
+    const path = tmpAuditFile()
+    writeFileSync(path, line('2026-09-01T00:00:00.000Z', 'old-1') + line('2026-09-01T00:00:01.000Z', 'old-2'), 'utf8')
+    const db = new FakeAuditDb()
+    const ing = ingesterFor(path, db)
+    await ing.runOnce()
+    const oldInode = db.offsets.get(path)!.inode
+
+    // rotate：刪掉舊檔、在同一路徑建新檔（新 inode），且新檔比舊檔短。
+    rmSync(path)
+    writeFileSync(path, line('2026-09-01T00:01:00.000Z', 'new-1'), 'utf8')
+    const stats = await ing.runOnce()
+
+    expect(stats.linesInserted).toBe(1)
+    expect(db.usage.map(u => u.identity)).toEqual(['old-1', 'old-2', 'new-1'])
+    const after = db.offsets.get(path)!
+    expect(after.inode).not.toBe(oldInode)
+    expect(after.inode).toBe(Number(statSync(path).ino))
+    expect(after.offset).toBe(statSync(path).size)
+  })
+
+  test('壞行照樣消耗（不會卡住整個檔案），但計入 linesInvalid', async () => {
+    const path = tmpAuditFile()
+    writeFileSync(path, `{"broken":\n${line('2026-09-01T00:00:05.000Z', 'good')}`, 'utf8')
+    const db = new FakeAuditDb()
+
+    const stats = await ingesterFor(path, db).runOnce()
+
+    expect(stats.linesInvalid).toBe(1)
+    expect(db.usage.map(u => u.identity)).toEqual(['good'])
+    expect(db.offsets.get(path)!.offset).toBe(statSync(path).size)
+  })
+
+  test('mcp_usage 寫入失敗 → offset 停在失敗那一行之前，下一輪從同一位置重讀（只重複、不缺口）', async () => {
+    const path = tmpAuditFile()
+    writeFileSync(
+      path,
+      line('2026-09-01T00:00:00.000Z', 'a') + line('2026-09-01T00:00:01.000Z', 'b') + line('2026-09-01T00:00:02.000Z', 'c'),
+      'utf8',
+    )
+    const db = new FakeAuditDb()
+    const ing = ingesterFor(path, db)
+
+    db.failInserts = 0
+    // 第一行成功、第二行失敗（第三行不會被嘗試）。
+    const origExecute = db.execute.bind(db)
+    let inserts = 0
+    db.execute = async (sql: string, params: unknown[] = []) => {
+      if (sql === W.MCP_USAGE_INSERT_IGNORE_SQL) {
+        inserts++
+        if (inserts === 2) throw new Error('mcp_usage 寫入失敗（測試注入）')
+      }
+      return origExecute(sql, params)
+    }
+
+    const stats = await ing.runOnce()
+    expect(stats.filesAborted).toBe(1)
+    expect(db.usage.map(u => u.identity)).toEqual(['a'])
+    const firstLineBytes = Buffer.byteLength(line('2026-09-01T00:00:00.000Z', 'a'), 'utf8')
+    expect(db.offsets.get(path)!.offset).toBe(firstLineBytes)
+
+    // 恢復後從第二行接續，不缺口。
+    db.execute = origExecute
+    await ing.runOnce()
+    expect(db.usage.map(u => u.identity)).toEqual(['a', 'b', 'c'])
+  })
+
+  test('有 spool 退路時：DB 寫入失敗 → 本檔剩下的行改落 spool（run_id=null），offset 照常推進', async () => {
+    const path = tmpAuditFile()
+    writeFileSync(
+      path,
+      line('2026-09-01T00:00:00.000Z', 'a') + line('2026-09-01T00:00:01.000Z', 'b') + line('2026-09-01T00:00:02.000Z', 'c'),
+      'utf8',
+    )
+    const db = new FakeAuditDb()
+    const spooled: Array<{ run_id: string | null; fn: string; args: unknown[] }> = []
+    const ing = createAuditIngester({
+      getExecutor: async () => db,
+      getSpool: () => ({
+        append: e => {
+          spooled.push({ run_id: e.run_id, fn: e.fn, args: e.args })
+        },
+        appendBatch: () => {},
+        filePath: () => '/dev/null',
+        close: () => {},
+      }),
+      sources: [{ service: 'toolsmith', path }],
+      host: 'head',
+    })
+
+    const origExecute = db.execute.bind(db)
+    let inserts = 0
+    db.execute = async (sql: string, params: unknown[] = []) => {
+      if (sql === W.MCP_USAGE_INSERT_IGNORE_SQL) {
+        inserts++
+        if (inserts >= 2) throw new Error('mcp_usage 寫入失敗（測試注入）')
+      }
+      return origExecute(sql, params)
+    }
+
+    const stats = await ing.runOnce()
+
+    expect(stats.linesInserted).toBe(1)
+    expect(stats.linesSpooled).toBe(2)
+    expect(stats.filesAborted).toBe(0)
+    expect(spooled.map(e => e.fn)).toEqual(['insertMcpUsage', 'insertMcpUsage'])
+    expect(spooled.every(e => e.run_id === null)).toBe(true)
+    // 條目已在 spool（重放者會補上）→ offset 推到檔尾，下一輪不重讀。
+    expect(db.offsets.get(path)!.offset).toBe(statSync(path).size)
+
+    db.execute = origExecute
+    const second = await ing.runOnce()
+    expect(second.linesRead).toBe(0)
+  })
+
+  test('有 spool 退路時：file_offsets 推進失敗 → 游標條目落 spool，記憶體游標照常前進', async () => {
+    const path = tmpAuditFile()
+    writeFileSync(path, line('2026-09-01T00:00:00.000Z', 'a'), 'utf8')
+    const db = new FakeAuditDb()
+    const spooled: Array<{ fn: string; run_id: string | null }> = []
+    const ing = createAuditIngester({
+      getExecutor: async () => db,
+      getSpool: () => ({
+        append: e => {
+          spooled.push({ fn: e.fn, run_id: e.run_id })
+        },
+        appendBatch: () => {},
+        filePath: () => '/dev/null',
+        close: () => {},
+      }),
+      sources: [{ service: 'toolsmith', path }],
+      host: 'head',
+    })
+
+    const origExecute = db.execute.bind(db)
+    db.execute = async (sql: string, params: unknown[] = []) => {
+      if (sql === W.FILE_OFFSET_UPDATE_SQL || sql === W.FILE_OFFSET_INSERT_SQL) throw new Error('file_offsets 寫入失敗（測試注入）')
+      return origExecute(sql, params)
+    }
+
+    const stats = await ing.runOnce()
+
+    expect(stats.offsetWriteErrors).toBe(1)
+    expect(stats.offsetsSpooled).toBe(1)
+    expect(spooled).toEqual([{ fn: 'upsertFileOffset', run_id: null }])
+    // 記憶體游標已前進：同一輪之後再跑一次不會重讀（DB 側由重放者補）。
+    db.execute = origExecute
+    const second = await ing.runOnce()
+    expect(second.linesRead).toBe(0)
+  })
+
+  test('file_offsets 讀取失敗（DB 不可達）→ 本輪跳過該檔，絕不從 0 重讀', async () => {
+    const path = tmpAuditFile()
+    writeFileSync(path, line('2026-09-01T00:00:00.000Z', 'a'), 'utf8')
+    const db = new FakeAuditDb()
+    db.failOffsetSelect = true
+
+    const stats = await ingesterFor(path, db).runOnce()
+
+    expect(stats.cursorLoadErrors).toBe(1)
+    expect(db.usage).toHaveLength(0)
+  })
+
+  test('executor 為 null → 整輪跳過', async () => {
+    const path = tmpAuditFile()
+    writeFileSync(path, line('2026-09-01T00:00:00.000Z', 'a'), 'utf8')
+
+    const stats = await ingesterFor(path, null).runOnce()
+
+    expect(stats.skippedNoExecutor).toBe(true)
+    expect(stats.filesScanned).toBe(0)
+  })
+
+  test('MON_DB_ENABLED 未設 → startAuditIngester 完全不啟動（不建 timer、不取 pool）', () => {
+    const prev = process.env.MON_DB_ENABLED
+    delete process.env.MON_DB_ENABLED
+    let poolAsked = 0
+    try {
+      const handle = startAuditIngester({ getExecutor: async () => { poolAsked++; return null } }, 1)
+      handle.stop()
+      expect(poolAsked).toBe(0)
+    } finally {
+      if (prev === undefined) delete process.env.MON_DB_ENABLED
+      else process.env.MON_DB_ENABLED = prev
+    }
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────
+// 對抗性審查 B1：§6.7 deadline + setInterval re-entrancy 閘門
+// ─────────────────────────────────────────────────────────────────────────
+
+describe('audit ingester — 查詢逾時與 re-entrancy（B1 修復）', () => {
+  test('file_offsets SELECT 永不 resolve → 逾時後計 cursorLoadErrors，本輪跳過該檔（不從 0 重讀、不掛住整輪）', async () => {
+    const path = tmpAuditFile()
+    writeFileSync(path, line('2026-09-01T00:00:00.000Z', 'a'), 'utf8')
+    const hanging: MonitorDbExecutor = { execute: () => new Promise(() => {}) }
+
+    const stats = await createAuditIngester({
+      getExecutor: async () => hanging,
+      sources: [{ service: 'toolsmith', path }],
+      host: 'head',
+      queryBudgetMs: 1,
+    }).runOnce()
+
+    expect(stats.cursorLoadErrors).toBe(1)
+    expect(stats.linesInserted).toBe(0)
+    expect(stats.filesScanned).toBe(0)
+  })
+
+  test('mcp_usage 寫入永不 resolve → 逾時後降級走 spool，offset 照常推進', async () => {
+    const path = tmpAuditFile()
+    writeFileSync(path, line('2026-09-01T00:00:00.000Z', 'a') + line('2026-09-01T00:00:01.000Z', 'b'), 'utf8')
+    const db = new FakeAuditDb()
+    const spooled: Array<{ run_id: string | null; fn: string }> = []
+    const origExecute = db.execute.bind(db)
+    db.execute = async (sql: string, params: unknown[] = []) => {
+      if (sql === W.MCP_USAGE_INSERT_IGNORE_SQL) return new Promise(() => {}) as never
+      return origExecute(sql, params)
+    }
+
+    const stats = await createAuditIngester({
+      getExecutor: async () => db,
+      getSpool: () => ({
+        append: e => {
+          spooled.push({ run_id: e.run_id, fn: e.fn })
+        },
+        appendBatch: () => {},
+        filePath: () => '/dev/null',
+        close: () => {},
+      }),
+      sources: [{ service: 'toolsmith', path }],
+      host: 'head',
+      queryBudgetMs: 1,
+    }).runOnce()
+
+    expect(stats.linesSpooled).toBe(2)
+    expect(spooled.every(e => e.fn === 'insertMcpUsage' && e.run_id === null)).toBe(true)
+    expect(db.offsets.get(path)!.offset).toBe(statSync(path).size)
+  })
+
+  test('上一輪未結束時，下一輪不進場（re-entrancy 閘門）', () => {
+    const prev = process.env.MON_DB_ENABLED
+    process.env.MON_DB_ENABLED = '1'
+    const path = tmpAuditFile()
+    writeFileSync(path, line('2026-09-01T00:00:00.000Z', 'a'), 'utf8')
+
+    const realSetInterval = globalThis.setInterval
+    let tick: (() => void) | null = null
+    // @ts-expect-error 測試用替身：攔下 tick callback，由測試自己決定何時觸發。
+    globalThis.setInterval = (cb: () => void) => {
+      tick = cb
+      return 0 as unknown as ReturnType<typeof setInterval>
+    }
+
+    let executorAsked = 0
+    try {
+      const handle = startAuditIngester({
+        getExecutor: async () => {
+          executorAsked++
+          return new Promise<never>(() => {}) as unknown as Promise<MonitorDbExecutor | null>
+        },
+        sources: [{ service: 'toolsmith', path }],
+      })
+      tick!()
+      tick!()
+      tick!()
+      handle.stop()
+    } finally {
+      globalThis.setInterval = realSetInterval
+      if (prev === undefined) delete process.env.MON_DB_ENABLED
+      else process.env.MON_DB_ENABLED = prev
+    }
+
+    expect(executorAsked).toBe(1)
+  })
+})

@@ -35,7 +35,7 @@ function makeHarness(opts: { postResults?: Record<string, PostJobResult>; capaci
     spawnNow: () => ({ ok: false }),
   })
   const postedJobs: { worker: string; job: JobRequest; registrySnapshotAtCall: ReturnType<DispatchRegistry['get']> }[] = []
-  const dispatchAttemptCalls: { fn: 'create' | 'advance'; input: Record<string, unknown> }[] = []
+  const dispatchAttemptCalls: { fn: 'create' | 'advance' | 'supersede'; input: Record<string, unknown> }[] = []
   const deps: BacklogDispatcherDeps = {
     registry,
     postJob: async (w, job) => {
@@ -53,6 +53,7 @@ function makeHarness(opts: { postResults?: Record<string, PostJobResult>; capaci
     dispatchAttempts: {
       create: input => dispatchAttemptCalls.push({ fn: 'create', input }),
       advance: input => dispatchAttemptCalls.push({ fn: 'advance', input }),
+      supersedeOthers: input => dispatchAttemptCalls.push({ fn: 'supersede', input: input as unknown as Record<string, unknown> }),
     },
   }
   return {
@@ -93,13 +94,28 @@ describe('createBacklogDispatcher — fillFreedSlot', () => {
     expect(h.postedJobs[0]!.registrySnapshotAtCall).toMatchObject({ status: 'dispatching', ticket: 'FAQ-1' })
     expect(h.registry.get('FAQ-1')).toMatchObject({ status: 'confirmed', worker: 'w1' })
     expect(h.bugQueue.size()).toBe(0)
-    // dispatch_attempts 觀察面：create(dispatching) → advance(dispatched)，
-    // job body 帶的 dispatchId 與登記表一致（§5.3）。
-    expect(h.dispatchAttemptCalls.map(c => c.fn)).toEqual(['create', 'advance'])
+    // dispatch_attempts 觀察面（MA-3/MI-10 後）：supersede（殘留清理）→
+    // create(dispatching) → advance(dispatched)，job body 帶的 dispatchId 與
+    // 登記表一致（§5.3）。
+    expect(h.dispatchAttemptCalls.map(c => c.fn)).toEqual(['supersede', 'create', 'advance'])
     const dispatchId = h.registry.get('FAQ-1')!.dispatchId
-    expect(h.dispatchAttemptCalls[0]!.input).toMatchObject({ dispatchId, ticket: 'FAQ-1', kind: 'bug', status: 'dispatching', statusRank: 10 })
-    expect(h.dispatchAttemptCalls[1]!.input).toMatchObject({ dispatchId, status: 'dispatched', statusRank: 20 })
+    expect(h.dispatchAttemptCalls[0]!.input).toMatchObject({ ticket: 'FAQ-1', kind: 'bug', excludeDispatchId: dispatchId })
+    expect(h.dispatchAttemptCalls[1]!.input).toMatchObject({ dispatchId, ticket: 'FAQ-1', kind: 'bug', status: 'dispatching', statusRank: 10 })
+    expect(h.dispatchAttemptCalls[2]!.input).toMatchObject({ dispatchId, status: 'dispatched', statusRank: 20 })
     expect(h.postedJobs[0]!.job.dispatchId).toBe(dispatchId)
+    h.cleanup()
+  })
+
+  // ── MA-3/MI-10 迴歸：create 必須帶 headRunId（backlog 條目在 head 有
+  // onEnqueued 寫的 queued run 列，headRunId 是 §5.3 的對位鍵）──
+  test('MA-3：create 帶 headRunId = 佇列 payload 的 runId', async () => {
+    const h = makeHarness()
+    // 泛型測試佇列的 payload 沒有型別上的 runId 欄——production 的
+    // BugPayload.runId 就是掛在 payload 上的欄位，這裡直接塞同名欄位。
+    h.bugQueue.submit('FAQ-7', null, { resume: false, runId: 'run-head-7' } as never)
+    await h.dispatcher.fillFreedSlot('bug', worker('w1'))
+    const create = h.dispatchAttemptCalls.find(c => c.fn === 'create')!
+    expect(create.input).toMatchObject({ ticket: 'FAQ-7', headRunId: 'run-head-7' })
     h.cleanup()
   })
 
@@ -119,8 +135,8 @@ describe('createBacklogDispatcher — fillFreedSlot', () => {
     expect(h.registry.get('FAQ-1')).toBe(null)
     expect(h.bugQueue.size()).toBe(1)
     expect(h.bugQueue.has('FAQ-1')).toBe('queued')
-    expect(h.dispatchAttemptCalls.map(c => c.fn)).toEqual(['create', 'advance'])
-    expect(h.dispatchAttemptCalls[1]!.input).toMatchObject({ status: 'cleared', statusRank: 100, clearReason: 'full' })
+    expect(h.dispatchAttemptCalls.map(c => c.fn)).toEqual(['supersede', 'create', 'advance'])
+    expect(h.dispatchAttemptCalls[2]!.input).toMatchObject({ status: 'cleared', statusRank: 100, clearReason: 'full' })
     h.cleanup()
   })
 

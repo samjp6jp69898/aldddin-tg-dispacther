@@ -61,24 +61,27 @@ export interface RunIdentity {
 }
 
 /**
- * W1：進度寫入（queued/running）。八條賦值全部包 `IF(runs.host = new.host, …, runs.<col>)`
+ * W1：進度寫入（queued/running）。十條賦值全部包 `IF(runs.host = new.host, …, runs.<col>)`
  * 守衛（【G:MJ-E1】），host 不符時全部欄位寫回原值 ⇒ 無變更 ⇒ `-FOUND_ROWS` 下 affectedRows=0，
  * 冷路徑 SELECT 可偵測出 r1_violation。
  */
 export const W1_SQL = `
 INSERT INTO runs
-  (run_id, host, ticket, kind, lifecycle_rank, started_at, pid, stdout_path,
-   trigger_source, retry_of_run_id, dispatch_id, legacy_key, created_at)
-VALUES (?,?,?,?,?,?,?,?,?,?,?,?, NOW(3)) AS new
+  (run_id, host, ticket, kind, lifecycle_rank, started_at, pid, stdout_path, stderr_path,
+   trigger_source, retry_of_run_id, dispatch_id, legacy_key, triggered_by_email, triggered_by_name, created_at)
+VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, NOW(3)) AS new
 ON DUPLICATE KEY UPDATE
-  lifecycle_rank  = IF(runs.host = new.host, GREATEST(runs.lifecycle_rank, new.lifecycle_rank), runs.lifecycle_rank),
-  started_at      = IF(runs.host = new.host, COALESCE(runs.started_at,      new.started_at),      runs.started_at),
-  pid             = IF(runs.host = new.host, COALESCE(runs.pid,             new.pid),             runs.pid),
-  stdout_path     = IF(runs.host = new.host, COALESCE(runs.stdout_path,     new.stdout_path),     runs.stdout_path),
-  trigger_source  = IF(runs.host = new.host, COALESCE(runs.trigger_source,  new.trigger_source),  runs.trigger_source),
-  retry_of_run_id = IF(runs.host = new.host, COALESCE(runs.retry_of_run_id, new.retry_of_run_id), runs.retry_of_run_id),
-  dispatch_id     = IF(runs.host = new.host, COALESCE(runs.dispatch_id,     new.dispatch_id),     runs.dispatch_id),
-  legacy_key      = IF(runs.host = new.host, COALESCE(runs.legacy_key,      new.legacy_key),      runs.legacy_key)
+  lifecycle_rank     = IF(runs.host = new.host, GREATEST(runs.lifecycle_rank, new.lifecycle_rank), runs.lifecycle_rank),
+  started_at         = IF(runs.host = new.host, COALESCE(runs.started_at,         new.started_at),         runs.started_at),
+  pid                = IF(runs.host = new.host, COALESCE(runs.pid,                new.pid),                runs.pid),
+  stdout_path        = IF(runs.host = new.host, COALESCE(runs.stdout_path,        new.stdout_path),        runs.stdout_path),
+  stderr_path        = IF(runs.host = new.host, COALESCE(runs.stderr_path,        new.stderr_path),        runs.stderr_path),
+  trigger_source     = IF(runs.host = new.host, COALESCE(runs.trigger_source,     new.trigger_source),     runs.trigger_source),
+  retry_of_run_id    = IF(runs.host = new.host, COALESCE(runs.retry_of_run_id,    new.retry_of_run_id),    runs.retry_of_run_id),
+  dispatch_id        = IF(runs.host = new.host, COALESCE(runs.dispatch_id,        new.dispatch_id),        runs.dispatch_id),
+  legacy_key         = IF(runs.host = new.host, COALESCE(runs.legacy_key,         new.legacy_key),         runs.legacy_key),
+  triggered_by_email = IF(runs.host = new.host, COALESCE(runs.triggered_by_email, new.triggered_by_email), runs.triggered_by_email),
+  triggered_by_name  = IF(runs.host = new.host, COALESCE(runs.triggered_by_name,  new.triggered_by_name),  runs.triggered_by_name)
 `.trim()
 
 export const RUNS_COLD_PATH_W1_SQL = 'SELECT host, lifecycle_rank FROM runs WHERE run_id = ?'
@@ -88,10 +91,13 @@ export interface WriteRunProgressInput extends RunIdentity {
   startedAt?: string | null
   pid?: number | null
   stdoutPath?: string | null
+  stderrPath?: string | null
   triggerSource?: string | null
   retryOfRunId?: string | null
   dispatchId?: string | null
   legacyKey?: string | null
+  triggeredByEmail?: string | null
+  triggeredByName?: string | null
 }
 
 export async function writeRunProgress(pool: MonitorDbExecutor, input: WriteRunProgressInput): Promise<WriteOutcome> {
@@ -104,10 +110,13 @@ export async function writeRunProgress(pool: MonitorDbExecutor, input: WriteRunP
     dt(input.startedAt),
     input.pid ?? null,
     input.stdoutPath ?? null,
+    input.stderrPath ?? null,
     input.triggerSource ?? null,
     input.retryOfRunId ?? null,
     input.dispatchId ?? null,
     input.legacyKey ?? null,
+    input.triggeredByEmail ?? null,
+    input.triggeredByName ?? null,
   ]
   const [header] = await pool.execute<ResultSetHeader>(W1_SQL, params)
   const affected = (header as ResultSetHeader).affectedRows
@@ -142,9 +151,26 @@ UPDATE runs
    AND (outcome IS NULL OR outcome_tier < 2)
 `.trim()
 
+// 2026-09-03（根因修復，見 switch-readiness.ts C4/C6 持續性缺口分析）：
+// W1（writeRunProgress）若在 server 崩潰/重啟的窄縫遺失，這條 INSERT 就是
+// 這一列在 runs 表唯一的落地機會——原本沒帶 legacy_key/stdout_path/
+// stderr_path，永遠留 NULL，導致 tg-monitor 用 COALESCE(legacy_key, run_id)
+// 或 stdout_path 做比對時永遠對不上 sqlite 舊資料/collector。呼叫端
+// （post-run-notify.ts main()）本來就知道這一輪的 stdoutPath（argv 帶入）與
+// 可推導出的 stderrPath/legacyKey（`<ticket>.<timestamp>` 命名慣例），這裡
+// 補上這三欄，皆選填（COALESCE 語意的延伸：呼叫端沒有值時維持 NULL，不硬填
+// 假值）。
+//
+// `started_at` 一併補上（同一次根因修復追加）：`RUNS_LIST_WHERE`
+// （tg-monitor/lib/read/mysql.ts）要求 `started_at IS NOT NULL` 才會被
+// `pipelineRuns()`（switch-readiness.ts C4 實際讀取的入口）看見——只補
+// legacy_key/stdout_path/stderr_path 三欄，列依然會被這個 WHERE 篩掉，C4
+// 缺口不會真的消失。呼叫端推回的 startedAt 值來源與 sqlite 側
+// `pipeline_runs.started_at` 完全同構（兩邊都是從同一個 log 檔名時間戳反推，
+// 見 switch-readiness.ts 檔頭「`started_at` 的兩軌容差」說明），不是臆測值。
 export const W2_INSERT_SQL = `
-INSERT INTO runs (run_id, host, ticket, kind, lifecycle_rank, outcome, outcome_tier, outcome_source, finished_at, exit_code, created_at)
-VALUES (?, ?, ?, ?, 100, ?, 2, ?, ?, ?, NOW(3))
+INSERT INTO runs (run_id, host, ticket, kind, lifecycle_rank, outcome, outcome_tier, outcome_source, finished_at, exit_code, legacy_key, stdout_path, stderr_path, started_at, trigger_source, triggered_by_email, triggered_by_name, created_at)
+VALUES (?, ?, ?, ?, 100, ?, 2, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(3))
 `.trim()
 
 export const RUNS_COLD_PATH_TERMINAL_SQL = 'SELECT host, outcome, outcome_tier FROM runs WHERE run_id = ?'
@@ -156,6 +182,30 @@ export interface WriteRunOutcomeAuthoritativeInput extends RunIdentity {
   outcomeSource: string
   finishedAt: string
   exitCode?: number | null
+  /**
+   * 2026-09-03 根因修復：只在 W2 走 INSERT fallback（W1 從未落地）時派上用場——
+   * UPDATE 路徑代表列已存在（多半是 W1 寫的），這三欄早已由 W1 補齊，這裡不重複
+   * 覆寫。呼叫端沒有值就傳 undefined/null，INSERT 出的列該三欄仍為 NULL（不硬填
+   * 假值），不影響既有行為。
+   */
+  legacyKey?: string | null
+  stdoutPath?: string | null
+  stderrPath?: string | null
+  /**
+   * 2026-09-03 根因修復（同上）：只在 INSERT fallback 用得到，UPDATE 路徑的列
+   * 已存在（多半是 W1 寫的），這欄早已補齊。見 W2_INSERT_SQL 檔頭關於
+   * `RUNS_LIST_WHERE`／C4 的說明。
+   */
+  startedAt?: string | null
+  /**
+   * 2026-09-03 根因修復追加（post-run-notify.ts 補列路徑讀 triggered-by.json）：
+   * 同上，只在 INSERT fallback 用得到——UPDATE 路徑的列已存在（多半是 W1
+   * 寫的），這三欄早已由 W1 補齊。呼叫端沒有值就傳 undefined/null，不硬填
+   * 假值。
+   */
+  triggerSource?: string | null
+  triggeredByEmail?: string | null
+  triggeredByName?: string | null
 }
 
 /**
@@ -194,6 +244,13 @@ export async function writeRunOutcomeAuthoritative(
       input.outcomeSource,
       dt(input.finishedAt),
       input.exitCode ?? null,
+      input.legacyKey ?? null,
+      input.stdoutPath ?? null,
+      input.stderrPath ?? null,
+      dt(input.startedAt),
+      input.triggerSource ?? null,
+      input.triggeredByEmail ?? null,
+      input.triggeredByName ?? null,
     ])
     return { kind: 'inserted' }
   } catch (err) {
@@ -419,9 +476,19 @@ INSERT INTO dispatch_attempts (dispatch_id, ticket, kind, worker_name, worker_ur
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(3))
 `.trim()
 
+// MA-2（review-final-A-dispatcher.md）：confirmed_at / cleared_at / clear_reason /
+// remote_run_id 與 worker_name/worker_url 一樣是「一次寫定」語意——這些欄位由
+// **不同的 advance 各自帶來**（dispatched 帶 confirmed_at/remote_run_id、
+// job_done/exception 只帶 cleared_at/clear_reason），後續 advance 未帶的欄位
+// 一律傳 null，plain 賦值會把先前寫好的值抹回 NULL（本機實查：status='cleared',
+// clear_reason='job_done' 的列 confirmed_at/remote_run_id 2/2 皆 NULL）。全部
+// 改 COALESCE(col, ?)，只在該欄仍為 NULL 時生效。R4 合規：每條 COALESCE 只讀
+// 自己那一欄的舊值（同 W1 的純 additive 慣例）。
 export const DISPATCH_ATTEMPT_ADVANCE_SQL = `
 UPDATE dispatch_attempts
-   SET status = ?, status_rank = ?, confirmed_at = ?, cleared_at = ?, clear_reason = ?, remote_run_id = ?,
+   SET status = ?, status_rank = ?,
+       confirmed_at = COALESCE(confirmed_at, ?), cleared_at = COALESCE(cleared_at, ?),
+       clear_reason = COALESCE(clear_reason, ?), remote_run_id = COALESCE(remote_run_id, ?),
        worker_name = COALESCE(worker_name, ?), worker_url = COALESCE(worker_url, ?)
  WHERE dispatch_id = ? AND status_rank < ?
 `.trim()
@@ -468,7 +535,12 @@ export interface AdvanceDispatchAttemptInput {
    * 到 'dispatched'/'already_running_remote' 才知道是哪一台——`COALESCE`
    * 只在首次寫入生效（worker 選定後不會再變），未提供時傳 null 不清空既有值
    * （否則 2C 回報的缺口：cleared/exception 等後續 advance 沒帶 worker 資訊，
-   * 會把已經寫好的 worker_name/worker_url 覆蓋回 NULL）。 */
+   * 會把已經寫好的 worker_name/worker_url 覆蓋回 NULL）。
+   *
+   * MA-2（2026-09-03）：同一個「一次寫定」語意擴及 confirmedAt / clearedAt /
+   * clearReason / remoteRunId——2C 當時只修了 worker 兩欄，其餘四欄留著 plain
+   * 賦值，job_done 的 advance 把 dispatched 寫好的 confirmed_at/remote_run_id
+   * 抹回 NULL（本機實查 2/2 列）。八個選填欄現在全部 COALESCE。 */
   workerName?: string | null
   workerUrl?: string | null
 }

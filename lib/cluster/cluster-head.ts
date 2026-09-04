@@ -6,6 +6,7 @@ import { createWorkerRegistry } from './worker-registry.ts'
 import { createDispatchRegistry, DISPATCH_STATUS_RANK, type DispatchEntry } from './dispatch-registry.ts'
 import { createDispatcher, type DispatchAttemptWriteDeps, type DispatchResult } from './dispatch.ts'
 import { createRemoteSweeper } from './remote-sweeper.ts'
+import { recordWorkerMonitorStatus } from './worker-monitor-status.ts'
 import { createBacklogDispatcher } from './backlog-dispatcher.ts'
 import { fetchWorkerCapacity, fetchWorkerJobStatus, postWorkerJob } from './worker-client.ts'
 import { isMonitorDbEnabled } from '../monitor-db/env.ts'
@@ -20,6 +21,7 @@ import {
   tryDispatchDemandQueueFront,
 } from '../pipeline-runner/spawn-demand-pipeline.ts'
 import { notifyOperator } from '../notify/operator.ts'
+import { applyRemoteTrackerRow, parseTrackerRow, readTrackerFile } from '../pipeline-runner/tracker-sync.ts'
 import type { TechUser } from '../user-resolution/tech-user.ts'
 
 // head 端多機派工的 production 接線（唯一入口）。dispatch.ts / remote-sweeper.ts
@@ -199,8 +201,22 @@ export function registerClusterRoutes(app: Hono): void {
     return c.json({ ok: true })
   })
 
+  // tracker 整檔下載（2026-09-03）：worker 接單當下拉一份覆蓋本機那份，
+  // 見 tracker-sync.ts「整檔同步」段落的事故背景。head 這份是唯一權威，
+  // 這裡只讀不寫。讀不到（檔案不存在/形狀不對）回 503 而不是空字串——
+  // worker 端要能區分「head 沒有 tracker」與「拿到一份空的」，前者必須
+  // 保留 worker 本機既有那份，不能拿空的去覆蓋。
+  app.get('/cluster/tracker', guard, c => {
+    const content = readTrackerFile()
+    if (content === null) {
+      console.error('cluster: worker 來拉 tracker，但 head 本機這份讀不到或格式不對——worker 會沿用它自己那份')
+      return c.json({ ok: false, reason: 'unavailable' }, 503)
+    }
+    return c.json({ ok: true, content })
+  })
+
   app.post('/cluster/job-done', guard, async c => {
-    const body = (await c.req.json().catch(() => null)) as { ticket?: string; worker?: string } | null
+    const body = (await c.req.json().catch(() => null)) as { ticket?: string; worker?: string; trackerRow?: string } | null
     if (!body || typeof body.ticket !== 'string' || !CLUSTER_TICKET_RE.test(body.ticket)) {
       return c.json({ ok: false }, 400)
     }
@@ -227,6 +243,20 @@ export function registerClusterRoutes(app: Hono): void {
       })
     }
     console.error(`cluster: ${body.ticket} 於 worker ${worker} 執行結束（job-done 回報）`)
+    // 終態回寫（2026-09-03）：worker 上 /create-mr Step 8 寫的是**執行機**那份
+    // tracker，head 這份不會自己知道。把該單的行帶回來寫進 head，多機才只有
+    // 一份權威。遠端字串一律先過 parseTrackerRow 的狀態白名單與時間格式，
+    // 不合格就當沒帶（記 log，不阻斷 job-done 的冪等回應）。
+    if (typeof body.trackerRow === 'string' && body.trackerRow !== '') {
+      const parsed = parseTrackerRow(body.trackerRow)
+      if (parsed === null) {
+        console.error(`cluster: ${body.ticket} 的 job-done 帶了無法解析的 tracker 行，已忽略（head 那份維持原狀）`)
+      } else if (!applyRemoteTrackerRow(body.ticket, parsed.status, parsed.doneAt)) {
+        console.error(`cluster: ${body.ticket} 的終態 ${parsed.status} 回寫 head tracker 失敗（該單可能不在 head 那份裡）`)
+      } else {
+        console.error(`cluster: ${body.ticket} 的終態 ${parsed.status} 已從 worker ${worker} 回寫 head tracker`)
+      }
+    }
     // 這台 worker 剛釋放一個名額：把 head 佇列隊頭遞補過去（cluster-wide
     // 遞補，見 backlog-dispatcher.ts）。fire-and-forget，不擋這支 HTTP 回應
     // ——比照 notifyQueueEvent 等既有 best-effort 收尾的寫法。找不到該 worker
@@ -234,6 +264,26 @@ export function registerClusterRoutes(app: Hono): void {
     const kind = body.ticket.startsWith('FAQ-') ? 'bug' : 'demand'
     const w = workerRegistry.list().find(x => x.name === worker && !x.disabled)
     if (w) void backlogDispatcher.fillFreedSlot(kind, w).catch(err => console.error(`cluster: ${body.ticket} 的 backlog 遞補失敗: ${err}`))
+    return c.json({ ok: true })
+  })
+
+  // 【plan-db-as-truth-v3.2.md MJ-E4 ＝ MAJOR-F6，§6.8(e)】worker 的監控自況
+  // 主動回報。與上面兩條 /cluster/register、/cluster/job-done **完全同型**：
+  // 同一組 guard（LAN-only + shared secret）、同樣低頻（每 worker 每 60 秒
+  // 一次）、同樣小 payload、同樣不擴大能力面——這是本案往 8787 唯一新增的
+  // 路由（【G:MN-G8】）。刻意不動 worker 的 `GET /health`（那是 worker 上唯一
+  // 不驗證的路由，MJ-E4 的裁定就是一個字都不改它）。
+  // head 只存記憶體（worker-monitor-status.ts），判斷與告警在 health-monitor
+  // 的 60 秒 timer 內，不在這支 handler 裡——handler 本身零 I/O。
+  app.post('/cluster/monitor-status', guard, async c => {
+    const body = (await c.req.json().catch(() => null)) as { worker?: unknown } | null
+    if (!body || typeof body.worker !== 'string' || !WORKER_NAME_RE.test(body.worker)) {
+      return c.json({ ok: false }, 400)
+    }
+    // 三個數值欄的型別收斂在 recordWorkerMonitorStatus 內（不合法一律 null =
+    // 「不知道」）：回報端暫時算不出 spool 深度時仍該讓這筆回報留下時間戳，
+    // 400 掉整筆會讓 §6.8(e) 誤判成「這台完全失聯」。
+    recordWorkerMonitorStatus(body.worker, body as Parameters<typeof recordWorkerMonitorStatus>[1])
     return c.json({ ok: true })
   })
 

@@ -17,6 +17,9 @@
 //   - 重生＝欄位級改寫：讀現行 CSV → 每列只把 tg_chat_id 換成 DB 值（DB 無
 //     該列 → 保留檔案原值）→ backupOutsideRepo(csv,'tech-users') →
 //     writeFileAtomic。永不新增列、永不刪列、永不改其他欄、header 原樣。
+//     m6 防呆（寫 DB 與重生**兩個方向都要**，見 regenerateCsvContent 檔頭註解）：
+//     任何即將寫入 CSV 的 DB 值含 `,`／`"`／`\r`／`\n` → 整個重生中止（throw），
+//     不寫檔、不產生半套 CSV（不引入 RFC-4180 quoting，7 處讀者皆純逗號 split）。
 //   - --reconcile：對整份 CSV 跑上述方向表 + 重生；DB 有列但 CSV 沒有的
 //     孤兒列印 WARN 清單，不自動刪。
 //   - --dry-run：印將發生的動作摘要，零 DB 讀寫、零 CSV 寫入（executor 零呼叫）。
@@ -269,6 +272,14 @@ async function runUnsetCsvOnly(csvPath: string, email: string): Promise<string[]
 // （只在新值與現值不同時才重組該行，其餘行連 split/join 都不做）。
 // ─────────────────────────────────────────────────────────────────────────
 
+/**
+ * m6 防呆（重生方向）：§5.10 原文要求「寫 DB 與重生時」都拒絕含 `,`、`"`、`\r`、`\n`
+ * 的值。寫 DB 方向已由 `parseTechUsersCsvStrict`（CSV→DB）與 `runSetDbAuthoritative`
+ * 的 `CHAT_ID_RE` 檢查涵蓋；本函式補上重生（DB→CSV）方向的另一半——寫入 CSV 前驗證
+ * 每個即將寫入的 DB 值必須是空字串或符合 `^-?\d+$`（該 regex 本身已排除四種污染字元），
+ * 不符即整個重生中止（throw），不寫檔、不產生半套 CSV，維持「永不新增列/欄」不變式。
+ * **不引入 RFC-4180 quoting**（7 個跨 repo 讀者全是純逗號 split，裁定方向）。
+ */
 export function regenerateCsvContent(content: string, dbChatIds: Map<string, string | null>): string {
   const lines = content.split('\n')
   const cols = findEmailAndChatIdColumns(lines[0] ?? '')
@@ -281,6 +292,12 @@ export function regenerateCsvContent(content: string, dbChatIds: Map<string, str
     const email = fields[emailCol]
     if (email === undefined || !dbChatIds.has(email)) continue // DB 無該列 → 保留原值
     const newVal = dbChatIds.get(email) ?? ''
+    if (newVal !== '' && !CHAT_ID_RE.test(newVal)) {
+      throw new Error(
+        `tech-users.csv 重生防呆失敗：email=${email} 的 DB 值格式不合法` +
+          '（疑似含逗號/雙引號/CR/LF，或不符 ^-?\\d+$），整個重生中止，不寫檔',
+      )
+    }
     if (fields[chatCol] === newVal) continue // 值未變 → 不重組該行，保持 byte 不變
     fields[chatCol] = newVal
     lines[i] = fields.join(',')

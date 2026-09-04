@@ -8,9 +8,14 @@
 //   規則 1（跨欄禁止）：對每一條 SQL，「被賦值的欄位集合」∩「其他欄位的賦值運算式
 //     所引用的欄位集合」= ∅。→ 精確擋掉 `outcome_source = IF(outcome IS NULL, …)`
 //     這種「引用同語句內另一個會被賦值的欄位」的寫法。
-//   規則 2（自引用白名單）：一個欄位的賦值運算式若引用它自己，形狀只允許三種：
+//   規則 2（自引用白名單）：一個欄位的賦值運算式若引用它自己，形狀只允許四種：
 //     COALESCE(<自己>, <參數|new.同名欄>)、GREATEST(<自己>, <參數|new.同名欄>)、
-//     IF(<守衛>, <前兩種之一>, <自己>)，其中 <守衛> 只允許引用「本語句不賦值」的欄位。
+//     IF(<守衛>, <前兩種之一>, <自己>)、IF(<守衛>, <new.同名欄（裸值）>, <自己>)，
+//     其中 <守衛> 只允許引用「本語句不賦值」的欄位。第四種形狀是第三種的變體：中間分支
+//     直接是 new.同名欄的裸值而不再包一層 COALESCE——語意等價（COALESCE(x) = x，當 new
+//     一定帶值時兩者是同一件事），F-0 擴充規則 2 覆蓋 lib/registry/token-registry.ts 既有
+//     上線的 ISSUE_UPSERT_SQL 時發現既有三形狀漏收這個變體，故補上（不是放寬防線，是承認
+//     一個已經安全的語法變體）。
 //   規則 3（守衛位置）：形狀 B 的每一條 UPDATE，其守衛（比較/IS NULL 判斷）必須出現在
 //     WHERE，不得出現在任何 SET 運算式裡（規則 2 允許的 IF 守衛除外——那個守衛本身
 //     不是「決定要不要覆寫終態」的業務守衛，是純粹的 host 相符檢查，且被規則 2 明文放行）。
@@ -111,6 +116,11 @@ const SELF_REF_PATTERNS = [
   // IF(<guard>, <COALESCE|GREATEST 其一>, <self>)
   (col: string, expr: string) => {
     const m = new RegExp(`^IF\\(.+,\\s*(?:COALESCE|GREATEST)\\(.+\\)\\s*,\\s*(?:[a-zA-Z_]+\\.)?${col}\\s*\\)$`, 'i').exec(expr)
+    return m !== null
+  },
+  // IF(<guard>, <new.同名欄（裸值，不包 COALESCE/GREATEST）>, <self>)
+  (col: string, expr: string) => {
+    const m = new RegExp(`^IF\\(.+,\\s*new\\.${col}\\s*,\\s*(?:[a-zA-Z_]+\\.)?${col}\\s*\\)$`, 'i').exec(expr)
     return m !== null
   },
 ]

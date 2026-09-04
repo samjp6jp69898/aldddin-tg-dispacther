@@ -45,10 +45,15 @@ import {
 } from './lib/pipeline-runner/spawn-demand-pipeline.ts'
 import { createLocalActivity } from './lib/cluster/local-activity.ts'
 import { isTicketLocked, describeTicketProgress, getTicketProgressStages } from './lib/pipeline-runner/ticket-progress.ts'
-import { ensureTrackerPending } from './lib/pipeline-runner/tracker-sync.ts'
+import { ensureTrackerPending, readTrackerRow, writeTrackerFile } from './lib/pipeline-runner/tracker-sync.ts'
 import { startStaleLockReaper } from './lib/pipeline-runner/stale-lock-reaper.ts'
 import { startMonitorMaintenance, runRestartSweep } from './lib/monitor-db/maintenance.ts'
-import { declareMonitorRole } from './lib/monitor-db/env.ts'
+import { declareMonitorRole, isMonitorDbEnabled } from './lib/monitor-db/env.ts'
+import { startMonitorCollectors } from './lib/monitor-db/collectors/index.ts'
+import { getLastHeartbeatResult, startMonitorHeartbeat } from './lib/monitor-db/heartbeat.ts'
+import { startLogShipperLoop, listDispatcherLogFiles } from './lib/log-shipper/mount.ts'
+import { createClusterSink } from './lib/log-shipper/cluster-sink.ts'
+import { readSpoolDepth } from './lib/monitor-db/spool/depth.ts'
 import type { SubmitResult } from './lib/pipeline-runner/pipeline-queue.ts'
 import type { TechUser } from './lib/user-resolution/tech-user.ts'
 
@@ -109,6 +114,46 @@ async function postToHead(path: string, body: unknown): Promise<boolean> {
   }
 }
 
+/**
+ * 接單前向 head 抓一份完整 tracker 覆蓋本機（2026-09-03）。
+ *
+ * 背景見 tracker-sync.ts「整檔同步」段落：worker 機上這份檔案不存在時，
+ * /create-mr Step 0.1 會把每一張單都判成 not claimable，pipeline 幾十秒
+ * 就 SKIPPED 退出，head 那端只看得到「派出去、幾秒後 job-done」。
+ *
+ * 全程降級不阻斷：head 打不到、回 503、內容形狀不對、或本機正有人在寫
+ * （writeTrackerFile 搶不到 tracker.sh 那把檔級鎖）都只記 log，沿用本機
+ * 既有那份繼續接單——拿不到最新副本頂多是狀態舊，硬把接單擋掉才是把
+ * 單機時期就能跑的情境也一起弄壞。
+ *
+ * 逾時 3 秒：這一段落在 head 端 postJob 的 6 秒預算內（見 worker-client.ts
+ * 逾時預算註解，該預算原本只含 ensureTrackerPending 的 1–3 秒 Notion 查詢）。
+ * LAN 上 200KB 量級的 JSON 實測遠低於此；逾時就走上面的降級路徑。
+ */
+async function pullTrackerFromHead(ticket: string): Promise<void> {
+  try {
+    const res = await fetch(`${headUrl}/cluster/tracker`, {
+      headers: { [CLUSTER_TOKEN_HEADER]: secret },
+      signal: AbortSignal.timeout(3_000),
+    })
+    if (!res.ok) {
+      console.error(`worker-agent: ${ticket} 接單前拉 head tracker 失敗（HTTP ${res.status}），沿用本機那份`)
+      return
+    }
+    const body = (await res.json()) as { ok?: boolean; content?: unknown }
+    if (body?.ok !== true || typeof body.content !== 'string') {
+      console.error(`worker-agent: ${ticket} 接單前拉 head tracker 回應格式不對，沿用本機那份`)
+      return
+    }
+    const outcome = writeTrackerFile(body.content)
+    if (outcome !== 'ok') {
+      console.error(`worker-agent: ${ticket} 接單前寫入 head tracker 副本未完成（${outcome}），沿用本機那份`)
+    }
+  } catch (err) {
+    console.error(`worker-agent: ${ticket} 接單前拉 head tracker 例外，沿用本機那份: ${err}`)
+  }
+}
+
 function reportJobDone(ticket: string): void {
   // C-1 修正：回報前先確認這張單在本機已無**任何**活動——wrapper 的 EXIT
   // trap 內 post-run-notify 可能已對 timeout 自動重試 spawn 了下一輪 run
@@ -120,7 +165,12 @@ function reportJobDone(ticket: string): void {
     console.error(`worker-agent: ${ticket} 結束但本機仍有該單的其他活動（可能為自動重試），跳過 job-done 回報`)
     return
   }
-  void postToHead('/cluster/job-done', { ticket, worker: workerName }).then(ok => {
+  // 終態隨回報一起帶回 head（2026-09-03）：/create-mr Step 8 寫的是本機這份
+  // tracker，head 那份不會自己知道。只有 bug 單走 tracker（ALDREQ 的認領與
+  // 狀態完全在 Notion，tracker.sh 也只認 FAQ- 行）。讀不到就不帶這個欄位，
+  // head 端維持原本只清登記的行為。
+  const trackerRow = BUG_TICKET_RE.test(ticket) ? readTrackerRow(ticket) : null
+  void postToHead('/cluster/job-done', { ticket, worker: workerName, ...(trackerRow ? { trackerRow } : {}) }).then(ok => {
     if (!ok) console.error(`worker-agent: job-done 回報失敗（${ticket}），交由 head sweeper 事後校正`)
   })
 }
@@ -167,6 +217,85 @@ void runRestartSweep(
 // sweeper。直接複用上面已建好的 localActivity（queue ∪ 鎖目錄 ∪ ps 三合一，
 // 不重建第二份）。isMonitorDbEnabled()=false 時內部直接 no-op。
 startMonitorMaintenance({ isTicketActive: ticket => localActivity.isActive(ticket) })
+
+// 【plan §9 Phase 4】collectors：agent trace / bug stdout → agent_runs。worker
+// 只掛這一個——`mcp_usage` 的稽核 jsonl 只在 head 上，且 mon_exec 沒有那張表
+// 的權限（§11.1 授權對映）。isMonitorDbEnabled()=false 時內部整段 no-op。
+startMonitorCollectors({ role: 'mon_exec' })
+
+// 【plan §6.8(1)(2)】monitor_heartbeat：啟動時打一拍 + 每 60 秒一拍
+// （writer='worker-agent'，PK 是 (host, writer)，每台 worker 自己一列）。
+// 失敗只 WARN + 落 spool；isMonitorDbEnabled()=false 時整段 no-op。
+startMonitorHeartbeat({ writer: 'worker-agent' })
+
+// 【plan §7.2/§7.4，Phase 7 整合】worker 端的 log shipping 常駐迴圈。
+// library（lib/log-shipper/shipper.ts）2026-09-02 就完成了，但在此之前**沒有
+// 任何行程呼叫過 runOneCycle()**——VictoriaLogs 一直沒有新資料，那不是驗證
+// 缺口而是整合工項從未開始，2026-09-03 補上。head 那一份掛在 intake-server.ts。
+//
+// sink 走 cluster-sink → head 的 9429（經 SSH tunnel 的 127.0.0.1:9429，
+// 與監控 DB 的 3307 同一條隧道，doctor-worker 的「監控 DB」節就在驗這兩個埠）。
+// 不直寫 VictoriaLogs：worker 上沒有 MON_VL_* 憑證，而且 §3.3(e) 的 host 覆寫
+// 與 LRU 去重都在 intake 那一側，繞過它等於繞過那兩層。
+startLogShipperLoop({
+  label: 'worker-agent',
+  listSourceFiles: listDispatcherLogFiles,
+  // 直接用模組層那個已收斂成 string 的 `secret`：本行程在 :63 就對缺 secret
+  // 拒絕啟動了，這裡再檢查一次是永遠不會成立的死碼。
+  createSink: () => createClusterSink({ worker: workerName, clusterSecret: secret }),
+})
+
+// 【plan-db-as-truth-v3.2.md MJ-E4 ＝ MAJOR-F6，§6.8(e)】每 60 秒把本機的監控
+// 自況主動回報給 head（head 存記憶體，由它的 health-monitor 判斷告警）。
+//
+// 為什麼是主動回報：v3 原本要把這三個欄位塞進本機 `GET /health`，但那是本機
+// 唯一不驗證的路由（下面 :/health），且「head 本來就每輪打 /health」是事實
+// 錯誤。改走已認證的 postToHead 之後，`/health` 一個字不用改，head 也不需要
+// 新增任何輪詢工項。
+//
+// 紀律：這支跑在**自己的 timer 內**，絕不掛進 `/jobs` 熱路徑（那條路徑不得
+// 有任何 DB／網路 I/O）。`isMonitorDbEnabled()` 關閉時連 timer 都不建——
+// flag=0 時本行程的行為與本次改動前完全相同。
+const MONITOR_STATUS_TICK_MS = 60_000
+
+/** 心跳結果 → `db_writable` 的三態：`null`（還沒打過任何一拍＝不知道）／
+ * `true`（上一拍真的寫進 DB）／`false`（上一拍落 spool 或整個遺失）。 */
+function toTriState(result: ReturnType<typeof getLastHeartbeatResult>): boolean | null {
+  return result === null ? null : result === 'written'
+}
+
+async function reportMonitorStatus(): Promise<void> {
+  try {
+    const spool = readSpoolDepth()
+    // `oldest_age_s`：由 worker 自己換算（head 只會拿它跟門檻比大小，不做
+    // 跨機時鐘校正——兩端時鐘偏移的影響因此只落在這一個數字上，不會污染
+    // head 蓋章的 receivedAt）。
+    const oldestAgeS = spool.oldestTs === null ? null : Math.max(0, Math.round((Date.now() - Date.parse(spool.oldestTs)) / 1000))
+    const ok = await postToHead('/cluster/monitor-status', {
+      worker: workerName,
+      spool_depth: spool.depth,
+      oldest_age_s: oldestAgeS,
+      // 「上一拍心跳有沒有真的寫進 DB」——本行程手上唯一不需要多打一次 DB
+      // 就能得到的可寫性證據（見 heartbeat.ts 的 getLastHeartbeatResult）。
+      //
+      // **`null` ＝ 還沒打過任何一拍，也就是「不知道」**（a7-D15：null 必須貫穿，
+      // 不得在任何一段被壓成 false/0）。本函式在 :220 開機當下就跑第一輪，與
+      // `startMonitorHeartbeat()` 的首拍是競跑的——舊寫法 `=== 'written'` 會把
+      // 這個必然發生的起步期回報成 `false`＝「該台監控 DB 不可寫」，那是**捏造的
+      // 壞消息**，會讓 (e) 的告警文字冤枉一台其實好好的機器。
+      db_writable: toTriState(getLastHeartbeatResult('worker-agent')),
+    })
+    if (!ok) console.error('worker-agent: monitor-status 回報失敗（head 打不到），下一輪重試')
+  } catch (err) {
+    // best-effort：回報失敗絕不影響本行程任何其他職責。
+    console.error(`worker-agent: monitor-status 回報時發生例外: ${err}`)
+  }
+}
+
+if (isMonitorDbEnabled()) {
+  void reportMonitorStatus()
+  setInterval(() => void reportMonitorStatus(), MONITOR_STATUS_TICK_MS)
+}
 
 // ---- HTTP 介面 ----
 
@@ -262,6 +391,10 @@ app.post('/jobs', guard, async c => {
     if (stats.queued > 0 || stats.running >= stats.limit) return c.json({ ok: false, reason: 'full' }, 409)
     // 比照 head 端 claim.ts：spawn 前先確保本機 tracker 有這張單（/create-mr
     // Step 0 的存在性檢查讀的是「執行機」的 tracker，不是 head 的）。
+    // ensure-pending 之前先把 head 那份完整抓下來覆蓋——tracker.sh 對「檔案
+    // 不存在」是直接 exit 1，ensureTrackerPending 會靜默失敗，Step 0.1 就
+    // 判 not claimable（2026-09-03 事故，見 tracker-sync.ts 檔內說明）。
+    await pullTrackerFromHead(body.ticket)
     ensureTrackerPending(body.ticket)
     const result = submitCreateMr(body.ticket, { resume: body.resume === true, triggeredBy, dispatchId: dispatchId ?? undefined })
     // §5.4：submitCreateMr 現在會在 started/queued 兩種狀態鑄 run_id 並疊加進

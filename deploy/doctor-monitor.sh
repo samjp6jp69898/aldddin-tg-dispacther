@@ -172,8 +172,16 @@ if [ -f "$TGMON/.env" ] && [ -f "$TGMON/.env.example" ] && grep -q 'MON_DB_ENABL
   fi
   TGMON_PID=$(launchctl list | awk '$3=="com.aladdin.tg-monitor"{print $1}')
   if [ -n "$TGMON_PID" ] && [ "$TGMON_PID" != "-" ] && curl -s -o /dev/null -w '' "http://127.0.0.1:8799/" ; then
-    HC=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:8799/")
-    [ "$HC" = "200" ] && ok "tg-monitor 8799 正常回應 (pid=$TGMON_PID)" || err "tg-monitor 8799 回應異常: $HC"
+    # `-L` 跟隨導向、驗**最終**狀態碼：ff 的 7818207（2026-09-02）刪掉舊版
+    # public/index.html 之後，`/` 改成導向 `/next/`（React 版是唯一前端），原本
+    # 只認 200 的寫法從那次起就恆紅，`[ "$ERRORS" -eq 0 ]` 永遠不成立、整份
+    # doctor 的驗收價值歸零。
+    # 用 `-L` 而不是「多接受一個 302」或「改打 /next/」：前者只修掉這一個狀態碼、
+    # 後者只是把一個寫死路徑換成另一個，下次前端再動入口就再壞一次；`-L` 讓這個
+    # 檢查對「`/` 到底回 200 還是 3xx」永久不敏感——它問的本來就是「這個服務的
+    # 首頁最後拿得到嗎」。（a7 2026-09-02 裁定；`/` 維持 302 不改回 200。）
+    HC=$(curl -sL -o /dev/null -w '%{http_code}' "http://127.0.0.1:8799/")
+    [ "$HC" = "200" ] && ok "tg-monitor 8799 正常回應（跟隨導向後 HTTP ${HC}, pid=${TGMON_PID}）" || err "tg-monitor 8799 回應異常: $HC"
   else
     err "tg-monitor 未在跑或 8799 無回應"
   fi
@@ -195,6 +203,18 @@ if [ -n "$WORKER_NAME_IN_HEAD_ENV" ]; then
   err "head 的 .env 含非空 CLUSTER_WORKER_NAME='$WORKER_NAME_IN_HEAD_ENV'（head 不該有這個值，worker 才用；這正是 2026-09-02 crash loop 的根因）"
 else
   ok "head 的 .env 沒有殘留 CLUSTER_WORKER_NAME"
+fi
+# 2026-09-03 補：doctor-worker.sh:163-164 對 worker 端有對稱檢查
+# （MON_DB_USER 必須恆等於 mon_exec），head 這邊原本沒有——loadMonitorEnv()
+# 的 expectedRole 同步檢查（env.ts）本來就會在角色/帳號不符時擋下連線，這裡
+# 只是把這個事實提前變成一條可主動示警的 doctor 檢查項目。
+MON_DB_USER_IN_HEAD_ENV=$(grep '^MON_DB_USER=' "$ENV_FILE" | cut -d= -f2- | tr -d '\r\n')
+if [ -z "$MON_DB_USER_IN_HEAD_ENV" ]; then
+  err "head 的 .env 找不到 MON_DB_USER（無法確認角色帳號）"
+elif [ "$MON_DB_USER_IN_HEAD_ENV" = "mon_head" ]; then
+  ok "head 的 .env 的 MON_DB_USER=mon_head"
+else
+  err "head 的 .env 的 MON_DB_USER='$MON_DB_USER_IN_HEAD_ENV'（head 必須恆等於 mon_head，否則 loadMonitorEnv 的 expectedRole 檢查會擋下連線；對稱於 doctor-worker.sh:163-164）"
 fi
 if grep -q "declareMonitorRole('mon_head')" "$DISPATCHER/server.ts"; then
   ok "server.ts 已顯式宣告角色 mon_head（不再嗅探 CLUSTER_WORKER_NAME）"
@@ -219,10 +239,28 @@ if [ -n "$LATEST" ]; then
   else
     err "最新備份已 ${AGE_H}h（> 26h）"
   fi
-  if gunzip -c "$LATEST" | grep -q "CREATE TABLE.*runs"; then
-    ok "備份可解壓且含 CREATE TABLE runs"
+  # 這裡用 grep -c 而不是 grep -q（2026-09-03）。-q 命中即早退，上游 gunzip 會收到
+  # SIGPIPE，而本腳本開著 pipefail —— 整條管線因此判失敗。它只在檔案大到塞滿 pipe
+  # buffer 時才發生：2026-09-02 的備份 2365 bytes 判綠，2026-09-03 的 56403 bytes 就
+  # 判紅（exit 141）。同一份檢查、同一種內容，**只因為備份長大就永久轉紅**，而且紅的
+  # 是檢查不是備份，沒有人看得出差別。
+  # -c 一定讀到 EOF，結構上不可能早退；命中 0 筆時 grep 退 1，由 || true 吸收，判斷
+  # 完全落在計數值上、與退出碼脫鉤。不靠「141 vs 1」去分辨兩種語意——那等於把 SIGPIPE
+  # 這個實作細節當成契約，換個 shell 或管線多一段，數字就變了而且不會有人知道。
+  if gzip -t "$LATEST" 2>/dev/null; then
+    # 加 -a：dump 含二進位欄位資料（有 NUL byte），沒有 -a 的話 grep 走 binary 模式，
+    # 行為會隨「今天的資料剛好有沒有二進位」而變——那是另一個大小/內容相依的假陽性。
+    DDL_HITS=$(gunzip -c "$LATEST" 2>/dev/null | grep -ac "CREATE TABLE.*runs" || true)
+    if [ "$DDL_HITS" -gt 0 ]; then
+      ok "備份可解壓且含 CREATE TABLE runs（命中 ${DDL_HITS} 筆）"
+    else
+      # 空 gzip 是**合法的** gzip（20 bytes），會通過上面的 gzip -t，只有這條抓得到。
+      err "備份可解壓但找不到 CREATE TABLE runs（內容不是有效的 dump）"
+    fi
   else
-    err "備份內容異常，找不到 CREATE TABLE runs"
+    # 命中筆數在這條路徑上**沒有被評估**，所以一個字都不印（D42）：印成 0 會讓人讀成
+    # 「解壓成功但內容沒有 runs」，那是另一種病、另一種處置。
+    err "備份不是完整的 gzip，無法解壓：$LATEST"
   fi
   ls -ld "$BACKUP_DIR" | awk '{print $1}' | grep -q '^drwx------' && ok "備份目錄權限 0700" || warn "備份目錄權限非 0700"
 else
@@ -248,6 +286,99 @@ if [ "$TUNNEL_JOBS" -eq 0 ]; then
   napb 3 "尚無 monitor-tunnel job（worker 部署與 tunnel 屬 Phase 3，本輪明確排除）"
 else
   ok "偵測到 $TUNNEL_JOBS 個 monitor-tunnel job"
+fi
+
+echo ""
+echo "=== 11. Phase 8 讀取面（MON_READ_SOURCE 回滾槓桿 + /api/stream） ==="
+# 本節刻意只做**廉價、唯讀、零副作用**的檢查，維持本腳本檔頭「不做任何寫入，
+# 純檢查」的契約。tg-monitor 那兩支驗收腳本（compare-sqlite-mysql.ts /
+# verify-stream.ts）不適合放進預設路徑：
+#   - verify-stream.ts 會**另起一個 server**、開 40 條連線、並在**活的**
+#     DISPATCHER_LOG_DIR 底下建一個暫時 log 檔（白名單只涵蓋那個目錄，改放 /tmp
+#     會被 403），單次 2–4 分鐘；
+#   - compare-sqlite-mysql.ts 唯讀但要整表撈兩軌的 events 做逐欄比對。
+# 所以它們放在 DOCTOR_DEEP=1 之後（見本節最後一段）。預設巡檢只驗「槓桿存在、
+# 沒有靜默降級、驗收產物還在」這三件事——那才是每次巡檢都該問的問題。
+TGM_DIR="/Users/user/aladdin/tg-monitor"
+TGM_ENV="$TGM_DIR/.env"
+RUN_MONITOR="$TGM_DIR/launchd/run-monitor.sh"
+
+# (a) 回滾槓桿的兩個必要條件：.env 有這個 key、wrapper 會把它匯出。
+#     缺任一個，「改 .env 一個字 + kickstart」這顆按鈕就是假的（BL-C2 同型）。
+if [ -f "$TGM_ENV" ] && grep -q '^MON_READ_SOURCE=' "$TGM_ENV"; then
+  ok "tg-monitor/.env 有 MON_READ_SOURCE（回滾槓桿存在）"
+else
+  err "tg-monitor/.env 缺 MON_READ_SOURCE —— 讀取面回滾按鈕不成立"
+fi
+if grep -q 'MON_READ_SOURCE' "$RUN_MONITOR" 2>/dev/null; then
+  ok "run-monitor.sh 的逐 key 匯出白名單含 MON_READ_SOURCE"
+else
+  err "run-monitor.sh 白名單缺 MON_READ_SOURCE —— launchd 起的行程永遠讀不到它"
+fi
+
+# (b) 靜默降級偵測：MON_READ_SOURCE=mysql 但探針失敗時，tg-monitor 會退回 sqlite
+#     並繼續服務（lib/read/index.ts：plist 是 KeepAlive=true，啟動 throw 會變成
+#     無窮重啟迴圈）。那件事只寫 stderr，從外面看不出來——操作者會以為在跑 mysql。
+#     /api/read-source 就是為了讓巡檢問得出這句話而加的。
+READ_SRC_JSON=$(curl -s -m 3 http://127.0.0.1:8799/api/read-source 2>/dev/null || true)
+if [ -z "$READ_SRC_JSON" ]; then
+  err "tg-monitor（127.0.0.1:8799）沒有回應 /api/read-source"
+elif echo "$READ_SRC_JSON" | grep -q '"effective"'; then
+  EFFECTIVE=$(echo "$READ_SRC_JSON" | sed -E 's/.*"effective":"([^"]*)".*/\1/')
+  if echo "$READ_SRC_JSON" | grep -q '"degraded":true'; then
+    err "讀取面靜默降級中：要的是 mysql，實際在跑 ${EFFECTIVE}（查 tg-monitor stderr 的探針失敗原因）"
+  else
+    ok "讀取面資料源 = ${EFFECTIVE}（無降級）"
+  fi
+else
+  napb 8 "tg-monitor 尚未重啟載入含 /api/read-source 的版本（回應：${READ_SRC_JSON:0:60}）"
+fi
+
+# (c) 兩支驗收產物還在（被刪掉就等於 Phase 8 的迴歸基準沒了）
+for SCRIPT in "$TGM_DIR/scripts/sse-segfault-repro.ts" "$TGM_DIR/scripts/verify-stream.ts" "$TGM_DIR/scripts/compare-sqlite-mysql.ts"; do
+  [ -f "$SCRIPT" ] && ok "驗收產物存在：$(basename "$SCRIPT")" || err "驗收產物缺失：$SCRIPT"
+done
+
+# (d) 深度巡檢（預設不跑）：DOCTOR_DEEP=1 才會真的執行那兩支。
+#     verify-stream.ts 有副作用（見本節開頭），所以連 deep 模式都明確印出來。
+if [ "${DOCTOR_DEEP:-0}" = "1" ]; then
+  echo "--- DOCTOR_DEEP=1：跑 tg-monitor 的兩支驗收腳本（數分鐘） ---"
+  if (cd "$TGM_DIR" && bun run scripts/verify-stream.ts sqlite >/tmp/doctor-verify-stream.log 2>&1); then
+    ok "verify-stream.ts sqlite 全綠"
+  else
+    err "verify-stream.ts sqlite 失敗（詳見 /tmp/doctor-verify-stream.log）"
+  fi
+  # 雙軌對照的非 0 退出碼代表「兩軌有差異」，在 collector 遷移與回填完成前**本來就會有**，
+  # 所以判 WARN 不判 ERROR；退出碼 2 才是真的連不上監控 DB。
+  (cd "$TGM_DIR" && bun run scripts/compare-sqlite-mysql.ts >/tmp/doctor-compare.log 2>&1)
+  case "$?" in
+    0) ok "雙軌對照：兩軌一致" ;;
+    2) err "雙軌對照：連不上監控 DB（詳見 /tmp/doctor-compare.log）" ;;
+    *) warn "雙軌對照有差異（回填/collector 進度未完成時屬預期，詳見 /tmp/doctor-compare.log）" ;;
+  esac
+else
+  echo "[SKIP]  深度驗收（verify-stream / 雙軌對照）——需要時跑 DOCTOR_DEEP=1 $0"
+fi
+
+echo ""
+echo "=== 12. tg-monitor 最近一次啟動的來源（D48：裸 kickstart 留痕） ==="
+# safe-kickstart.sh 擋不住裸 `launchctl kickstart`，而且**那件事在 run-monitor.sh 這層
+# 結構上就做不到**：啟動後才擋，服務已經被 `kickstart -k` 的 -k 殺掉了；plist 又是
+# KeepAlive=true，擋一次就變成無限重啟迴圈（形狀同 2026-09-02 那次 crash loop）。
+# 阻擋型只會把繞過的**後果**從「載進別人的碼」換成「監控整個停擺」，繞過本身沒被擋。
+# 所以那一層是 fail-open 的「留痕」不是「阻擋」：每次啟動記一行 start，標明來源。
+# 但寫下的痕跡若沒有人讀，就還是一種沒有觀察者的失敗——這一節就是那個讀的人。
+# 判 WARN 不判 ERROR：手動重啟過是**可疑**不是故障，不該污染 ERRORS=0 這條部署硬條件。
+# 覆寫用的環境變數只為了讓這三個分支測得到：kickstart.log 是稽核紀錄，為了測 WARN
+# 分支去偽造幾行再刪掉，等於為了驗證檢查而污染被檢查的證據。正式路徑上沒有人會設它。
+KICKSTART_LOG="${DOCTOR_KICKSTART_LOG:-/Users/user/aladdin/tg-monitor/data/kickstart.log}"
+LAST_START=$(grep ' | start | ' "$KICKSTART_LOG" 2>/dev/null | tail -1)
+if [ -z "$LAST_START" ]; then
+  warn "kickstart.log 找不到任何 start 紀錄（guard 尚未隨服務重啟載入，或 log 被清過）"
+elif echo "$LAST_START" | grep -q 'via=safe-kickstart'; then
+  ok "最近一次啟動經由 safe-kickstart：${LAST_START}"
+else
+  warn "最近一次啟動未經 safe-kickstart（裸 kickstart 或開機自動啟動）：${LAST_START}"
 fi
 
 echo ""

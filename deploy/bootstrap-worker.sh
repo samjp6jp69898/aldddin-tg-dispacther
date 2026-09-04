@@ -62,7 +62,30 @@ fi
 mkdir -p "$ALADDIN/worktrees" "$DISPATCHER/logs" 2>/dev/null && ok "worktrees/ 與 logs/ 目錄就緒"
 [ -d "$ALADDIN/obsidian" ] && mkdir -p "$ALADDIN/obsidian/Debug"
 
-echo "== 6. .env（不代辦，只檢查）=="
+echo "== 6. 非 git 資產（不代辦，只檢查——2026-09-03 事故補課）=="
+# 這三項都不在任何 repo 裡，也無法在 worker 這端自己取得（worker 沒有回連
+# head 的管道），所以只能列待辦、由人從 head 推過來。2026-08-31 建 landon2
+# 時三項全漏，且當時 bootstrap 與 doctor 都沒有檢查它們，機器看起來是好的、
+# 實際上每張派來的單都白跑。缺失的共同特徵是「不會讓 pipeline 報錯退出」。
+TRACKER_MD="$HOME/.claude/projects/-Users-user-aladdin/memory/bug_analysis_tracker.md"
+mkdir -p "$(dirname "$TRACKER_MD")" 2>/dev/null
+if [ -f "$TRACKER_MD" ] && grep -qE '^\| FAQ-[0-9]+ \|' "$TRACKER_MD" 2>/dev/null; then
+  ok "bug_analysis_tracker.md 已存在"
+else
+  todo "從 head 複製 bug 認領表（缺了會讓每張派來的單在 /create-mr Step 0.1 判 not claimable、幾十秒 SKIPPED）：在 head 執行 scp -p ~/.claude/projects/-Users-user-aladdin/memory/bug_analysis_tracker.md user@<本機IP>:~/.claude/projects/-Users-user-aladdin/memory/"
+fi
+if [ -x "$HOME/.claude/gdrive.sh" ] && [ -f "$HOME/.claude/gdrive_token.json" ]; then
+  ok "gdrive.sh + gdrive_token.json 已存在"
+else
+  todo "從 head 複製 Google Drive 上傳工具與憑證（缺了分析文件上傳會全失敗、Notion 留言沒有文件連結）：在 head 執行 scp -p ~/.claude/gdrive.sh ~/.claude/gdrive_token.json user@<本機IP>:~/.claude/"
+fi
+if [ -d "$ALADDIN/cqa-e2e" ] && [ -n "$(ls -A "$ALADDIN/cqa-e2e" 2>/dev/null)" ]; then
+  ok "cqa-e2e/ 已存在"
+else
+  todo "從 head 同步 CQA 取證環境（缺了 cqa-grounder 無法做畫面取證、grounding 降級 DEGRADED；約 360MB）：在 head 執行 rsync -a /Users/user/aladdin/cqa-e2e/ user@<本機IP>:/Users/user/aladdin/cqa-e2e/"
+fi
+
+echo "== 7. .env（不代辦，只檢查）=="
 if [ -f "$DISPATCHER/.env" ]; then
   MISSING=""
   for KEY in CLUSTER_SHARED_SECRET CLUSTER_HEAD_URL CLUSTER_WORKER_NAME CLUSTER_WORKER_URL TG_DISPATCH_BOT_TOKEN ALD_NOTION_TOKEN MON_DB_ENABLED MON_DB_HOST MON_DB_PORT MON_DB_SCHEMA MON_DB_USER MON_DB_PASSWORD; do
@@ -73,7 +96,7 @@ else
   todo "從 head 安全複製 .env 到 $DISPATCHER/.env（AirDrop/scp/USB，不走會落地存放的通道），再補 CLUSTER_WORKER_NAME / CLUSTER_WORKER_URL 為本機值"
 fi
 
-echo "== 7. launchd（worker agent 常駐）=="
+echo "== 8. launchd（worker agent 常駐）=="
 if [ -f "$DISPATCHER/launchd/com.aladdin.tg-worker-agent.plist" ]; then
   cp "$DISPATCHER/launchd/com.aladdin.tg-worker-agent.plist" "$HOME/Library/LaunchAgents/" 2>/dev/null \
     && ok "plist 已複製到 ~/Library/LaunchAgents/（啟動見下方指令）" \

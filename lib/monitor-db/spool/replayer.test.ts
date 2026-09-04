@@ -190,3 +190,24 @@ describe('drainAll', () => {
     expect(again.files.every(f => f.replayed === 0 && f.deadLettered === 0)).toBe(true)
   }, 20_000)
 })
+
+// 2026-09-02 指揮官裁定（per-fn run_id）的重放端配套確認：`run_id: null` 的
+// 條目（file_offsets / mcp_usage / *_log 等結構上沒有 run_id 的表）必須被
+// 重放端正常消化——replayer.ts 與 apply-entry.ts 都不看 run_id，這條測試把
+// 「不看」這件事釘成可證偽的事實（tg-monitor 側會 append 這種條目）。
+describe('run_id: null 的條目（per-fn 硬規則放行的非 run 類寫入）', () => {
+  test('重放端照常消化，不拒收、不進 dead-letter', async () => {
+    const dir = tmpDir()
+    const w = createSpoolWriter({ writer: 'tg-monitor', dir })
+    w.append({ ts: 't1', host: 'h', run_id: null, fn: 'insertStatusLogRow', args: [['service_status_log', ['service'], ['x']]] })
+    w.append({ ts: 't2', host: 'h', run_id: null, fn: 'upsertFileOffset', args: [{ path: '/p', inode: 1, offset: 2, eventSeq: 3 }] })
+    w.close()
+
+    const { applied, deps } = fakeDeps()
+    const summary = await replayOnce(dir, deps)
+
+    expect(applied.map(e => e.fn)).toEqual(['insertStatusLogRow', 'upsertFileOffset'])
+    expect(applied.every(e => e.run_id === null)).toBe(true)
+    expect(summary.files.every(f => f.deadLettered === 0)).toBe(true)
+  })
+})

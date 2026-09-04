@@ -32,7 +32,7 @@
 // 可以安全地在檔案頂層 import（它自己的檔頭註解明講這一點）。
 import type { Pool } from 'mysql2/promise'
 import { randomUUID } from 'node:crypto'
-import { isMonitorDbEnabled } from '../monitor-db/env.ts'
+import { declareMonitorRole, isMonitorDbEnabled } from '../monitor-db/env.ts'
 import type { SpoolWriterHandle } from '../monitor-db/spool/writer.ts'
 import { monitorRoleForThisHost, SHORT_LIVED_WRITE_BUDGET_MS, tryWriteOrSpool } from '../monitor-db/runtime.ts'
 
@@ -88,6 +88,18 @@ export async function writeDemandOutcomeAuthoritative(
   let pool: Pool | undefined
   let spool: SpoolWriterHandle | undefined
   try {
+    // 2026-09-03 補（承 2026-09-02 熱修 183bf5a 明確留下的缺口：本檔當時未
+    // 升級）：本函式的兩個實際呼叫端（post-run-demand.ts 的 trap 側、
+    // run-demand-pipeline.ts 的 finalize()）都是固定只在 head 機器上跑的短命
+    // CLI（demand pipeline 由常駐在 head 的 server.ts 觸發，worker 不會
+    // 執行），在這裡（本函式是兩者共用、實際觸發 monitor-db 讀寫的最早執行
+    // 點）跟 server.ts/worker-agent.ts 一樣顯式宣告角色——之後下面
+    // monitorRoleForThisHost() 一律用宣告值，不再嗅探
+    // process.env.CLUSTER_WORKER_NAME（head .env 殘留這個變數時不再誤判成
+    // worker，見 env.ts declareMonitorRole 註解）。放在 try 內：本函式的
+    // 「全程 best-effort、絕不拋出」承諾涵蓋這一步（呼叫端 post-run-demand.ts
+    // 沒有自己的 try/catch，靠的正是這裡的保證）。
+    declareMonitorRole('mon_head')
     const { createMonitorPool } = await import('../monitor-db/pool.ts')
     const { createSpoolWriter } = await import('../monitor-db/spool/writer.ts')
     const { writeRunOutcomeAuthoritative } = await import('../monitor-db/writes.ts')

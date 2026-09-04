@@ -47,20 +47,38 @@ describe('createSpoolWriter', () => {
     expect(lines.map(l => JSON.parse(l).seq)).toEqual([1, 2, 3])
   })
 
-  test('run_id 為空 → 拒絕寫入並丟例外（【G:MJ-G2】的一般化硬規則：run_id 不得留給重放時再解析）', () => {
+  // 【G:MJ-G2】硬規則的 per-fn 適用範圍（2026-09-02 指揮官裁定）：
+  // runs/agent_runs 類的 fn 仍必須帶非空 run_id；其餘表（結構上沒有 run_id）
+  // 允許 null。兩個方向各有結構性測試，缺一不可。
+  test('runs 類 fn（writeRunProgress）run_id 為空 → 拒絕寫入並丟例外（run_id 不得留給重放時再解析）', () => {
     const dir = tmpSpoolDir()
     const w = createSpoolWriter({ writer: 'cli', dir })
-    expect(() => w.append({ ts: 't1', host: 'h', run_id: '', fn: 'f', args: [] })).toThrow()
+    expect(() => w.append({ ts: 't1', host: 'h', run_id: '', fn: 'writeRunProgress', args: [] })).toThrow()
+    expect(() => w.append({ ts: 't1', host: 'h', run_id: null, fn: 'upsertAgentRun', args: [] })).toThrow()
     w.close()
+    expect(readFileSync(w.filePath(), 'utf8')).toBe('')
   })
 
-  test('appendBatch 中任一條 run_id 為空 → 整批拒絕，不留下部分寫入（檔案應維持空）', () => {
+  test('非 run 類 fn（file_offsets / mcp_usage / 心跳 / *_log / unknown_senders）run_id=null → 照常收下', () => {
+    const dir = tmpSpoolDir()
+    const w = createSpoolWriter({ writer: 'cli', dir })
+    for (const fn of ['upsertFileOffset', 'insertMcpUsage', 'upsertMonitorHeartbeat', 'insertStatusLogRow', 'insertTgUnknownSender']) {
+      w.append({ ts: 't1', host: 'h', run_id: null, fn, args: [{}] })
+    }
+    w.close()
+    const lines = readFileSync(w.filePath(), 'utf8').trim().split('\n')
+    expect(lines).toHaveLength(5)
+    expect(lines.map(l => JSON.parse(l).run_id)).toEqual([null, null, null, null, null])
+    expect(JSON.parse(lines[0]!)).toMatchObject({ seq: 1, fn: 'upsertFileOffset' })
+  })
+
+  test('appendBatch 中任一條 runs 類 fn 的 run_id 為空 → 整批拒絕，不留下部分寫入（檔案應維持空）', () => {
     const dir = tmpSpoolDir()
     const w = createSpoolWriter({ writer: 'cli', dir })
     expect(() =>
       w.appendBatch([
-        { ts: 't1', host: 'h', run_id: 'r1', fn: 'f', args: [] },
-        { ts: 't2', host: 'h', run_id: '', fn: 'f', args: [] },
+        { ts: 't1', host: 'h', run_id: 'r1', fn: 'writeRunProgress', args: [] },
+        { ts: 't2', host: 'h', run_id: '', fn: 'writeRunProgress', args: [] },
       ]),
     ).toThrow()
     w.close()

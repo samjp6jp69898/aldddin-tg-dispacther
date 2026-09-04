@@ -24,6 +24,7 @@ function makeHarness(
   const dequeueFailed: string[] = []
   const skipped: { ticket: string; reason: string }[] = []
   const enqueued: string[] = []
+  const dispatchedRemote: string[] = []
   const queue = createPipelineQueue<{ tag: string }>({
     limiter: createConcurrencyLimiter(limit),
     stateFile,
@@ -39,6 +40,7 @@ function makeHarness(
       return text ? { code: 'test', text } : null
     },
     onEnqueued: e => enqueued.push(e.ticket),
+    onDispatchedRemote: e => dispatchedRemote.push(e.ticket),
     onSkipped: (e, reason) => skipped.push({ ticket: e.ticket, reason: reason.text }),
     onDequeueStarted: e => dequeueStarted.push(e.ticket),
     onDequeueFailed: e => dequeueFailed.push(e.ticket),
@@ -55,7 +57,7 @@ function makeHarness(
   }
   const readState = () => JSON.parse(readFileSync(stateFile, 'utf8')) as { updatedAt: string; entries: QueueEntry<{ tag: string }>[] }
   const cleanup = () => rmSync(dir, { recursive: true, force: true })
-  return { queue, stateFile, spawned, dequeueStarted, dequeueFailed, skipped, enqueued, finish, readState, cleanup }
+  return { queue, stateFile, spawned, dequeueStarted, dequeueFailed, skipped, enqueued, dispatchedRemote, finish, readState, cleanup }
 }
 
 describe('createPipelineQueue — 額度內直接啟動、額滿 FIFO 排隊', () => {
@@ -435,6 +437,36 @@ describe('createPipelineQueue — tryDispatchFront（cluster-wide 遞補，給 l
     expect(outcome).toBe('dispatched')
     expect(sawDuringAttempt).toBe(null)
     expect(h.queue.size()).toBe(1) // 只剩 FAQ-2
+    h.cleanup()
+  })
+
+  // ── MA-3 迴歸（review-final-A-dispatcher.md）：成功派往 worker 必須觸發
+  // onDispatchedRemote 恰一次——這是 head 側 queued（rank10）run 列唯一的收尾
+  // 時機，漏了就是幽靈 queued 列＋下次重啟被錯標 lost_on_restart。 ──
+  test('MA-3：attempt 回 true → onDispatchedRemote 帶該 entry 觸發恰一次；回 false / 拋例外 / skip 出列都不觸發', async () => {
+    const h = makeHarness(0, { skipTickets: new Map([['FAQ-3', '測試 skip']]) })
+    h.queue.submit('FAQ-1', null, { tag: 'a' })
+    h.queue.submit('FAQ-2', null, { tag: 'b' })
+    h.queue.submit('FAQ-3', null, { tag: 'c' })
+
+    expect(await h.queue.tryDispatchFront(async () => true)).toBe('dispatched')
+    expect(h.dispatchedRemote).toEqual(['FAQ-1'])
+
+    expect(await h.queue.tryDispatchFront(async () => false)).toBe('declined')
+    expect(h.dispatchedRemote).toEqual(['FAQ-1']) // 拒絕不觸發
+
+    expect(
+      await h.queue.tryDispatchFront(async () => {
+        throw new Error('postJob 炸了')
+      }),
+    ).toBe('declined')
+    expect(h.dispatchedRemote).toEqual(['FAQ-1']) // 例外不觸發（單塞回隊頭）
+
+    // FAQ-2 被消化後，FAQ-3 因 skipReason 出列——skip 走 onSkipped，不是 onDispatchedRemote。
+    expect(await h.queue.tryDispatchFront(async () => true)).toBe('dispatched')
+    expect(await h.queue.tryDispatchFront(async () => true)).toBe('empty')
+    expect(h.dispatchedRemote).toEqual(['FAQ-1', 'FAQ-2'])
+    expect(h.skipped.map(s => s.ticket)).toContain('FAQ-3')
     h.cleanup()
   })
 

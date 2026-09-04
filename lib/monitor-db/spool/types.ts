@@ -34,12 +34,22 @@ export type SpoolWriterName =
  *     寫入當下算好的絕對 ISO 字串。
  *   - 【G:MJ-G2】`run_id` 不得為空、不得留給重放時再解析；writer.ts 對空
  *     run_id 會直接拒絕寫入並丟例外（見 writer.ts 的硬性檢查）。
+ *     **2026-09-02 指揮官裁定（Phase 4）：這條硬規則的適用範圍收斂成 per-fn**
+ *     ——它的原始理由是「row 的身分不得留給重放時求值」，而身分帶 `run_id`
+ *     的只有 `runs` 與 `agent_runs` 兩張表；`file_offsets`（PK=(host,path)）、
+ *     `mcp_usage`（PK=id + UNIQUE(service,raw_sha256)）、`monitor_heartbeat`
+ *     （PK=(host,writer)）、`*_log`、`tg_unknown_senders` 的列**結構上沒有
+ *     run_id**，硬要它們帶一個假值反而是把「無主」偽裝成「有主」。
+ *     因此 `run_id` 型別放寬為 `string | null`，並由 writer.ts 依 `fn` 分流檢查
+ *     （見該檔的 `RUN_SCOPED_SPOOL_FNS`）。重放端（replayer.ts / replay-dead.ts /
+ *     apply-entry.ts）本來就完全不看 `run_id`，不需要任何配套改動。
  */
 export interface SpoolEntry {
   seq: number
   ts: string
   host: string
-  run_id: string
+  /** `runs`/`agent_runs` 類的 fn 必為非空字串；其餘表的 fn 允許 `null`（見上）。 */
+  run_id: string | null
   fn: string
   args: unknown[]
 }

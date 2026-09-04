@@ -15,7 +15,7 @@ process.env.CLUSTER_SHARED_SECRET = process.env.CLUSTER_SHARED_SECRET ?? 'x'.rep
 
 // 動態 import：必須等上面那行先跑完，靜態 import 會被提升到檔案最前面，
 // 那時 env 還沒设好，模組頂層的 throw 會先炸掉。
-const { createAmountBucket, createLruDedupSet, computeLineId, isLogLineIn, enforceLineSizeLimit } = await import('./intake-server.ts')
+const { createAmountBucket, createLruDedupSet, computeLineId, isLogLineIn, enforceLineSizeLimit, acceptLogBatch } = await import('./intake-server.ts')
 
 describe('createAmountBucket — token bucket（可變消耗量）', () => {
   test('容量內可消耗，超出容量的單次消耗直接失敗且不扣款', () => {
@@ -121,5 +121,76 @@ describe('enforceLineSizeLimit（§7.2 超大行防護）', () => {
     const line: LogLineIn = { path: '/a.log', inode: 1, offset: 0, truncated: true, origBytes: 999, head4k: 'h', tail4k: 't' }
     enforceLineSizeLimit(line)
     expect(line.origBytes).toBe(999) // 沒被重算
+  })
+})
+
+// ---------- acceptLogBatch — B-2：登記必須後置於 VL 持久化 ----------
+//
+// review-final-A-dispatcher.md B-2：舊版在 dedup filter 時就登記 id，一次 VL
+// 暫時失敗（503）→ worker 原封重送 → 全判重複 → 200/accepted:0 → worker
+// 推進 offset → 該批永久遺失（缺口，違反 §3.3(d) 的核心不變式）。以下用
+// 注入的假 forward 釘住「503 後重送必須被完整接受」。
+
+describe('acceptLogBatch — B-2：VL 失敗後重送不得被誤判為重複', () => {
+  const batch: LogLineIn[] = [
+    { path: '/logs/a.log', inode: 7, offset: 0, content: 'x' },
+    { path: '/logs/a.log', inode: 7, offset: 10, content: 'y' },
+  ]
+
+  test('第一次 VL 失敗（503、不登記）→ 原封重送被完整接受 → 第三次才是真重複', async () => {
+    const dedup = createLruDedupSet(10)
+    let calls = 0
+    const forward = async () => {
+      calls++
+      return calls > 1 // 第一次 false（VL 5xx/逾時），之後 true
+    }
+
+    const r1 = await acceptLogBatch('w1', batch, { dedup, forward })
+    expect(r1).toEqual({ status: 503, accepted: 0 })
+    expect(dedup.size()).toBe(0) // 失敗不登記——這正是 B-2 的修復本體
+
+    const r2 = await acceptLogBatch('w1', batch, { dedup, forward })
+    expect(r2).toEqual({ status: 200, accepted: batch.length }) // 重送全數接受
+    expect(dedup.size()).toBe(batch.length)
+
+    const r3 = await acceptLogBatch('w1', batch, { dedup, forward })
+    expect(r3).toEqual({ status: 200, accepted: 0 }) // 已持久化過才算重複
+    expect(calls).toBe(2) // 第三次全重複，不會再打 VL
+  })
+
+  test('批內重複沿用舊行為：同批相同 id 只轉寫第一份', async () => {
+    const dedup = createLruDedupSet(10)
+    const forwarded: LogLineIn[][] = []
+    const forward = async (_h: string, lines: LogLineIn[]) => {
+      forwarded.push(lines)
+      return true
+    }
+    const dup: LogLineIn[] = [batch[0]!, batch[0]!, batch[1]!]
+    const r = await acceptLogBatch('w1', dup, { dedup, forward })
+    expect(r).toEqual({ status: 200, accepted: 2 })
+    expect(forwarded[0]!.length).toBe(2)
+  })
+
+  test('全部重複 → 200/accepted:0 且完全不打 VL（worker 需要 2xx 才會推進 offset，避免無窮重送）', async () => {
+    const dedup = createLruDedupSet(10)
+    let calls = 0
+    const forward = async () => {
+      calls++
+      return true
+    }
+    await acceptLogBatch('w1', batch, { dedup, forward })
+    const r = await acceptLogBatch('w1', batch, { dedup, forward })
+    expect(r).toEqual({ status: 200, accepted: 0 })
+    expect(calls).toBe(1)
+  })
+
+  test('has() 不登記（查詢與登記分離的介面契約）；add() 才登記', () => {
+    const dedup = createLruDedupSet(10)
+    expect(dedup.has('a')).toBe(false)
+    expect(dedup.has('a')).toBe(false) // 查兩次都不登記
+    expect(dedup.size()).toBe(0)
+    dedup.add('a')
+    expect(dedup.has('a')).toBe(true)
+    expect(dedup.size()).toBe(1)
   })
 })

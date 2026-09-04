@@ -430,10 +430,13 @@ function spawnCreateMrNow(entry: QueueEntry<BugPayload>, onExit: () => void): { 
           startedAt: new Date().toISOString(),
           pid,
           stdoutPath,
+          stderrPath,
           triggerSource: entry.triggeredBy ? 'telegram' : 'cli',
           retryOfRunId,
           dispatchId,
           legacyKey,
+          triggeredByEmail: entry.triggeredBy?.email ?? null,
+          triggeredByName: entry.triggeredBy?.name ?? null,
         },
         pool =>
           writeRunProgress(pool, {
@@ -444,10 +447,13 @@ function spawnCreateMrNow(entry: QueueEntry<BugPayload>, onExit: () => void): { 
             startedAt: new Date().toISOString(),
             pid,
             stdoutPath,
+            stderrPath,
             triggerSource: entry.triggeredBy ? 'telegram' : 'cli',
             retryOfRunId,
             dispatchId,
             legacyKey,
+            triggeredByEmail: entry.triggeredBy?.email ?? null,
+            triggeredByName: entry.triggeredBy?.name ?? null,
           }),
       )
     }
@@ -534,6 +540,27 @@ const bugQueue = createPipelineQueue<BugPayload>({
           dispatchId: entry.payload.dispatchId,
         }),
     ),
+  // 【MA-3】backlog-dispatcher 成功把排隊中的單派給 worker：head 這邊
+  // onEnqueued 寫的 queued（rank10）列到此收尾——寫 dispatched_to_worker
+  // （tier 2，KNOWN_OUTCOME_TIER 早已定義、reviewer 查明從未有人寫入）。之後
+  // 這張單由 worker 自己鑄的 run_id 追蹤；head 列不收尾的話就是幽靈 queued，
+  // 下次重啟被 restart sweep 錯標 lost_on_restart。
+  onDispatchedRemote: entry => {
+    const finishedAt = new Date().toISOString()
+    dispatchMonitorWrite(
+      'writeRunOutcomeAuthoritative',
+      { runId: entry.payload.runId, ticket: entry.ticket, kind: BUG_RUN_KIND, outcome: 'dispatched_to_worker', outcomeSource: 'backlog-dispatch', finishedAt },
+      pool =>
+        writeRunOutcomeAuthoritative(pool, {
+          runId: entry.payload.runId,
+          ticket: entry.ticket,
+          kind: BUG_RUN_KIND,
+          outcome: 'dispatched_to_worker',
+          outcomeSource: 'backlog-dispatch',
+          finishedAt,
+        }),
+    )
+  },
   // Bug 單被 skip 沒有死路問題：tracker 仍是 pending、Notion 指派未動，隨時
   // 可重新認領（locked 情況則根本不需要重新認領，執行中的流程會自行回報）。
   onSkipped: (entry, reason) => {
