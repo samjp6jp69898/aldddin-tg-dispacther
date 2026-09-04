@@ -22,7 +22,13 @@ import {
 } from '../pipeline-runner/spawn-demand-pipeline.ts'
 import { notifyOperator } from '../notify/operator.ts'
 import { applyRemoteTrackerRow, parseTrackerRow, readTrackerFile } from '../pipeline-runner/tracker-sync.ts'
+import { resolveTechUserByEmail } from '../user-resolution/tech-user.ts'
 import type { TechUser } from '../user-resolution/tech-user.ts'
+
+// retry（task 2）只支援 bug 單——tg-monitor `/api/pipelines/retry` 本來就只
+// 接受 `FAQ-\d+`（見該端點註解「需求單 ALDREQ 目前不提供這個按鈕」），這裡
+// 收斂同一個限制，不接受 ALDREQ- 混進來。
+const RETRY_TICKET_RE = /^FAQ-\d+$/
 
 // head 端多機派工的 production 接線（唯一入口）。dispatch.ts / remote-sweeper.ts
 // 是純邏輯，這裡負責把真實依賴（worker-client、spawn 模組、registry 檔案
@@ -111,12 +117,15 @@ const dispatcher = createDispatcher({
     bug: {
       stats: getBugQueueStats,
       has: hasBugTicketActive,
-      submit: (ticket, techUser) => submitCreateMr(ticket, { triggeredBy: techUser }),
+      // techUser 可為 null、opts.resume 透傳給 submitCreateMr 的 `--resume`
+      // 語意（2026-09-04，task 2：tg-monitor 續跑改走這條路徑，見下方
+      // registerClusterRoutes 新增的 POST /cluster/retry）。
+      submit: (ticket, techUser, opts) => submitCreateMr(ticket, { triggeredBy: techUser ?? undefined, resume: opts?.resume }),
     },
     demand: {
       stats: getDemandQueueStats,
       has: hasDemandTicketActive,
-      submit: (ticket, assigneeEmail, techUser) => submitDemandPipeline(ticket, assigneeEmail, techUser),
+      submit: (ticket, assigneeEmail, techUser) => submitDemandPipeline(ticket, assigneeEmail, techUser ?? undefined),
     },
   },
   dispatchAttempts: dispatchAttemptWrites,
@@ -150,12 +159,13 @@ export function isClusterEnabled(): boolean {
 }
 
 /** claim.ts 的 submitCreateMr 替身：cluster 停用或無 worker 時走本機（等同
- * 既有行為），否則依名額派工。 */
-export function dispatchBug(ticket: string, techUser: TechUser): Promise<DispatchResult> {
-  return dispatcher.dispatchBug(ticket, techUser)
+ * 既有行為），否則依名額派工。techUser 可為 null（task 2：tg-monitor 續跑
+ * 查不到原認領人 email 時）；opts.resume 透傳 `--resume` 語意。 */
+export function dispatchBug(ticket: string, techUser: TechUser | null, opts?: { resume?: boolean }): Promise<DispatchResult> {
+  return dispatcher.dispatchBug(ticket, techUser, opts)
 }
 
-export function dispatchDemand(ticket: string, assigneeEmail: string, techUser: TechUser): Promise<DispatchResult> {
+export function dispatchDemand(ticket: string, assigneeEmail: string, techUser: TechUser | null): Promise<DispatchResult> {
   return dispatcher.dispatchDemand(ticket, assigneeEmail, techUser)
 }
 
@@ -213,6 +223,42 @@ export function registerClusterRoutes(app: Hono): void {
       return c.json({ ok: false, reason: 'unavailable' }, 503)
     }
     return c.json({ ok: true, content })
+  })
+
+  // 續跑（resume）改走跟一般派工相同的分派判斷（task 2，2026-09-04）：
+  // tg-monitor 的 `/api/pipelines/retry` 原本寫死呼叫本機
+  // spawn-create-mr.ts 的 submitCreateMr()（CLI 進程邊界），完全繞過這裡的
+  // dispatcher.dispatchBug()——resume 只在乎能不能 checkout 既有 mr/{ticket}
+  // 分支到新 worktree，不依賴哪台機器的本地磁碟殘留狀態，所以理論上可以派到
+  // 任一台機器（含跟原本執行的機器不同的 worker），這是預期內、可接受的行為。
+  //
+  // 為什麼是新端點而不是讓 tg-monitor 直接呼叫 CLI 版 dispatchBug：dispatchBug
+  // 依賴的 dispatchRegistry/workerRegistry 是這個**長駐 head 行程**的記憶體
+  // 單例（module-level singleton，只有 initClusterHead() 呼叫過的行程持久化
+  // 到磁碟並撿回既有狀態）——另開一個短命 CLI 行程 import cluster-head.ts 會
+  // 拿到一份空的、彼此不同步的登記表，可能跟這裡的真正 head 行程對同一張票
+  // 做出衝突的派工判斷（見 dispatch-registry.ts persistEnabled 只在
+  // recoverFromDisk() 之後才是 true 的既有機制）。改成 HTTP 呼叫這個長駐行程
+  // 自己，比照 tg-monitor 既有的 worker 名冊管理三個動作（disable/enable/
+  // remove）同一種模式——同一個 process、同一份記憶體狀態，不會有雙份登記表。
+  //
+  // 只接受 FAQ-（bug）：tg-monitor 的重試按鈕本來就只給 bug 單用（需求單
+  // ALDREQ 沒有這個按鈕，見 tg-monitor server.ts /api/pipelines/retry 註解），
+  // demand 沒有 resume 機制，這裡不開放。
+  app.post('/cluster/retry', guard, async c => {
+    const body = (await c.req.json().catch(() => null)) as { ticket?: string; triggeredByEmail?: string } | null
+    if (!body || typeof body.ticket !== 'string' || !RETRY_TICKET_RE.test(body.ticket)) {
+      return c.json({ ok: false, reason: 'bad_request' }, 400)
+    }
+    let techUser: TechUser | null = null
+    if (typeof body.triggeredByEmail === 'string' && body.triggeredByEmail !== '') {
+      techUser = resolveTechUserByEmail(body.triggeredByEmail)
+      // 帶了 email 卻查不到：明確拒絕，不要靜默丟掉發起人（比照
+      // spawn-create-mr.ts CLI `--triggered-by-email` 既有的同款紀律）。
+      if (!techUser) return c.json({ ok: false, reason: `triggeredByEmail 在 tech-users.csv 查無此 email：${body.triggeredByEmail}` }, 400)
+    }
+    const result = await dispatchBug(body.ticket, techUser, { resume: true })
+    return c.json(result, result.ok ? 200 : 500)
   })
 
   app.post('/cluster/job-done', guard, async c => {

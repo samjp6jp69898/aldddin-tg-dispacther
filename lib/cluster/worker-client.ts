@@ -149,3 +149,44 @@ export async function cancelRemoteJob(url: string, secret: string, ticket: strin
     return { ok: false, killed: [], reason: isTimeoutLike(err) ? 'worker 逾時未回應' : 'worker 連不上' }
   }
 }
+
+/** worker `GET /files` 的回應形狀（task 1，2026-09-04）。與 cancelRemoteJob 同一
+ * 風格：呼叫端（tg-monitor 的 `/api/agent-trace` 代理路徑）需要的最小形狀，本檔
+ * 不 import worker-agent.ts 的內部型別（同上方 RemoteCancelResult 註解的理由）。
+ * head 這一份跟 cancelRemoteJob 一樣是參考實作——真正呼叫它的是 tg-monitor 自己
+ * 在 lib/cluster-state.ts 複製的一份（兩個 repo 沒有 import 關係，見該檔頭）。 */
+export type RemoteFileResult = { ok: true; content: string } | { ok: false; reason: string }
+
+/** 讀取 worker 白名單目錄下某個檔案的內容（task 1：head 的 /api/agent-trace 對
+ * worker 執行的 run proxy 用）。打不通/逾時/被白名單拒絕都回 `{ok:false}`，
+ * reason 帶可讀訊息，不拋例外。 */
+export async function fetchRemoteFile(url: string, secret: string, path: string, timeoutMs = 8_000): Promise<RemoteFileResult> {
+  try {
+    const res = await fetch(`${url}/files?path=${encodeURIComponent(path)}`, { headers: headers(secret), signal: AbortSignal.timeout(timeoutMs) })
+    const body = (await res.json().catch(() => null)) as { ok?: boolean; content?: string; reason?: string } | null
+    if (!body || body.ok !== true || typeof body.content !== 'string') {
+      return { ok: false, reason: body?.reason ?? `worker 回應格式不對（HTTP ${res.status}）` }
+    }
+    return { ok: true, content: body.content }
+  } catch (err) {
+    return { ok: false, reason: isTimeoutLike(err) ? 'worker 逾時未回應' : 'worker 連不上' }
+  }
+}
+
+/** worker `GET /jobs/:ticket/stage-files` 的回應形狀（task 1）——見
+ * lib/pipeline-runner/local-stage-files.ts 的 LocalStageFiles。 */
+export type RemoteStageFiles = { debugFiles: Record<string, string | null>; worktreeBootstrapLog: string | null }
+
+/** 這張 bug 票在 worker 上的階段產物檔 mtime 原始資料（task 1：head 的
+ * computeBugStages() 組裝用）。打不通/逾時/格式不對回 null。 */
+export async function fetchRemoteStageFiles(url: string, secret: string, ticket: string, timeoutMs = 8_000): Promise<RemoteStageFiles | null> {
+  try {
+    const res = await fetch(`${url}/jobs/${encodeURIComponent(ticket)}/stage-files`, { headers: headers(secret), signal: AbortSignal.timeout(timeoutMs) })
+    if (!res.ok) return null
+    const body = (await res.json()) as { ok?: boolean; debugFiles?: unknown; worktreeBootstrapLog?: unknown }
+    if (body?.ok !== true || typeof body.debugFiles !== 'object' || body.debugFiles === null) return null
+    return { debugFiles: body.debugFiles as Record<string, string | null>, worktreeBootstrapLog: (body.worktreeBootstrapLog as string | null) ?? null }
+  } catch {
+    return null
+  }
+}

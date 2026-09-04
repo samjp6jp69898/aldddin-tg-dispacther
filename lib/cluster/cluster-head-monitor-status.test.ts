@@ -2,6 +2,7 @@ import { beforeAll, beforeEach, describe, expect, test } from 'bun:test'
 import { Hono } from 'hono'
 import { CLUSTER_TOKEN_HEADER } from './cluster-auth.ts'
 import { __resetWorkerMonitorStatusesForTest, getWorkerMonitorStatus, listWorkerMonitorStatuses } from './worker-monitor-status.ts'
+import { TEST_CLUSTER_SECRET } from './test-support/test-cluster-secret.ts'
 
 // POST /cluster/monitor-status（plan-db-as-truth-v3.2.md MJ-E4，§6.8(e)）：
 // 本案往 head 8787 唯一新增的路由（【G:MN-G8】），與既有 /cluster/register、
@@ -10,7 +11,11 @@ import { __resetWorkerMonitorStatusesForTest, getWorkerMonitorStatus, listWorker
 // cluster-head.ts 在 module load 當下就讀 CLUSTER_SHARED_SECRET（沒設就整組
 // 路由 no-op），所以這裡必須先設環境變數、再動態 import。
 
-const SECRET = 'monitor-status-test-secret-0123456789'
+// 2026-09-04：改用跨測試檔共用的常數（見 test-support/test-cluster-secret.ts
+// 檔頭），不再各自寫死不同字面值——bun test 預設不會給每個測試檔各自獨立的
+// module registry，cluster-head.ts 動態 import 到的模組實例在同一次 `bun test`
+// 進程裡是全部測試檔共用的。
+const SECRET = TEST_CLUSTER_SECRET
 
 let app: Hono
 

@@ -12,6 +12,13 @@
 //   POST /jobs/:ticket/cancel  取消本機正在跑的那張單（2026-09-04 新增，見
 //                       lib/pipeline-runner/local-cancel.ts；演算法比照
 //                       tg-monitor/lib/ingest.ts 的 cancelPipeline()）
+//   GET  /files         唯讀讀取白名單目錄下的檔案內容（2026-09-04 新增，
+//                       task 1：head 的 /api/agent-trace 對 worker 執行的 run
+//                       proxy 過來用；見 lib/pipeline-runner/local-trace-read.ts）
+//   GET  /jobs/:ticket/stage-files  這張 bug 票的階段產物檔存在與否＋mtime
+//                       原始資料（2026-09-04 新增，task 1：head 的
+//                       computeBugStages() 組裝用；見
+//                       lib/pipeline-runner/local-stage-files.ts）
 // 其餘路徑一律 uniform 401。
 //
 // 完成回報（事件驅動，不輪詢）：任一背景 pipeline 真的結束（pipeline-queue
@@ -61,6 +68,8 @@ import { createClusterSink } from './lib/log-shipper/cluster-sink.ts'
 import { readSpoolDepth } from './lib/monitor-db/spool/depth.ts'
 import { createJobDoneQueue, retryJobDoneQueue } from './lib/cluster/job-done-queue.ts'
 import { cancelLocalPipeline } from './lib/pipeline-runner/local-cancel.ts'
+import { readLocalTraceFile } from './lib/pipeline-runner/local-trace-read.ts'
+import { readLocalStageFiles } from './lib/pipeline-runner/local-stage-files.ts'
 import type { SubmitResult } from './lib/pipeline-runner/pipeline-queue.ts'
 import type { TechUser } from './lib/user-resolution/tech-user.ts'
 
@@ -492,6 +501,32 @@ app.post('/jobs/:ticket/cancel', guard, async c => {
   const r = await cancelLocalPipeline(kind, ticket)
   console.error(`worker-agent: cancel ${kind} ${ticket}: ${JSON.stringify(r)}`)
   return c.json(r, r.ok ? 200 : 409)
+})
+
+// 唯讀讀取白名單目錄下的檔案內容（2026-09-04 新增，task 1）：head 的
+// tg-monitor `/api/agent-trace` 對 worker 執行的 run proxy 過來用。白名單
+// 規則逐字比照 tg-monitor/lib/services.ts 的 isAllowedTracePath，見
+// lib/pipeline-runner/local-trace-read.ts 檔頭——不接受這個白名單以外的路徑，
+// 拒絕就是拒絕，不嘗試「猜測使用者真正想讀哪個檔案」之類的寬鬆化。
+app.get('/files', guard, c => {
+  const path = c.req.query('path') ?? ''
+  const r = readLocalTraceFile(path)
+  if (!r.ok) {
+    const status = r.reason === 'not_allowed' ? 403 : r.reason === 'missing' ? 404 : 500
+    return c.json({ ok: false, reason: r.reason, detail: r.detail }, status)
+  }
+  return c.json({ ok: true, content: r.content })
+})
+
+// 這張 bug 票的階段產物檔存在與否＋mtime（2026-09-04 新增，task 1）：head 的
+// computeBugStages() 組裝階段檢核表用，不論這張票目前有沒有鎖（跟
+// GET /jobs/:ticket 的 stages 欄位不同——那個只在 locked 時才有值，服務的是
+// TG bot「還在跑」的即時進度；這支給歷史 run 的檢核表用，鎖釋放後檔案仍在，
+// 一樣要能讀到）。見 lib/pipeline-runner/local-stage-files.ts 檔頭。
+app.get('/jobs/:ticket/stage-files', guard, c => {
+  const ticket = c.req.param('ticket')
+  if (!BUG_TICKET_RE.test(ticket)) return c.json({ ok: false, reason: 'bad_request' }, 400)
+  return c.json({ ok: true, ...readLocalStageFiles(ticket) })
 })
 
 app.all('*', c => respondUniform401(c))

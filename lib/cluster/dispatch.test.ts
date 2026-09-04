@@ -35,6 +35,7 @@ function makeHarness(opts: {
   const dir = mkdtempSync(join(tmpdir(), 'dispatch-test-'))
   const registry = createDispatchRegistry(join(dir, 'dispatched.json'))
   const localSubmits: string[] = []
+  const localSubmitOpts: ({ resume?: boolean } | undefined)[] = []
   const postedJobs: { worker: string; job: JobRequest }[] = []
   const probedTickets: { worker: string; ticket: string }[] = []
   const dispatchAttemptCalls: { fn: 'create' | 'advance' | 'supersedeOthers'; input: Record<string, unknown> }[] = []
@@ -60,8 +61,9 @@ function makeHarness(opts: {
       bug: {
         stats: () => opts.localBugStats ?? full,
         has: () => opts.localHas ?? null,
-        submit: ticket => {
+        submit: (ticket, _triggeredBy, submitOpts) => {
           localSubmits.push(ticket)
+          localSubmitOpts.push(submitOpts)
           return { ok: true, status: 'started', pid: 99 }
         },
       },
@@ -79,6 +81,7 @@ function makeHarness(opts: {
     dispatcher: createDispatcher(deps),
     registry,
     localSubmits,
+    localSubmitOpts,
     postedJobs,
     probedTickets,
     dispatchAttemptCalls,
@@ -325,5 +328,69 @@ describe('createDispatcher — dispatch_attempts 觀察面寫入（plan §5.3）
     const r = await createDispatcher(deps).dispatchBug('FAQ-1', USER)
     expect(r).toEqual({ ok: true, status: 'remote_started', worker: 'w1' })
     rmSync(dir, { recursive: true, force: true })
+  })
+})
+
+describe('createDispatcher — 續跑（task 2，2026-09-04）：resume 走跟一般派工相同的分派判斷', () => {
+  test('本機優先時：resume 透傳進 local.bug.submit 的 opts', async () => {
+    const h = makeHarness({
+      workers: [worker('w1')],
+      capacities: { w1: cap(stats(2)) },
+      localBugStats: stats(2), // 平手本機優先
+    })
+    const r = await h.dispatcher.dispatchBug('FAQ-1', USER, { resume: true })
+    expect(r).toEqual({ ok: true, status: 'started', pid: 99 })
+    expect(h.localSubmits).toEqual(['FAQ-1'])
+    expect(h.localSubmitOpts).toEqual([{ resume: true }])
+    h.cleanup()
+  })
+
+  test('派到 worker 時：job body 帶 resume:true——可以落到任一台（含跟原執行機不同的 worker），這是預期行為', async () => {
+    const h = makeHarness({
+      workers: [worker('w1'), worker('w22')],
+      capacities: { w1: cap(stats(1)), w22: cap(stats(4)) }, // w1 剩 4 格 > w22 剩 1 格，w1 勝出
+      localBugStats: full,
+    })
+    const r = await h.dispatcher.dispatchBug('FAQ-1', USER, { resume: true })
+    expect(r).toEqual({ ok: true, status: 'remote_started', worker: 'w1' })
+    expect(h.postedJobs[0]!.job).toMatchObject({ kind: 'bug', ticket: 'FAQ-1', resume: true, triggeredBy: USER })
+    h.cleanup()
+  })
+
+  test('不帶 resume（一般派工）：job body 不含 resume 欄位', async () => {
+    const h = makeHarness({
+      workers: [worker('w1')],
+      capacities: { w1: cap(stats(2)) },
+      localBugStats: full,
+    })
+    await h.dispatcher.dispatchBug('FAQ-1', USER)
+    expect(h.postedJobs[0]!.job.resume).toBeUndefined()
+    h.cleanup()
+  })
+
+  test('techUser 為 null（tg-monitor 續跑查不到原認領人 email）：本機 submit 收到 null，不假造使用者物件', async () => {
+    const h = makeHarness({
+      workers: [worker('w1')],
+      capacities: { w1: cap(stats(2)) },
+      localBugStats: stats(2), // 平手本機優先
+    })
+    const r = await h.dispatcher.dispatchBug('FAQ-1', null, { resume: true })
+    expect(r).toEqual({ ok: true, status: 'started', pid: 99 })
+    expect(h.localSubmitOpts).toEqual([{ resume: true }])
+    h.cleanup()
+  })
+
+  test('techUser 為 null 且派到 worker：job body 不帶 triggeredBy，dispatch_attempts 的 triggeredByEmail 不帶', async () => {
+    const h = makeHarness({
+      workers: [worker('w1')],
+      capacities: { w1: cap(stats(2)) },
+      localBugStats: full,
+    })
+    const r = await h.dispatcher.dispatchBug('FAQ-1', null, { resume: true })
+    expect(r).toEqual({ ok: true, status: 'remote_started', worker: 'w1' })
+    expect(h.postedJobs[0]!.job.triggeredBy).toBeUndefined()
+    expect(h.postedJobs[0]!.job.resume).toBe(true)
+    expect(h.dispatchAttemptCalls[1]!.input.triggeredByEmail).toBeUndefined()
+    h.cleanup()
   })
 })

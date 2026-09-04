@@ -96,12 +96,15 @@ export type DispatchDeps = {
     bug: {
       stats: () => QueueStats
       has: (ticket: string) => 'running' | 'queued' | null
-      submit: (ticket: string, triggeredBy: TechUser) => SubmitResult
+      /** triggeredBy 可為 null（2026-09-04，task 2：tg-monitor 的續跑不一定
+       * 查得到原認領人 email）；opts.resume 同上新增，讓 tg-monitor 的
+       * `/api/pipelines/retry` 走這條分派路徑時能帶 `--resume` 語意。 */
+      submit: (ticket: string, triggeredBy: TechUser | null, opts?: { resume?: boolean }) => SubmitResult
     }
     demand: {
       stats: () => QueueStats
       has: (ticket: string) => 'running' | 'queued' | null
-      submit: (ticket: string, assigneeEmail: string, triggeredBy: TechUser) => SubmitResult
+      submit: (ticket: string, assigneeEmail: string, triggeredBy: TechUser | null) => SubmitResult
     }
   }
   dispatchAttempts?: DispatchAttemptWriteDeps
@@ -116,10 +119,26 @@ export function freeSlots(stats: QueueStats): number {
 }
 
 export function createDispatcher(deps: DispatchDeps) {
-  async function dispatch(kind: 'bug' | 'demand', ticket: string, techUser: TechUser, assigneeEmail: string): Promise<DispatchResult> {
+  /**
+   * techUser 可為 null（2026-09-04，task 2）：一般派工（claim.ts/demand-claim.ts）
+   * 一律有真實 Telegram 使用者、恆非 null；tg-monitor 的續跑走 HTTP 呼叫
+   * `/cluster/retry`，原認領人 email 查不到時就是 null——比照 submitCreateMr
+   * 既有的 `opts.triggeredBy?: TechUser` optional 語意（QueueTriggeredBy 本來
+   * 就是 `{name,email}|null`），不用一個假造的使用者物件頂替。
+   *
+   * opts.resume：只有 bug 支援（demand 目前沒有 resume 機制，見
+   * cluster-head.ts `/cluster/retry` 只接受 FAQ- 的註解）。
+   */
+  async function dispatch(
+    kind: 'bug' | 'demand',
+    ticket: string,
+    techUser: TechUser | null,
+    assigneeEmail: string,
+    opts?: { resume?: boolean },
+  ): Promise<DispatchResult> {
     const localSide = deps.local[kind]
     const submitLocal = (): SubmitResult =>
-      kind === 'bug' ? deps.local.bug.submit(ticket, techUser) : deps.local.demand.submit(ticket, assigneeEmail, techUser)
+      kind === 'bug' ? deps.local.bug.submit(ticket, techUser, opts) : deps.local.demand.submit(ticket, assigneeEmail, techUser)
 
     // (1)(2) 重複防護——這兩個檢查與 (3) 佔位之間沒有任何 await，同一條
     // event loop 上的併發認領不可能雙雙通過。
@@ -133,10 +152,10 @@ export function createDispatcher(deps: DispatchDeps) {
     if (workers.length === 0) return submitLocal() // 單機模式：完全等同既有行為
 
     const attempts = deps.dispatchAttempts
-    const dispatchId = deps.registry.markDispatching(ticket, kind, { name: techUser.notion_user_name, email: techUser.email })
+    const dispatchId = deps.registry.markDispatching(ticket, kind, techUser ? { name: techUser.notion_user_name, email: techUser.email } : null)
     const dispatchedAt = new Date().toISOString()
     attempts?.supersedeOthers?.({ ticket, kind, excludeDispatchId: dispatchId })
-    attempts?.create({ dispatchId, ticket, kind, status: 'dispatching', statusRank: DISPATCH_STATUS_RANK.dispatching, dispatchedAt, triggeredByEmail: techUser.email })
+    attempts?.create({ dispatchId, ticket, kind, status: 'dispatching', statusRank: DISPATCH_STATUS_RANK.dispatching, dispatchedAt, triggeredByEmail: techUser?.email })
     try {
       // (4) 並行探測：名額 + 這張單在各 worker 的本機活動。
       const capacities = await Promise.all(workers.map(async w => ({ worker: w, cap: await deps.fetchCapacity(w, ticket) })))
@@ -182,7 +201,9 @@ export function createDispatcher(deps: DispatchDeps) {
       // 即使 postJob 逾時拿不到回應 body，worker 端把它寫進自己鑄的 runs.dispatch_id
       // 欄，事後仍能用 runs.dispatch_id = dispatch_attempts.dispatch_id 精確 join。
       const job: JobRequest =
-        kind === 'bug' ? { kind, ticket, triggeredBy: techUser, dispatchId } : { kind, ticket, triggeredBy: techUser, assigneeEmail, dispatchId }
+        kind === 'bug'
+          ? { kind, ticket, triggeredBy: techUser ?? undefined, dispatchId, ...(opts?.resume ? { resume: true } : {}) }
+          : { kind, ticket, triggeredBy: techUser ?? undefined, assigneeEmail, dispatchId }
       const r = await deps.postJob(best.worker, job)
       if (r.accepted) {
         deps.registry.confirmDispatched(ticket, best.worker.name, best.worker.url)
@@ -243,7 +264,7 @@ export function createDispatcher(deps: DispatchDeps) {
   }
 
   return {
-    dispatchBug: (ticket: string, techUser: TechUser) => dispatch('bug', ticket, techUser, ''),
-    dispatchDemand: (ticket: string, assigneeEmail: string, techUser: TechUser) => dispatch('demand', ticket, techUser, assigneeEmail),
+    dispatchBug: (ticket: string, techUser: TechUser | null, opts?: { resume?: boolean }) => dispatch('bug', ticket, techUser, '', opts),
+    dispatchDemand: (ticket: string, assigneeEmail: string, techUser: TechUser | null) => dispatch('demand', ticket, techUser, assigneeEmail),
   }
 }
