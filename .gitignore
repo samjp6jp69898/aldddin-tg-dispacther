@@ -19,3 +19,6 @@ logs/
 # T36（demand plan pipeline）執行期產物：plan.md 上傳 Drive 後才是正式交付，
 # 本機這份只是留痕方便除錯，跟 logs/ 同一類，不進版本控制。
 demand-plans/
+
+# worktree 隔離型 subagent 派工產生的暫存 worktree（2026-09-04），本機產物不進 git。
+.claude/worktrees/
