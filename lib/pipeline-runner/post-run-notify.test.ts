@@ -1,11 +1,14 @@
 import { describe, expect, mock, test } from 'bun:test'
-import { unlinkSync, writeFileSync } from 'node:fs'
+import { unlinkSync, writeFileSync, mkdtempSync, readFileSync, rmSync, existsSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { checkPushMismatch, shouldNotify, parseRunningBugTickets, writeAuthoritativeOutcome } from './post-run-notify.ts'
 import { FakeRunsDb } from '../monitor-db/test-support/fake-runs-db.ts'
 import { __resetDeclaredMonitorRoleForTest, declareMonitorRole } from '../monitor-db/env.ts'
 import type { SpoolEntry } from '../monitor-db/spool/types.ts'
 
 const LOG_DIR = '/Users/user/aladdin/telegram-dispatcher/logs'
+const PROD_LOG = join(LOG_DIR, 'post-run-notify.log')
 
 /** 假 spool writer：只記錄 append 呼叫，不碰真的檔案系統。 */
 function makeFakeSpool() {
@@ -96,24 +99,38 @@ describe('writeAuthoritativeOutcome — v3.2 §9 Phase2 bug 終態（權威）�
   // 刻意不用 mock.module 掉 pool.ts：pool.test.ts／semantic-verify.test.ts
   // 在同一次 `bun test` 行程內依賴同一個 module 的真實 createMonitorPool，
   // 全域 mock 會互相污染（見 whitelist-auto-sync-trigger.test.ts 檔頭同類警示）。
-  test('createMonitorPool() 真的 throw（模擬真實 MON_DB_USER 角色不符，不注入 deps.pool）→ 仍落 spool，資料不遺失', async () => {
+  test('createMonitorPool() 真的 throw（模擬真實 MON_DB_USER 角色不符，不注入 deps.pool）→ 仍落 spool，資料不遺失，且不污染生產 log', async () => {
     const prevRunId = process.env.MON_RUN_ID
     const prevUser = process.env.MON_DB_USER
     const prevWorker = process.env.CLUSTER_WORKER_NAME
     process.env.MON_RUN_ID = '66666666-6666-6666-6666-666666666666'
     delete process.env.CLUSTER_WORKER_NAME // 確保走 mon_head 分支（跟 head 機器的真實情境一致）
     process.env.MON_DB_USER = 'mon_exec' // 故意跟 mon_head 角色不符——重現 8 次事故的真實錯誤
+    // 2026-09-04 污染源修復：這條測試會真的觸發 log() 呼叫（見下方
+    // writeAuthoritativeOutcome 內的 catch），過去沒有可注入路徑時會真的寫進
+    // 生產 post-run-notify.log（實測污染 19 筆）。改注入暫存路徑，驗證 (a)
+    // 原本要測的落 spool 行為不變 (b) 生產 log 內容逐位元組不變。
+    const tmpDir = mkdtempSync(join(tmpdir(), 'post-run-notify-log-'))
+    const tmpLogPath = join(tmpDir, 'test.log')
+    const prodLogBefore = existsSync(PROD_LOG) ? readFileSync(PROD_LOG, 'utf8') : null
     try {
       const fakeSpool = makeFakeSpool()
       // 刻意只傳 deps.spool、不傳 deps.pool：函式因此會真的執行
       // `await import('../monitor-db/pool.ts')` + `createMonitorPool()`，
       // 而不是被測試直接繞過。
-      await writeAuthoritativeOutcome('FAQ-9007', 'timeout', 124, '/tmp/FAQ-9007.stdout.log', '/tmp/FAQ-9007.stderr.log', { spool: fakeSpool })
+      await writeAuthoritativeOutcome('FAQ-9007', 'timeout', 124, '/tmp/FAQ-9007.stdout.log', '/tmp/FAQ-9007.stderr.log', { spool: fakeSpool, logPath: tmpLogPath })
       expect(fakeSpool.appended.length).toBe(1)
       expect(fakeSpool.appended[0]!.run_id).toBe('66666666-6666-6666-6666-666666666666')
       expect(fakeSpool.appended[0]!.fn).toBe('writeRunOutcomeAuthoritative')
       expect((fakeSpool.appended[0]!.args[0] as { outcome: string }).outcome).toBe('timeout')
+      // (a) log() 真的被呼叫過（不是路徑注入把整條路徑短路掉、測試變成沒測到東西）
+      expect(existsSync(tmpLogPath)).toBe(true)
+      expect(readFileSync(tmpLogPath, 'utf8')).toContain('FAQ-9007 監控 DB 連線建立失敗')
+      // (b) 生產 log 完全沒有被寫入
+      const prodLogAfter = existsSync(PROD_LOG) ? readFileSync(PROD_LOG, 'utf8') : null
+      expect(prodLogAfter).toBe(prodLogBefore)
     } finally {
+      rmSync(tmpDir, { recursive: true, force: true })
       if (prevRunId === undefined) delete process.env.MON_RUN_ID
       else process.env.MON_RUN_ID = prevRunId
       if (prevUser === undefined) delete process.env.MON_DB_USER
@@ -136,7 +153,7 @@ describe('writeAuthoritativeOutcome — v3.2 §9 Phase2 bug 終態（權威）�
   // MON_DB_USER='mon_exec' 會通過角色比對、不觸發這個例外，落 spool 的行為
   // 就不會發生，測試會失敗，藉此把「宣告優先於嗅探」的保證落到這支 CLI 的
   // 實際程式碼路徑上，不只是 runtime.ts/env.ts 的通用單元測試）。
-  test('main() 已宣告 mon_head 後：即使 CLUSTER_WORKER_NAME 被汙染成非空字串，角色判斷仍固定回報 mon_head', async () => {
+  test('main() 已宣告 mon_head 後：即使 CLUSTER_WORKER_NAME 被汙染成非空字串，角色判斷仍固定回報 mon_head，且不污染生產 log', async () => {
     const prevRunId = process.env.MON_RUN_ID
     const prevUser = process.env.MON_DB_USER
     const prevWorker = process.env.CLUSTER_WORKER_NAME
@@ -145,18 +162,27 @@ describe('writeAuthoritativeOutcome — v3.2 §9 Phase2 bug 終態（權威）�
     process.env.CLUSTER_WORKER_NAME = 'polluted-worker-name' // 模擬環境變數污染
     process.env.MON_DB_USER = 'mon_exec' // 若角色仍被嗅探成 mon_exec，這裡會「相符」、不觸發下面的例外
     declareMonitorRole('mon_head') // 模擬 main() 在最早執行處已做過的宣告
+    // 2026-09-04 污染源修復：同上一條測試理由，這條也會真的觸發 log()。
+    const tmpDir = mkdtempSync(join(tmpdir(), 'post-run-notify-log-'))
+    const tmpLogPath = join(tmpDir, 'test.log')
+    const prodLogBefore = existsSync(PROD_LOG) ? readFileSync(PROD_LOG, 'utf8') : null
     try {
       const fakeSpool = makeFakeSpool()
       // 刻意只傳 deps.spool、不傳 deps.pool：函式真的執行
       // createMonitorPool(monitorRoleForThisHost(), ...)，不是被測試繞過。
-      await writeAuthoritativeOutcome('FAQ-9008', 'timeout', 124, '/tmp/FAQ-9008.stdout.log', '/tmp/FAQ-9008.stderr.log', { spool: fakeSpool })
+      await writeAuthoritativeOutcome('FAQ-9008', 'timeout', 124, '/tmp/FAQ-9008.stdout.log', '/tmp/FAQ-9008.stderr.log', { spool: fakeSpool, logPath: tmpLogPath })
       // 角色正確解析為 mon_head（跟 MON_DB_USER='mon_exec' 不符）→
       // loadMonitorEnv 同步拋出「角色不符」→ 外層 catch 把 pool 留在 null →
       // 落 spool。若角色錯誤解析成 mon_exec，這個 spool 條目就不會出現。
       expect(fakeSpool.appended.length).toBe(1)
       expect(fakeSpool.appended[0]!.run_id).toBe('77777777-7777-7777-7777-777777777777')
       expect(fakeSpool.appended[0]!.fn).toBe('writeRunOutcomeAuthoritative')
+      expect(existsSync(tmpLogPath)).toBe(true)
+      expect(readFileSync(tmpLogPath, 'utf8')).toContain('FAQ-9008 監控 DB 連線建立失敗')
+      const prodLogAfter = existsSync(PROD_LOG) ? readFileSync(PROD_LOG, 'utf8') : null
+      expect(prodLogAfter).toBe(prodLogBefore)
     } finally {
+      rmSync(tmpDir, { recursive: true, force: true })
       if (prevRunId === undefined) delete process.env.MON_RUN_ID
       else process.env.MON_RUN_ID = prevRunId
       if (prevUser === undefined) delete process.env.MON_DB_USER

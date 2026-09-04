@@ -1,6 +1,6 @@
 import { readFileSync, appendFileSync, mkdirSync } from 'node:fs'
 import { execFileSync } from 'node:child_process'
-import { basename, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import { classifyPipelineResult, type Classification } from './classify-result.ts'
 import { getTicketNotionUrl, getTicketAiAnalysisStatus } from '../notion-integration/candidate-tickets.ts'
 import { notifyOperator } from '../notify/operator.ts'
@@ -86,9 +86,18 @@ export function shouldNotify(classification: Classification): boolean {
   return NEEDS_NOTIFY.has(classification)
 }
 
-function log(msg: string): void {
-  mkdirSync(LOG_DIR, { recursive: true })
-  appendFileSync(POST_RUN_LOG, `${new Date().toISOString()} ${msg}\n`)
+/**
+ * `path` 可注入（2026-09-04，MON_DB_USER 根因調查發現的污染源修復）：
+ * `post-run-notify.test.ts` 的角色不符測試（FAQ-9007/9008）刻意不注入
+ * `deps.pool`，讓 `writeAuthoritativeOutcome()` 真的走到 `createMonitorPool()`
+ * 拋出例外的分支——但拋出後的 `log()` 呼叫沒有路徑可覆寫，於是每次
+ * `bun test` 都真的把測試訊息寫進生產事故日誌（實測 FAQ-9007 19 筆、
+ * FAQ-9008 14 筆）。預設值＝現行硬編路徑，正常呼叫端（本檔其餘十幾個
+ * `log(msg)` 呼叫點）完全不用改，行為逐位元組不變。
+ */
+function log(msg: string, path: string = POST_RUN_LOG): void {
+  mkdirSync(dirname(path), { recursive: true })
+  appendFileSync(path, `${new Date().toISOString()} ${msg}\n`)
 }
 
 /**
@@ -268,14 +277,17 @@ export async function writeAuthoritativeOutcome(
   exitCode: number,
   stdoutPath: string,
   stderrPath: string,
-  deps: { pool?: MonitorDbExecutor | null; spool?: SpoolWriterHandle } = {},
+  deps: { pool?: MonitorDbExecutor | null; spool?: SpoolWriterHandle; logPath?: string } = {},
 ): Promise<void> {
+  // logPath 只給測試注入暫存路徑（見 log() 檔頭理由），production 呼叫端
+  // 一律不傳，等同直接呼叫 log(msg)。
+  const logMsg = (msg: string): void => log(msg, deps.logPath)
   const testMode = 'pool' in deps || 'spool' in deps
   if (!isMonitorDbEnabled() && !testMode) return
 
   const runId = (process.env.MON_RUN_ID ?? '').trim()
   if (!runId) {
-    log(`${ticket} 監控 DB 寫入略過：process.env.MON_RUN_ID 為空（非本次 v3.2 spawn 鏈觸發，或環境變數遺失）`)
+    logMsg(`${ticket} 監控 DB 寫入略過：process.env.MON_RUN_ID 為空（非本次 v3.2 spawn 鏈觸發，或環境變數遺失）`)
     return
   }
 
@@ -310,7 +322,7 @@ export async function writeAuthoritativeOutcome(
       ownsPool = true
     }
   } catch (err) {
-    log(`${ticket} 監控 DB 連線建立失敗: ${err}`)
+    logMsg(`${ticket} 監控 DB 連線建立失敗: ${err}`)
   }
 
   // 整合修補批次 item 7：「預算內嘗試寫入，逾時/失敗落 spool」的核心邏輯
@@ -338,7 +350,7 @@ export async function writeAuthoritativeOutcome(
       spool.append({ ts: new Date().toISOString(), host: MON_HOST, run_id: runId, fn: 'writeRunOutcomeAuthoritative', args: [input] })
       if (!deps.spool) spool.close()
     } catch (spoolErr) {
-      log(`${ticket} 監控 DB 寫入與落 spool 都失敗，本次終態遺失: ${spoolErr}`)
+      logMsg(`${ticket} 監控 DB 寫入與落 spool 都失敗，本次終態遺失: ${spoolErr}`)
     }
   }
 
@@ -348,7 +360,7 @@ export async function writeAuthoritativeOutcome(
     try {
       await (pool as unknown as { end: () => Promise<void> }).end()
     } catch (err) {
-      log(`${ticket} 監控 DB 連線關閉失敗（不影響已完成的寫入/落 spool）: ${err}`)
+      logMsg(`${ticket} 監控 DB 連線關閉失敗（不影響已完成的寫入/落 spool）: ${err}`)
     }
   }
 }
