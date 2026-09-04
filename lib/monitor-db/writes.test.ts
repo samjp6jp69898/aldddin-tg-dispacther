@@ -305,6 +305,41 @@ describe('cancel：W4（旗標）／W5（遲到修正）— 三種到達順序�
     expect(after.cancel_requested_at).toBe('2026-09-02 00:00:00.000')
   })
 
+  // 2026-09-04 同構修復（W4b 版，比照 e0d6c84/726d00a 對 W2_INSERT_SQL 的根因
+  // 修復）：W4b 是 cancel 旗標搶在 W1/W2 落地前建列時，這一列在 runs 表唯一
+  // 的落地機會，原本沒帶 stdout_path/stderr_path/started_at/trigger_source/
+  // triggered_by_email/triggered_by_name 六欄，永遠留 NULL。這裡驗證
+  // writeCancelFlag 真的會把六者寫進新建的佔位列。退回舊版 writes.ts
+  // （W4B_INSERT_SQL 沒有這六欄、WriteCancelFlagInput 沒有這六個欄位）時，
+  // 這個測試會因為六個欄位根本不是合法輸入欄位（TS 編譯期）或即使硬塞進去
+  // 也不會被 INSERT 到 row（執行期 FakeRunsDb 讀不到對應 params）而斷言失敗
+  // ——已用 git stash 對照確認退回舊版程式碼時同一測試會紅。
+  test('W4b：旗標先於任何 W1/W2 抵達，呼叫端提供的 stdoutPath/stderrPath/startedAt/triggerSource/triggeredByEmail/triggeredByName 要正確落地，不再永遠 NULL', async () => {
+    const db = new FakeRunsDb()
+    const flag = await writeCancelFlag(db, {
+      ...ident({ runId: 'run-cancel-headless', ticket: 'FAQ-4865' }),
+      cancelRequestedAt: '2026-09-04T00:00:00.000Z',
+      resolvedBy: 'placeholder',
+      legacyKey: 'FAQ-4865.2026-09-04T00-00-00-000Z',
+      stdoutPath: '/Users/user/aladdin/telegram-dispatcher/logs/FAQ-4865.2026-09-04T00-00-00-000Z.stdout.log',
+      stderrPath: '/Users/user/aladdin/telegram-dispatcher/logs/FAQ-4865.2026-09-04T00-00-00-000Z.stderr.log',
+      startedAt: '2026-09-04T00:00:00.000Z',
+      triggerSource: 'telegram',
+      triggeredByEmail: 'a@b.com',
+      triggeredByName: 'A B',
+    })
+    expect(flag.kind).toBe('inserted')
+    const row = db.rows.get('run-cancel-headless')!
+    expect(row.stdout_path).toBe('/Users/user/aladdin/telegram-dispatcher/logs/FAQ-4865.2026-09-04T00-00-00-000Z.stdout.log')
+    expect(row.stderr_path).toBe('/Users/user/aladdin/telegram-dispatcher/logs/FAQ-4865.2026-09-04T00-00-00-000Z.stderr.log')
+    // dt()（isoToMysqlDatetime3OrNull）把 ISO 字串轉成 MySQL DATETIME(3) 字面格式
+    // （空白分隔、無 T/Z）——同 W2 那個等價測試驗證的轉換。
+    expect(row.started_at).toBe('2026-09-04 00:00:00.000')
+    expect(row.trigger_source).toBe('telegram')
+    expect(row.triggered_by_email).toBe('a@b.com')
+    expect(row.triggered_by_name).toBe('A B')
+  })
+
   test('cancel 旗標的 COALESCE 冪等：重放兩次不覆寫第一次的 resolvedBy/時間', async () => {
     const db = new FakeRunsDb()
     await writeRunProgress(db, { ...ident(), lifecycleRank: 30 })

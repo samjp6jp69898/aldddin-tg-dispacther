@@ -323,13 +323,33 @@ export class FakeRunsDb implements MonitorDbExecutor {
         finished_at: finishedAt,
       })
     } else {
-      const [rId, h, ticket, kind, cancelRequestedAt, resolvedBy, legacyKey] = params as [
+      const [
+        rId,
+        h,
+        ticket,
+        kind,
+        cancelRequestedAt,
+        resolvedBy,
+        legacyKey,
+        stdoutPath,
+        stderrPath,
+        startedAt,
+        triggerSource,
+        triggeredByEmail,
+        triggeredByName,
+      ] = params as [
         string,
         string,
         string,
         string,
         string,
         string,
+        string | null,
+        string | null,
+        string | null,
+        string | null,
+        string | null,
+        string | null,
         string | null,
       ]
       runId = rId
@@ -340,6 +360,12 @@ export class FakeRunsDb implements MonitorDbExecutor {
         cancel_requested_at: cancelRequestedAt,
         cancel_resolved_by: resolvedBy,
         legacy_key: legacyKey,
+        stdout_path: stdoutPath,
+        stderr_path: stderrPath,
+        started_at: startedAt,
+        trigger_source: triggerSource,
+        triggered_by_email: triggeredByEmail,
+        triggered_by_name: triggeredByName,
       })
     }
     return okHeader(1)

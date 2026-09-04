@@ -324,15 +324,34 @@ UPDATE runs
  WHERE run_id = ? AND host = ?
 `.trim()
 
+// 2026-09-03（同構修復，比照 W2_INSERT_SQL 檔頭的根因修復——見上方 e0d6c84/
+// 726d00a 兩次修復的說明）：W4b 是 cancel 旗標搶在 W1 落地前建列時，這一列
+// 在 runs 表唯一的落地機會，原本沒帶 stdout_path/stderr_path/started_at/
+// trigger_source/triggered_by_email/triggered_by_name 六欄，永遠留 NULL——
+// 與 W2 INSERT fallback 曾經的缺口是同一個成因（同一批走查漏掉的獨立缺口，
+// 不是一次性歷史殘留：只要 cancel 事件搶在 W1 之前建列就會再產生一筆缺欄位
+// 的列）。呼叫端沒有值就傳 undefined/null，不硬填假值——W1 隨後抵達時仍會
+// 用 COALESCE 補齊真正的值。
 export const W4B_INSERT_SQL = `
-INSERT INTO runs (run_id, host, ticket, kind, lifecycle_rank, cancel_requested_at, cancel_resolved_by, legacy_key, created_at)
-VALUES (?, ?, ?, ?, 10, ?, ?, ?, NOW(3))
+INSERT INTO runs (run_id, host, ticket, kind, lifecycle_rank, cancel_requested_at, cancel_resolved_by, legacy_key, stdout_path, stderr_path, started_at, trigger_source, triggered_by_email, triggered_by_name, created_at)
+VALUES (?, ?, ?, ?, 10, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(3))
 `.trim()
 
 export interface WriteCancelFlagInput extends RunIdentity {
   cancelRequestedAt: string
   resolvedBy: CancelResolvedBy
   legacyKey?: string | null
+  /**
+   * 2026-09-03 同構修復：只在 W4b 走 INSERT（旗標搶在 W1/W2 之前抵達）時派
+   * 上用場——W1 隨後抵達時會用 COALESCE 補齊真正的值，這裡不影響既有行為。
+   * 呼叫端沒有值就傳 undefined/null，不硬填假值（見 W4B_INSERT_SQL 檔頭）。
+   */
+  stdoutPath?: string | null
+  stderrPath?: string | null
+  startedAt?: string | null
+  triggerSource?: string | null
+  triggeredByEmail?: string | null
+  triggeredByName?: string | null
 }
 
 /**
@@ -356,6 +375,12 @@ export async function writeCancelFlag(pool: MonitorDbExecutor, input: WriteCance
       dt(input.cancelRequestedAt),
       input.resolvedBy,
       input.legacyKey ?? null,
+      input.stdoutPath ?? null,
+      input.stderrPath ?? null,
+      dt(input.startedAt),
+      input.triggerSource ?? null,
+      input.triggeredByEmail ?? null,
+      input.triggeredByName ?? null,
     ])
     return { kind: 'inserted' }
   } catch (err) {
