@@ -121,7 +121,11 @@ async function resolveR3(pool: MonitorDbExecutor, input: ResolveRunIdInput): Pro
  * 這張 ticket 找到的，不需要在這裡重複驗證）。檔案不存在/壞掉/沒有 runId
  * 一律回 null（不可用，不算 mismatch）。
  */
-function resolveR2(input: ResolveRunIdInput): { runId: string; mismatch: boolean } | null {
+// export（非本檔原本職責範圍，2026-09-04 worker 端本機取消新增）：worker 端
+// 在 DB 逾時/不可達時需要一個「純本機、無 DB」的 run_id 退路，跟本檔
+// resolveRunId() 的 R2 步驟是同一段邏輯，不重寫一份（見
+// lib/pipeline-runner/local-cancel.ts 的 resolveRunIdLocalOnly）。
+export function resolveR2(input: ResolveRunIdInput): { runId: string; mismatch: boolean } | null {
   const { marker, kind } = input
   if (!marker.runId) return null
   if (marker.kind !== null && marker.kind !== kind) {

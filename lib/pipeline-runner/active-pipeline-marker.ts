@@ -1,6 +1,7 @@
 import { mkdirSync, writeFileSync, rmSync, readFileSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
 import type { RunKind } from '../monitor-db/types.ts'
+import type { MarkerSnapshot } from '../monitor-db/cancel-resolve.ts'
 
 export const ACTIVE_MARKER_DIR = '/Users/user/aladdin/telegram-dispatcher/logs/active-pipelines'
 
@@ -121,5 +122,34 @@ export function readRunIdFromActiveMarker(kind: RunKind, ticket: string, dir: st
     return parsed.runId
   } catch {
     return null
+  }
+}
+
+/**
+ * 【2026-09-04，worker 端本機取消新增】讀出標記檔的完整快照
+ * `{runId, kind}`，**不**要求呼叫端先知道 kind 才能讀——與
+ * `readRunIdFromActiveMarker`（呼叫端必須先給 `kind` 驗證一致，不一致直接
+ * 回 null）不同，本函式把 kind 是否一致的判斷留給呼叫端（見
+ * `lib/monitor-db/cancel-resolve.ts` 的 `resolveR2`：marker 記錄的 kind 與
+ * 請求不一致時要能分辨「不可用」與「mismatch」兩種情況，分別走不同的降級/
+ * 告警路徑，不能在讀取這一層就把兩者都壓成 null）。
+ *
+ * 回傳形狀與 `tg-monitor/lib/mon-db.ts` 的 `readActiveMarker()` 逐位元組相同
+ * （`{runId: string|null, kind: RunKind|null}`），因為兩檔讀的是同一份標記
+ * 格式（本檔 `markPipelineActive` 寫的 JSON）——但**不** import 對方：跨 repo
+ * 沒有 import 關係，這是本檔案本來就是這份標記格式的權威定義來源，tg-monitor
+ * 那份是唯讀複製（見該檔案自己的檔頭說明），順序反過來。
+ */
+export function readActiveMarkerSnapshot(ticket: string, dir: string = ACTIVE_MARKER_DIR): MarkerSnapshot {
+  const raw = readMarkerRaw(ticket, dir)
+  if (raw === null) return { runId: null, kind: null }
+  try {
+    const parsed = JSON.parse(raw) as { runId?: unknown; kind?: unknown }
+    const runId = typeof parsed.runId === 'string' && UUID_RE.test(parsed.runId) ? parsed.runId : null
+    const markerKind = parsed.kind === 'bug' || parsed.kind === 'demand' ? parsed.kind : null
+    return { runId, kind: markerKind }
+  } catch {
+    // 舊格式（純 ISO 字串）或壞檔：JSON.parse 失敗 → 沒有 runId 可用。
+    return { runId: null, kind: null }
   }
 }

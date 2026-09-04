@@ -9,12 +9,16 @@
 //                       submitDemandPipeline（佇列、併發上限、去重、
 //                       stale-lock 回收全部沿用單機機制，一行不改）
 //   GET  /jobs/:ticket  某張單在本機的實況（鎖/佇列狀態 + stage 進度描述）
+//   POST /jobs/:ticket/cancel  取消本機正在跑的那張單（2026-09-04 新增，見
+//                       lib/pipeline-runner/local-cancel.ts；演算法比照
+//                       tg-monitor/lib/ingest.ts 的 cancelPipeline()）
 // 其餘路徑一律 uniform 401。
 //
 // 完成回報（事件驅動，不輪詢）：任一背景 pipeline 真的結束（pipeline-queue
 // 的 onExited 事件）就 POST head 的 /cluster/job-done，讓 head 清掉派工
-// 登記、該單恢復可認領。回報 best-effort：head 暫時打不到也沒關係，head 的
-// remote sweeper 會事後校正（見 cluster-head.ts）。
+// 登記、該單恢復可認領。單次回報失敗會落地待重送佇列，由週期性 timer 補送
+// （2026-09-04，見 lib/cluster/job-done-queue.ts）；head 的 remote sweeper
+// 仍是最後一道校正防線（見 cluster-head.ts）。
 //
 // 對使用者的通知不經過 head：pipeline 的 EXIT trap / post-run-notify /
 // tg-notify.sh 在本機直接打 Telegram API（.env 隨 aladdin 目錄複製過來，
@@ -24,6 +28,7 @@
 // MCP proxy 都只該有一份）。worker 只跑這支 + 它自己的 launchd plist。
 
 import { Hono } from 'hono'
+import { join } from 'node:path'
 import { getClusterSecret, WORKER_NAME_RE, WORKER_URL_RE } from './lib/cluster/cluster-env.ts'
 import { createClusterAuthGuard, CLUSTER_TOKEN_HEADER } from './lib/cluster/cluster-auth.ts'
 import { respondUniform401 } from './lib/security/uniform-401.ts'
@@ -54,6 +59,8 @@ import { getLastHeartbeatResult, startMonitorHeartbeat } from './lib/monitor-db/
 import { startLogShipperLoop, listDispatcherLogFiles } from './lib/log-shipper/mount.ts'
 import { createClusterSink } from './lib/log-shipper/cluster-sink.ts'
 import { readSpoolDepth } from './lib/monitor-db/spool/depth.ts'
+import { createJobDoneQueue, retryJobDoneQueue } from './lib/cluster/job-done-queue.ts'
+import { cancelLocalPipeline } from './lib/pipeline-runner/local-cancel.ts'
 import type { SubmitResult } from './lib/pipeline-runner/pipeline-queue.ts'
 import type { TechUser } from './lib/user-resolution/tech-user.ts'
 
@@ -69,6 +76,10 @@ if (maybeSecret === null) {
 // 重新綁定成 string 型別：模組層的 null check 不會流進下面各 closure 的
 // 型別收斂，這一行讓後續所有用點都拿到非 null 型別。
 const secret: string = maybeSecret
+// 比照 cluster-head.ts 的同名常數（同一套 /Users/user/aladdin 目錄慣例，見
+// launchd/run-worker-agent.sh）：worker 機上的 telegram-dispatcher checkout
+// 一律在這個固定路徑。
+const LOG_DIR = '/Users/user/aladdin/telegram-dispatcher/logs'
 const headUrl = (process.env.CLUSTER_HEAD_URL ?? '').trim().replace(/\/+$/, '')
 const workerName = (process.env.CLUSTER_WORKER_NAME ?? '').trim()
 const advertiseUrl = (process.env.CLUSTER_WORKER_URL ?? '').trim().replace(/\/+$/, '')
@@ -154,6 +165,17 @@ async function pullTrackerFromHead(ticket: string): Promise<void> {
   }
 }
 
+// job-done 回報可靠送達（2026-09-04）：單次 postToHead 失敗時落地待重送佇列
+// （tmp+rename，比照 pipeline-queue.ts 既有慣例），由下面的週期性 timer 定期
+// 補送，worker 重啟時 loadFromDisk() 撿回——見 job-done-queue.ts 檔頭「已知
+// 現況」背景說明（原本失敗只 catch 回傳 false，回報永久遺失，是「已無執行
+// 活動但未收到 job-done 回報」誤報訊息的根因）。
+const jobDoneQueue = createJobDoneQueue(join(LOG_DIR, 'job-done-queue.json'))
+
+function jobDoneBody(entry: { ticket: string; worker: string; trackerRow?: string }): Record<string, unknown> {
+  return { ticket: entry.ticket, worker: entry.worker, ...(entry.trackerRow ? { trackerRow: entry.trackerRow } : {}) }
+}
+
 function reportJobDone(ticket: string): void {
   // C-1 修正：回報前先確認這張單在本機已無**任何**活動——wrapper 的 EXIT
   // trap 內 post-run-notify 可能已對 timeout 自動重試 spawn 了下一輪 run
@@ -170,13 +192,28 @@ function reportJobDone(ticket: string): void {
   // 狀態完全在 Notion，tracker.sh 也只認 FAQ- 行）。讀不到就不帶這個欄位，
   // head 端維持原本只清登記的行為。
   const trackerRow = BUG_TICKET_RE.test(ticket) ? readTrackerRow(ticket) : null
-  void postToHead('/cluster/job-done', { ticket, worker: workerName, ...(trackerRow ? { trackerRow } : {}) }).then(ok => {
-    if (!ok) console.error(`worker-agent: job-done 回報失敗（${ticket}），交由 head sweeper 事後校正`)
+  const entry = { ticket, worker: workerName, trackerRow: trackerRow ?? undefined }
+  void postToHead('/cluster/job-done', jobDoneBody(entry)).then(ok => {
+    if (ok) return
+    console.error(`worker-agent: job-done 回報失敗（${ticket}），已落地待重送佇列，下一輪 tick 重試`)
+    jobDoneQueue.enqueue(entry)
   })
 }
 
 registerBugPipelineExitListener(reportJobDone)
 registerDemandPipelineExitListener(reportJobDone)
+
+const JOB_DONE_RETRY_TICK_MS = 60_000
+
+/** 週期性補送待重送佇列（見 job-done-queue.ts 的 retryJobDoneQueue）——不是
+ * 用等待解決正確性問題：head 短暫失聯是外部失敗，這是對它的確定性重試排程，
+ * 跟本檔既有的 registerWithHead 30 分鐘 timer、monitor-status 60 秒 timer
+ * 同一類週期性排程器。 */
+async function retryQueuedJobDoneReports(): Promise<void> {
+  const { attempted, succeeded } = await retryJobDoneQueue(jobDoneQueue, entry => postToHead('/cluster/job-done', jobDoneBody(entry)))
+  if (attempted > 0) console.error(`worker-agent: job-done 待重送佇列本輪嘗試 ${attempted} 筆，成功補送 ${succeeded} 筆`)
+}
+setInterval(() => void retryQueuedJobDoneReports(), JOB_DONE_RETRY_TICK_MS)
 
 async function registerWithHead(): Promise<void> {
   const ok = await postToHead('/cluster/register', { name: workerName, url: advertiseUrl })
@@ -188,6 +225,15 @@ setInterval(() => void registerWithHead(), 30 * 60_000)
 // ---- 本機既有機制的啟動收尾（比照 server.ts）----
 
 startStaleLockReaper()
+
+// job-done 待重送佇列：撿回重啟前還沒送達的回報（trap 沒機會寫入佇列的極端
+// 情況——例如整機斷電——除外），並立即嘗試補送一輪，不等第一次 60 秒 tick。
+const queuedJobDoneReports = jobDoneQueue.loadFromDisk()
+if (queuedJobDoneReports.length > 0) {
+  console.error(`worker-agent: 撿回 ${queuedJobDoneReports.length} 筆重啟前未送達的 job-done 回報，立即嘗試補送`)
+  void retryQueuedJobDoneReports()
+}
+
 const bugRecovered = recoverBugQueue()
 const demandRecovered = recoverDemandQueue()
 if (
@@ -433,6 +479,19 @@ app.get('/jobs/:ticket', guard, c => {
     progress: locked ? describeTicketProgress(ticket) : null,
     stages: locked ? getTicketProgressStages(ticket) : [],
   })
+})
+
+// 取消本機正在跑的一張單（2026-09-04 新增，同一套 auth guard）：演算法見
+// lib/pipeline-runner/local-cancel.ts 檔頭——ps 快照找出 wrapper pid、展開
+// 子孫、最深先 SIGTERM，1.5 秒後 wrapper 補 TERM，5 秒後殘留補 KILL。回應
+// 形狀比照 tg-monitor 的 /api/pipelines/cancel（CancelPipelineResult）。
+app.post('/jobs/:ticket/cancel', guard, async c => {
+  const ticket = c.req.param('ticket')
+  const kind = BUG_TICKET_RE.test(ticket) ? 'bug' : DEMAND_TICKET_RE.test(ticket) ? 'demand' : null
+  if (!kind) return c.json({ ok: false, reason: 'bad_request' }, 400)
+  const r = await cancelLocalPipeline(kind, ticket)
+  console.error(`worker-agent: cancel ${kind} ${ticket}: ${JSON.stringify(r)}`)
+  return c.json(r, r.ok ? 200 : 409)
 })
 
 app.all('*', c => respondUniform401(c))

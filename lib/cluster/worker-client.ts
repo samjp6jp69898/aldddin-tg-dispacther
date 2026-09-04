@@ -113,3 +113,39 @@ export async function fetchWorkerJobStatus(url: string, secret: string, ticket: 
     return null
   }
 }
+
+/** worker-agent.ts 的 `CancelLocalPipelineResult`（見 lib/pipeline-runner/
+ * local-cancel.ts）——本檔不 import 那個型別（worker-agent.ts 是入口檔，不是
+ * 給其他模組 import 的函式庫），這裡只聲明呼叫端（tg-monitor 的
+ * cancelPipeline 轉發路徑）需要的最小形狀。 */
+export type RemoteCancelResult = {
+  ok: boolean
+  killed: number[]
+  wrapperPid?: number
+  reason?: string
+  runId?: string
+  runIdResolvedBy?: string
+  flagWritten?: boolean
+}
+
+/**
+ * 轉發取消請求給 worker 的 `POST /jobs/:ticket/cancel`（2026-09-04 新增，
+ * task 3）。打不通/逾時一律回 `{ok: false, reason: 'unreachable'}`——呼叫端
+ * （tg-monitor 的 `/api/pipelines/cancel`）據此顯示「取消失敗」，不用像
+ * `postWorkerJob` 那樣區分 ambiguous（取消沒有「兩台同時取消」的雙跑風險，
+ * 逾時重按一次即可，不需要保守語意）。
+ */
+export async function cancelRemoteJob(url: string, secret: string, ticket: string, timeoutMs = 8_000): Promise<RemoteCancelResult> {
+  try {
+    const res = await fetch(`${url}/jobs/${encodeURIComponent(ticket)}/cancel`, {
+      method: 'POST',
+      headers: headers(secret),
+      signal: AbortSignal.timeout(timeoutMs),
+    })
+    const body = (await res.json().catch(() => null)) as RemoteCancelResult | null
+    if (!body || typeof body.ok !== 'boolean') return { ok: false, killed: [], reason: `worker 回應格式不對（HTTP ${res.status}）` }
+    return body
+  } catch (err) {
+    return { ok: false, killed: [], reason: isTimeoutLike(err) ? 'worker 逾時未回應' : 'worker 連不上' }
+  }
+}
