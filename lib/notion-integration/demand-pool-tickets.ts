@@ -6,7 +6,7 @@ const execFileAsync = promisify(execFile)
 const NOTION_SH = '/Users/user/aladdin/scripts/notion.sh'
 // 『總需求池資料庫』，與 Bug List 平行且有 relation 互連（見 tasks.json T23
 // changelog）。跟 candidate-tickets.ts 的 DATA_SOURCE_ID 不是同一個 database。
-const DATA_SOURCE_ID = '21d87d78-618a-8135-ad4f-000b273e1293'
+export const DATA_SOURCE_ID = '21d87d78-618a-8135-ad4f-000b273e1293'
 
 // 可認領判準之一（使用者 2026-08-17 定案，見 tasks.json T23 changelog）：
 // 『技術處理人員』這個 people 欄位最貼近 Bug List 的『當前指派』（抽樣裡填的
@@ -18,7 +18,7 @@ const DATA_SOURCE_ID = '21d87d78-618a-8135-ad4f-000b273e1293'
 // candidate-tickets.ts 的 { select: { equals } }——已用 notion.sh
 // query-datasource 實測驗證過兩者回傳格式不同，混用會讓 Notion API 直接
 // 回錯誤，不是猜測。
-const WANTED_STATUSES = ['文件完成待處理', '需求仍有問題']
+export const WANTED_STATUSES = ['文件完成待處理', '需求仍有問題']
 
 // 可認領判準之二（使用者 2026-08-27 定案）：『AI分析』欄位（select 型，跟
 // Bug List 共用同一組選項）也要限定，只有『待分析』（人工已標記可分析）與
@@ -27,7 +27,7 @@ const WANTED_STATUSES = ['文件完成待處理', '需求仍有問題']
 // 分析成功/分析失敗/不需分析）一律不出現在候選清單。已用 notion.sh
 // query-datasource 對真實資料實測過：這個 database 目前絕大多數候選狀態的
 // 單都是 AI分析 空值，加這條件後清單內容會明顯變窄，是刻意的行為改變。
-const WANTED_AI_ANALYSIS = ['待分析', '需要重跑']
+export const WANTED_AI_ANALYSIS = ['待分析', '需要重跑']
 
 // export 供測試直接驗證 filter 組裝邏輯，不需要真的打 Notion API
 // （candidate-tickets.ts 的 buildFilter 沒有 export，因為那個檔案本身沒有

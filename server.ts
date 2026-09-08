@@ -19,6 +19,7 @@ import { startMonitorMaintenance, runRestartSweep } from './lib/monitor-db/maint
 import { declareMonitorRole } from './lib/monitor-db/env.ts'
 import { startMonitorCollectors } from './lib/monitor-db/collectors/index.ts'
 import { startMonitorHeartbeat } from './lib/monitor-db/heartbeat.ts'
+import { mountOpsUi } from './lib/ops-ui/index.ts'
 
 registerHandlers(bot)
 
@@ -183,6 +184,11 @@ registerProxyRoutes(app)
 // 回報），CLUSTER_SHARED_SECRET 未設定時整個函式是 no-op、一條路由都不掛。
 // 註冊位置同 proxy 的硬約束：必須在 catch-all 之前，否則被 401 吃掉。
 registerClusterRoutes(app)
+
+// ops-ui（2026-09-08）：技術同事的瀏覽器派工台 /ops/*（Telegram Login Widget
+// 登入 + OPS_ALLOWED_CIDRS 公司網路白名單，見 lib/ops-ui/routes.ts 檔頭）。
+// 註冊位置同 proxy／cluster 的硬約束：必須在下面 catch-all 之前。
+mountOpsUi(app, { botUsername: bot.botInfo.username })
 
 // 任何沒命中上面路由的請求（含猜錯 webhook 路徑）一律回跟「secret_token 錯誤」
 // 一模一樣的回應：401 + 空 body。回應內容與送出時點的定義都在

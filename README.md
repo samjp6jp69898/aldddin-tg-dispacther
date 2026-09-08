@@ -626,3 +626,27 @@ route dns` 建立 DNS route，不會因為 tunnel 重啟而變），所以正常
    ```
    （正式上線本身 `setWebhook` 只在 T22 執行一次，這裡只是輪替 secret 時要
    重跑同一個呼叫；換完可以用上一節的 `getWebhookInfo` 確認真的生效）。
+
+## ops-ui：技術同事的瀏覽器派工台（`/ops`，2026-09-08）
+
+`https://mcp.aladdin-assistant.cc/ops/`——技術同事不用再靠 bot 的 `/status`，在瀏覽器就能看
+**進行中／待處理／處理過**三個分頁，對「指派給自己」的待處理單直接按「啟動」觸發既有 pipeline，
+每張單都有 Notion 連結，並即時顯示 Notion 的『狀態』／『AI分析』現值。程式碼在 `lib/ops-ui/`
+（`routes.ts` 檔頭有完整防線說明），掛在同一支 webhook server（8787）上，經既有 cloudflared tunnel 對外。
+
+- **兩道門檻，缺一不可**：
+  1. 公司網路：`.env` 的 `OPS_ALLOWED_CIDRS`（逗號分隔 IP/CIDR）比對 Cloudflare 注入的
+     `CF-Connecting-IP`；未設定＝全部拒絕（fail-closed），被拒的來源 IP 會記在
+     `logs/launchd-server.err.log`（`ops-ui: 來源 IP 不在 OPS_ALLOWED_CIDRS 內 …`），要加白名單就從那裡抄。
+  2. Telegram 身分：頁面用 Telegram Login Widget，回呼由 bot token 驗簽後比對
+     `tech-users.csv` 的 `tg_chat_id`——只有 bot 白名單內的人登得進來，登入有效 24 小時，server 重啟即失效。
+- **一次性設定（人工）**：到 BotFather 對 dispatcher bot 執行 `/setdomain`，填 `mcp.aladdin-assistant.cc`，
+  否則 widget 會顯示 *Bot domain invalid*。`OPS_PUBLIC_ORIGIN` 通常不用填（經 tunnel 時由 Host 推導）。
+- **啟動規則**：跟 TG bot 完全同一條決策核心（`lib/locking/claim.ts` 的 `claimBugTicket`／
+  `demand-claim.ts` 的 `claimDemandTicket`），只能啟動 Notion『當前指派』（Bug）／『技術處理人員』
+  （需求單）含本人的單；別人的單只能看與開 Notion。回覆文字與 TG 一字不差。
+- **資料來源**：待處理＝Notion 候選單查詢（全隊，快取 15 秒）；進行中＝監控 DB `runs`（queued/running）
+  ∪ 本機鎖目錄 ∪ 佇列快照 ∪ 遠端派工登記表，進度文字沿用 `/status` 的還原邏輯；處理過＝監控 DB `runs`
+  終態列（`MON_DB_ENABLED` 關閉時該分頁只顯示未啟用）。
+- **改完程式碼要重啟**：`launchctl kickstart -k gui/$(id -u)/com.aladdin.tg-dispatch-server`。
+- 測試：`NODE_ENV=test bun test lib/ops-ui`。

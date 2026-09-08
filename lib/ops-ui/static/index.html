@@ -1,0 +1,300 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>工單派工台</title>
+<style>
+  :root{--bg:#f6f7f9;--card:#fff;--line:#e3e6ea;--text:#1d232a;--muted:#6b7480;--accent:#2563eb;--ok:#15803d;--warn:#b45309;--bad:#b91c1c;--chip:#eef2f7}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang TC","Noto Sans TC",sans-serif}
+  header{display:flex;align-items:center;gap:16px;padding:12px 20px;background:var(--card);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:2}
+  header h1{font-size:16px;margin:0;font-weight:600}
+  header .spacer{flex:1}
+  header .who{color:var(--muted)}
+  main{width:100%;margin:0;padding:16px 20px}
+  .login{max-width:420px;margin:80px auto;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:28px;text-align:center}
+  .login p{color:var(--muted)}
+  .tabs{display:flex;gap:4px;border-bottom:1px solid var(--line);margin-bottom:12px}
+  .tabs button{background:none;border:0;border-bottom:2px solid transparent;padding:10px 14px;font:inherit;cursor:pointer;color:var(--muted)}
+  .tabs button.on{color:var(--accent);border-bottom-color:var(--accent);font-weight:600}
+  .tabs .count{display:inline-block;min-width:20px;padding:0 6px;margin-left:6px;border-radius:10px;background:var(--chip);font-size:12px}
+  .bar{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin:8px 0 12px;color:var(--muted)}
+  .bar input[type=text]{padding:6px 8px;border:1px solid var(--line);border-radius:6px;font:inherit;min-width:180px}
+  .bar label{display:flex;align-items:center;gap:4px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:8px;overflow:auto}
+  table{width:100%;border-collapse:collapse;min-width:900px}
+  th,td{padding:8px 10px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+  th{font-weight:600;color:var(--muted);font-size:12px;white-space:nowrap;background:#fafbfc;position:sticky;top:0}
+  tr:last-child td{border-bottom:0}
+  td.mono,.mono{font-family:ui-monospace,Menlo,monospace;white-space:nowrap}
+  td.progress{white-space:pre-wrap;font-size:12px;color:#374151;max-width:420px}
+  .chip{display:inline-block;padding:1px 8px;border-radius:10px;background:var(--chip);font-size:12px;white-space:nowrap}
+  .chip.ok{background:#dcfce7;color:var(--ok)}
+  .chip.warn{background:#fef3c7;color:var(--warn)}
+  .chip.bad{background:#fee2e2;color:var(--bad)}
+  .chip.info{background:#dbeafe;color:#1d4ed8}
+  a{color:var(--accent);text-decoration:none}
+  a:hover{text-decoration:underline}
+  button.act{background:var(--accent);color:#fff;border:0;border-radius:6px;padding:5px 12px;font:inherit;cursor:pointer;white-space:nowrap}
+  button.act:disabled{background:#c7cdd6;cursor:not-allowed}
+  button.ghost{background:none;border:1px solid var(--line);border-radius:6px;padding:5px 10px;font:inherit;cursor:pointer;color:var(--text)}
+  .empty{padding:28px;text-align:center;color:var(--muted)}
+  .toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);background:#111827;color:#fff;padding:12px 16px;border-radius:8px;max-width:640px;white-space:pre-wrap;box-shadow:0 8px 24px rgba(0,0,0,.25);z-index:5}
+  .toast.bad{background:var(--bad)}
+  .toast.ok{background:var(--ok)}
+  .muted{color:var(--muted)}
+  .err{color:var(--bad)}
+  .title{max-width:480px;white-space:normal;word-break:break-word}
+  dialog{border:1px solid var(--line);border-radius:10px;padding:20px;max-width:480px;font:inherit}
+  dialog::backdrop{background:rgba(0,0,0,.35)}
+  dialog .btns{display:flex;justify-content:flex-end;gap:8px;margin-top:16px}
+</style>
+</head>
+<body>
+<div id="app"></div>
+
+<script>
+(function () {
+  'use strict'
+  const BOT_USERNAME = '__BOT_USERNAME__'
+  const AUTH_URL = '__AUTH_URL__'
+  const API = '/ops/api'
+  const POLL_MS = 15000
+  const $app = document.getElementById('app')
+
+  const state = {
+    me: null,
+    tab: localStorage.getItem('ops.tab') || 'active',
+    filter: '',
+    histFilter: '',
+    active: null, pending: null, history: null,
+    histOffset: 0,
+    error: null,
+    loading: false,
+    timer: null,
+  }
+
+  // ---------- helpers ----------
+  const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))
+  const fmtTime = iso => {
+    if (!iso) return '—'
+    const d = new Date(iso); if (isNaN(d)) return esc(iso)
+    return d.toLocaleString('zh-TW', { hour12: false, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+  }
+  const fmtDur = (a, b) => {
+    if (!a) return '—'
+    const ms = (b ? new Date(b) : new Date()) - new Date(a); if (isNaN(ms) || ms < 0) return '—'
+    const m = Math.floor(ms / 60000); return m < 60 ? m + ' 分' : Math.floor(m / 60) + ' 時 ' + (m % 60) + ' 分'
+  }
+  const notionLink = (url, ticket) => url ? `<a class="mono" href="${esc(url)}" target="_blank" rel="noopener">${esc(ticket)} ↗</a>` : `<span class="mono">${esc(ticket)}</span>`
+  const outcomeChip = o => {
+    if (!o) return '<span class="chip">—</span>'
+    const good = ['success','already_fixed','recovered','already_satisfied']
+    const soft = ['needs_qa_clarification','needs_clarification','i18n','insufficient_spec','skipped','skipped_locked','skipped_expired','dispatched_to_worker','cancelled']
+    const cls = good.includes(o) ? 'ok' : soft.includes(o) ? 'warn' : 'bad'
+    return `<span class="chip ${cls}">${esc(o)}</span>`
+  }
+  const aiChip = v => {
+    if (!v) return '<span class="chip">—</span>'
+    const cls = v === '分析成功' ? 'ok' : v === '分析中' ? 'info' : v === '分析失敗' ? 'bad' : (v === '待分析' || v === '需要重跑') ? 'warn' : ''
+    return `<span class="chip ${cls}">${esc(v)}</span>`
+  }
+  const stateChip = s => s === 'running' ? '<span class="chip info">執行中</span>' : s === 'queued' ? '<span class="chip warn">排隊中</span>' : '<span class="chip">派工中</span>'
+  const names = list => (list || []).map(p => esc(p.name || p.id)).join('、') || '—'
+
+  let toastTimer = null
+  function toast(text, cls) {
+    document.querySelectorAll('.toast').forEach(e => e.remove())
+    const el = document.createElement('div'); el.className = 'toast ' + (cls || ''); el.textContent = text
+    document.body.appendChild(el)
+    clearTimeout(toastTimer); toastTimer = setTimeout(() => el.remove(), 9000)
+  }
+
+  async function api(path, opts) {
+    const res = await fetch(API + path, Object.assign({ credentials: 'same-origin' }, opts || {}))
+    if (res.status === 401) { state.me = null; render(); throw new Error('unauthenticated') }
+    const body = await res.json().catch(() => ({}))
+    if (!res.ok) throw new Error(body.text || body.error || ('HTTP ' + res.status))
+    return body
+  }
+
+  // ---------- data ----------
+  async function loadTab(tab) {
+    state.loading = true; state.error = null; renderBarOnly()
+    try {
+      if (tab === 'active') state.active = await api('/active')
+      else if (tab === 'pending') state.pending = await api('/pending')
+      else state.history = await api('/history?limit=50&offset=' + state.histOffset + '&ticket=' + encodeURIComponent(state.histFilter))
+    } catch (e) {
+      if (e.message !== 'unauthenticated') state.error = e.message
+    } finally {
+      state.loading = false; render()
+    }
+  }
+  function schedule() {
+    clearTimeout(state.timer)
+    state.timer = setTimeout(() => { if (state.me && !document.hidden) loadTab(state.tab); schedule() }, POLL_MS)
+  }
+
+  async function start(ticket) {
+    const dlg = document.getElementById('confirm')
+    dlg.querySelector('.msg').textContent = `確定要啟動 ${ticket} 的自動分析流程？啟動後會佔用一個背景併發名額，完成時會透過 Telegram 通知你。`
+    dlg.returnValue = ''
+    dlg.showModal()
+    await new Promise(r => dlg.addEventListener('close', r, { once: true }))
+    if (dlg.returnValue !== 'yes') return
+    const btn = document.querySelector(`button[data-start="${ticket}"]`); if (btn) { btn.disabled = true; btn.textContent = '啟動中…' }
+    try {
+      const r = await api('/start', { method: 'POST', headers: { 'content-type': 'application/json', 'x-ops-ui': '1' }, body: JSON.stringify({ ticket }) })
+      const good = ['started','queued','remote_started']
+      toast(r.text, good.includes(r.code) ? 'ok' : (r.code === 'already_running' || r.code === 'already_queued' || r.code === 'already_running_local' || r.code === 'already_running_remote') ? '' : 'bad')
+      if (good.includes(r.code)) { state.tab = 'active'; localStorage.setItem('ops.tab', 'active') }
+      await Promise.all([loadTab('pending'), loadTab('active')])
+    } catch (e) {
+      if (e.message !== 'unauthenticated') toast('啟動失敗：' + e.message, 'bad')
+      if (btn) { btn.disabled = false; btn.textContent = '啟動' }
+    }
+  }
+
+  // ---------- render ----------
+  function renderLogin() {
+    $app.innerHTML = `
+      <header><h1>工單派工台</h1></header>
+      <div class="login">
+        <h2 style="margin-top:0">請用 Telegram 登入</h2>
+        <p>只有已綁定 <b>@${esc(BOT_USERNAME)}</b> 的技術人員、且在公司網路內，才能進入。</p>
+        <div id="tg-widget"></div>
+        <p class="muted" style="font-size:12px">登入後 24 小時內免重新登入；伺服器重啟需重新登入。</p>
+      </div>`
+    const s = document.createElement('script')
+    s.async = true
+    s.src = 'https://telegram.org/js/telegram-widget.js?22'
+    s.setAttribute('data-telegram-login', BOT_USERNAME)
+    s.setAttribute('data-size', 'large')
+    s.setAttribute('data-auth-url', AUTH_URL)
+    s.setAttribute('data-request-access', 'write')
+    document.getElementById('tg-widget').appendChild(s)
+  }
+
+  function renderBarOnly() {
+    const st = document.getElementById('status'); if (st) st.textContent = state.loading ? '更新中…' : ''
+  }
+
+  function render() {
+    if (!state.me) { renderLogin(); return }
+    const a = state.active, p = state.pending, h = state.history
+    const pendingCount = p ? p.bug.filter(r => r.canStart).length + p.demand.filter(r => r.canStart).length : ''
+    $app.innerHTML = `
+      <header>
+        <h1>工單派工台</h1>
+        <span class="spacer"></span>
+        <span class="who">${esc(state.me.name)} &lt;${esc(state.me.email)}&gt;</span>
+        <button class="ghost" id="logout">登出</button>
+      </header>
+      <main>
+        <div class="tabs">
+          <button data-tab="active" class="${state.tab==='active'?'on':''}">進行中<span class="count">${a ? a.rows.length : '…'}</span></button>
+          <button data-tab="pending" class="${state.tab==='pending'?'on':''}">待處理<span class="count">${p ? pendingCount : '…'}</span></button>
+          <button data-tab="history" class="${state.tab==='history'?'on':''}">處理過<span class="count">${h ? h.total : '…'}</span></button>
+        </div>
+        <div class="bar">
+          ${state.tab === 'pending' ? `<input type="text" id="filter" placeholder="篩選單號 / 標題 / 指派" value="${esc(state.filter)}">` : ''}
+          ${state.tab === 'history' ? `<input type="text" id="histFilter" placeholder="單號（如 FAQ-4905）" value="${esc(state.histFilter)}"><button class="ghost" id="histSearch">搜尋</button>` : ''}
+          <button class="ghost" id="refresh">重新整理</button>
+          <span id="status" class="muted">${state.loading ? '更新中…' : ''}</span>
+          ${state.error ? `<span class="err">讀取失敗：${esc(state.error)}</span>` : ''}
+          <span class="spacer"></span>
+          <span class="muted">每 ${POLL_MS/1000} 秒自動更新</span>
+        </div>
+        <div class="card">${state.tab === 'active' ? tableActive(a) : state.tab === 'pending' ? tablePending(p) : tableHistory(h)}</div>
+      </main>
+      <dialog id="confirm"><div class="msg"></div><form method="dialog" class="btns"><button class="ghost" value="no">取消</button><button class="act" value="yes">確定啟動</button></form></dialog>`
+    bind()
+  }
+
+  function tableActive(a) {
+    if (!a) return '<div class="empty">載入中…</div>'
+    if (!a.rows.length) return '<div class="empty">目前沒有進行中的工單</div>'
+    return `<table><thead><tr><th>單號</th><th>標題</th><th>類型</th><th>狀態</th><th>發起人</th><th>開始</th><th>已耗時</th><th>Notion AI分析</th><th>進度</th></tr></thead><tbody>
+      ${a.rows.map(r => `<tr>
+        <td>${notionLink(r.url, r.ticket)}</td>
+        <td class="title" title="${esc(r.title||'')}">${esc(r.title || '—')}</td>
+        <td>${r.kind === 'demand' ? '需求' : 'Bug'}</td>
+        <td>${stateChip(r.state)}${r.verified ? '' : ' <span class="chip warn" title="本機與派工登記表都查無此單">待校正</span>'}</td>
+        <td>${esc(r.triggeredByName || '—')}</td>
+        <td class="mono">${fmtTime(r.startedAt || r.enqueuedAt)}</td>
+        <td class="mono">${r.state === 'queued' ? '—' : fmtDur(r.startedAt)}</td>
+        <td>${aiChip(r.aiAnalysis)}</td>
+        <td class="progress">${esc(r.progress)}</td>
+      </tr>`).join('')}</tbody></table>`
+  }
+
+  function tablePending(p) {
+    if (!p) return '<div class="empty">載入中…</div>'
+    const q = state.filter.trim().toLowerCase()
+    const rows = [...p.bug, ...p.demand]
+      .filter(r => r.canStart)
+      .filter(r => !q || (r.ticket + ' ' + r.title + ' ' + r.assignees.map(x => x.name).join(' ')).toLowerCase().includes(q))
+    if (!rows.length) return `<div class="empty">沒有指派給你的待處理工單</div>`
+    const busy = new Set((state.active ? state.active.rows : []).map(r => r.ticket))
+    return `<table><thead><tr><th>單號</th><th>標題</th><th>類型</th><th>嚴重性/優先級</th><th>狀態</th><th>AI分析</th><th>指派</th><th>最後編輯</th><th></th></tr></thead><tbody>
+      ${rows.map(r => `<tr>
+        <td>${notionLink(r.url, r.ticket)}</td>
+        <td class="title" title="${esc(r.title||'')}">${esc(r.title || '—')}</td>
+        <td>${r.kind === 'demand' ? '需求' : 'Bug'}</td>
+        <td><span class="chip">${esc(r.priority || '—')}</span></td>
+        <td>${esc(r.status || '—')}</td>
+        <td>${aiChip(r.aiAnalysis)}</td>
+        <td>${names(r.assignees)}</td>
+        <td class="mono">${fmtTime(r.lastEditedAt)}</td>
+        <td>${busy.has(r.ticket) ? '<span class="chip info">進行中</span>' : r.canStart ? `<button class="act" data-start="${esc(r.ticket)}">啟動</button>` : `<button class="act" disabled title="只能啟動指派給自己的單">啟動</button>`}</td>
+      </tr>`).join('')}</tbody></table>`
+  }
+
+  function tableHistory(h) {
+    if (!h) return '<div class="empty">載入中…</div>'
+    if (!h.monitorDb) return '<div class="empty">監控 DB 未啟用，無法列出歷史紀錄</div>'
+    if (!h.rows.length) return '<div class="empty">沒有符合的歷史紀錄</div>'
+    const pages = `<div class="bar" style="padding:8px 10px;margin:0"><span class="muted">第 ${h.offset + 1}–${Math.min(h.offset + h.rows.length, h.total)} 筆，共 ${h.total} 筆</span><span class="spacer"></span>
+      <button class="ghost" data-page="prev" ${h.offset === 0 ? 'disabled' : ''}>上一頁</button><button class="ghost" data-page="next" ${h.offset + h.limit >= h.total ? 'disabled' : ''}>下一頁</button></div>`
+    return `<table><thead><tr><th>單號</th><th>標題</th><th>類型</th><th>結果</th><th>發起人</th><th>開始</th><th>結束</th><th>耗時</th><th>Notion 狀態</th><th>Notion AI分析</th></tr></thead><tbody>
+      ${h.rows.map(r => `<tr>
+        <td>${notionLink(r.url, r.ticket)}</td>
+        <td class="title" title="${esc(r.title||'')}">${esc(r.title || '—')}</td>
+        <td>${r.kind === 'demand' ? '需求' : 'Bug'}</td>
+        <td>${outcomeChip(r.outcome)}${r.outcomeTier === 1 ? ' <span class="chip" title="暫定終態，等待權威回填">暫定</span>' : ''}</td>
+        <td>${esc(r.triggeredByName || (r.triggerSource === 'cli' ? '（手動 CLI）' : '—'))}</td>
+        <td class="mono">${fmtTime(r.startedAt || r.createdAt)}</td>
+        <td class="mono">${fmtTime(r.finishedAt)}</td>
+        <td class="mono">${fmtDur(r.startedAt, r.finishedAt)}</td>
+        <td>${esc(r.notionStatus || '—')}</td>
+        <td>${aiChip(r.aiAnalysis)}</td>
+      </tr>`).join('')}</tbody></table>${pages}`
+  }
+
+  function bind() {
+    document.querySelectorAll('[data-tab]').forEach(b => b.onclick = () => { state.tab = b.dataset.tab; localStorage.setItem('ops.tab', state.tab); render(); loadTab(state.tab) })
+    document.querySelectorAll('[data-start]').forEach(b => b.onclick = () => start(b.dataset.start))
+    document.querySelectorAll('[data-page]').forEach(b => b.onclick = () => { state.histOffset = Math.max(0, state.histOffset + (b.dataset.page === 'next' ? 50 : -50)); loadTab('history') })
+    const f = document.getElementById('filter'); if (f) f.oninput = () => { state.filter = f.value; const card = document.querySelector('.card'); card.innerHTML = tablePending(state.pending); bind() }
+    const hf = document.getElementById('histFilter'); if (hf) { hf.onkeydown = e => { if (e.key === 'Enter') { state.histFilter = hf.value; state.histOffset = 0; loadTab('history') } } }
+    const hs = document.getElementById('histSearch'); if (hs) hs.onclick = () => { state.histFilter = document.getElementById('histFilter').value; state.histOffset = 0; loadTab('history') }
+    const rf = document.getElementById('refresh'); if (rf) rf.onclick = () => loadTab(state.tab)
+    const lo = document.getElementById('logout'); if (lo) lo.onclick = async () => { await fetch('/ops/logout', { method: 'POST', credentials: 'same-origin' }); state.me = null; render() }
+  }
+
+  // ---------- boot ----------
+  ;(async () => {
+    try { state.me = await api('/me') } catch (e) { state.me = null }
+    render()
+    if (state.me) {
+      await Promise.all([loadTab('active'), loadTab('pending')])
+      if (state.tab === 'history') loadTab('history')
+      schedule()
+    }
+  })()
+})()
+</script>
+</body>
+</html>
