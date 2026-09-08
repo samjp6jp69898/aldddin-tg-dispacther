@@ -50,6 +50,15 @@ describe('classifyPipelineResult — 七種分類（T12 acceptance criteria）',
     expect(classifyPipelineResult(0, fakeStdout({ result: '- Pipeline status: needs_qa_clarification' }))).toBe('needs_qa_clarification')
   })
 
+  // 2026-09-08 新增（pipeline-modes Phase 2）：「只做問題分析」模式的暫停
+  // 出口，見 plan-pipeline-modes-v1.md §2.4。含 markdown 加粗/反引號變體
+  // 各一，比照上方檔頭「FAQ-4616」註解說明的容忍規則。
+  test('analysis_done：純文字、加粗、反引號三種寫法都要命中', () => {
+    expect(classifyPipelineResult(0, fakeStdout({ result: '- Pipeline status: analysis_done' }))).toBe('analysis_done')
+    expect(classifyPipelineResult(0, fakeStdout({ result: '- **Pipeline status**: analysis_done' }))).toBe('analysis_done')
+    expect(classifyPipelineResult(0, fakeStdout({ result: '- Pipeline status: `analysis_done`' }))).toBe('analysis_done')
+  })
+
   test('failed', () => {
     expect(classifyPipelineResult(0, fakeStdout({ result: '- Pipeline status: failed' }))).toBe('failed')
   })

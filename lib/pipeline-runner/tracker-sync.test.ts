@@ -77,6 +77,14 @@ describe('parseTrackerRow — 遠端字串進 shell 之前的白名單', () => {
     expect(parseTrackerRow('| FAQ-1 | done |')).toBeNull()
     expect(parseTrackerRow('')).toBeNull()
   })
+
+  // 2026-09-08 新增（pipeline-modes Phase 2）：analysis_done 是「只做問題
+  // 分析」模式跑完後的暫停態，見 aladdin_ai/scripts/tracker.sh 第 18 行合法
+  // 狀態清單。
+  test('analysis_done：白名單已放行，跟其餘既有狀態一樣正常解析', () => {
+    const row = '| FAQ-5001 | https://notion.so/a | P2較高 | analysis_done | 2026-09-08 |  |'
+    expect(parseTrackerRow(row)).toEqual({ status: 'analysis_done', doneAt: '' })
+  })
 })
 
 describe('readTrackerFile — head 端提供整檔', () => {
@@ -158,5 +166,13 @@ describe('readTrackerRow / applyRemoteTrackerRow — 真的跑 tracker.sh', () =
     expect(applyRemoteTrackerRow('FAQ-4844', 'deleted' as never, '')).toBe(false)
     expect(applyRemoteTrackerRow('FAQ-4844', 'done', '; touch /tmp/pwned')).toBe(false)
     expect(readFileSync(trackerPath(), 'utf8')).toBe(before)
+  })
+
+  // 2026-09-08 新增（pipeline-modes Phase 2）：analysis_done 不能被白名單擋
+  // 下——tracker.sh 第 49 行 case 分支已放行，這裡驗證真的能寫進檔案。
+  test('analysis_done：白名單放行，真的寫進檔案', () => {
+    writeFileSync(trackerPath(), fixture([ROW_PENDING]))
+    expect(applyRemoteTrackerRow('FAQ-4844', 'analysis_done', '')).toBe(true)
+    expect(readFileSync(trackerPath(), 'utf8')).toContain('| analysis_done |')
   })
 })

@@ -39,6 +39,10 @@ export const KNOWN_OUTCOME_TIER: Readonly<Record<string, OutcomeTier>> = Object.
   failed: 2,
   timeout: 2,
   needs_qa_clarification: 2,
+  // 2026-09-08 新增，pipeline-modes Phase 2「只做問題分析」模式的暫停出口，
+  // create-mr 自己會在 7c 發 TG，不是失敗（見
+  // pipeline-modes-project-docs/plan-pipeline-modes-v1.md §2.4）。
+  analysis_done: 2,
   already_fixed: 2,
   i18n: 2,
   cancelled: 2,

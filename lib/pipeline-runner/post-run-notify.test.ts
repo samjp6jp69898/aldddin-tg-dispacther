@@ -268,9 +268,12 @@ describe('writeAuthoritativeOutcome — v3.2 §9 Phase2 bug 終態（權威）�
 })
 
 describe('shouldNotify — T13 補發通知範圍（2026-08-14 使用者定案，見 tasks.json changelog）', () => {
-  test('create-mr 自己已通知/已留言過的三類，不重複發', () => {
+  test('create-mr 自己已通知/已留言過的四類，不重複發', () => {
     expect(shouldNotify('success')).toBe(false)
     expect(shouldNotify('needs_qa_clarification')).toBe(false)
+    // 2026-09-08 新增（pipeline-modes Phase 2）：analysis_done 是「只做問題
+    // 分析」模式的暫停出口，create-mr 自己在 7c 已發過 TG，不用補發。
+    expect(shouldNotify('analysis_done')).toBe(false)
     expect(shouldNotify('failed')).toBe(false)
   })
 

@@ -18,8 +18,11 @@ function setLockPath(): string {
   return process.env.TRACKER_SET_LOCK || '/tmp/bug-analysis-locks/.tracker-set-lock'
 }
 /** tracker.sh set 的合法狀態集合（該腳本第 47 行 case 分支）。head 回寫
- * worker 終態前照這個白名單驗，不讓遠端字串直接流進 shell 參數。 */
-const TRACKER_STATUSES = ['pending', 'rerun', 'in_progress', 'done', 'failed', 'needs_qa'] as const
+ * worker 終態前照這個白名單驗，不讓遠端字串直接流進 shell 參數。
+ * `analysis_done`（2026-09-08，pipeline-modes Phase 2）：aladdin_ai/scripts/
+ * tracker.sh 第 18 行合法狀態清單已含它，見該行「只做問題分析」模式跑完
+ * 根因分析報告後的暫停態說明。 */
+const TRACKER_STATUSES = ['pending', 'rerun', 'in_progress', 'done', 'failed', 'needs_qa', 'analysis_done'] as const
 export type TrackerStatus = (typeof TRACKER_STATUSES)[number]
 /** 完成時間欄：tracker.sh set 的第三參數，格式見該腳本用法（`2026-07-03 1530`）。
  * 歷史資料另有 `20260519 1105` 這種舊格式，兩種都放行、其餘一律丟棄。 */

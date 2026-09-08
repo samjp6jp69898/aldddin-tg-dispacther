@@ -12,8 +12,10 @@
 //   3. jq -r .result 解開後判斷：create-mr.md Step 9 完成報告固定有一行
 //      「- Pipeline status: {pipeline_status}」，用錨定 regex 抓這一行的值
 //      直接對應 success（含 already_fixed / i18n_manual_handoff）/
-//      needs_qa_clarification / failed；抓不到這行時才看是不是真正的早退
-//      SKIPPED（見下方判斷順序註解）；都不是 → unknown_failure
+//      needs_qa_clarification / analysis_done（2026-09-08 新增，見
+//      pipeline-modes-project-docs/plan-pipeline-modes-v1.md §2.4）/ failed；
+//      抓不到這行時才看是不是真正的早退 SKIPPED（見下方判斷順序註解）；
+//      都不是 → unknown_failure
 //
 // ============================================================================
 // 2026-09-04 研究補充：能不能可靠偵測「Claude session/usage limit 用盡」
@@ -138,6 +140,10 @@ export type Classification =
   | 'skipped'
   | 'success'
   | 'needs_qa_clarification'
+  // 2026-09-08 新增，pipeline-modes Phase 2：「只做問題分析」模式的暫停
+  // 出口，create-mr 自己會在 7c 發 TG，不是失敗（見
+  // pipeline-modes-project-docs/plan-pipeline-modes-v1.md §2.4）。
+  | 'analysis_done'
   | 'failed'
   // dispatcher 自己合成的分類，create-mr 完全沒機會回報這幾種——代表 CLI
   // 這層本身就有問題（跑不完、跑完但沒吐出可辨識的合法結果）。
@@ -258,6 +264,7 @@ export function classifyPipelineResult(exitCode: number, stdoutContent: string):
     const status = statusMatch[1]
     if (status === 'success' || status === 'already_fixed' || status === 'i18n_manual_handoff') return 'success'
     if (status === 'needs_qa_clarification') return 'needs_qa_clarification'
+    if (status === 'analysis_done') return 'analysis_done'
     if (status === 'failed') return 'failed'
     return 'unknown_failure' // 抓到這一行但值不是已知的五種，視為未知
   }

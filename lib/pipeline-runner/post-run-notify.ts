@@ -53,8 +53,10 @@ const BUG_PIPELINE_CONCURRENCY_LIMIT = 5
 // 相容加 mode 之前就 spawn、還在跑的舊 wrapper。
 const RUN_CREATE_MR_PROC_RE = /^bash -c [\s\S]*\brun-create-mr\s+([A-Z]+-\d+)\s+(\S+?)(?:\s+(?:full|analysis|fix|reanalyze))?(?:\s+resume)?\s*$/
 
-// T13：create-mr.md 自己的出口表已經處理過這三種——不重複發：
-//   - success / needs_qa_clarification：Step 7b.1 / 7c 已發過 TG。
+// T13：create-mr.md 自己的出口表已經處理過這幾種——不重複發：
+//   - success / needs_qa_clarification / analysis_done（2026-09-08 新增，見
+//     pipeline-modes-project-docs/plan-pipeline-modes-v1.md §2.4）：
+//     Step 7b.1 / 7c 已發過 TG。
 //   - failed：Step 7c 已留 Notion「分析失敗」留言（2026-08-26 起 create-mr 的
 //     7c 還會自己發 TG 通知＋附 Drive 分析文件連結——dispatcher 這裡照舊不補
 //     發，否則同一張 failed 會收到兩則）
@@ -244,8 +246,9 @@ ${logLines}`
 ${logLines}`
 
     default:
-      // success/needs_qa_clarification/failed 這三類不會走到補發通知路徑
-      // （見上方 NEEDS_NOTIFY），這裡只是保底分支，理論上不會被呼叫到。
+      // success/needs_qa_clarification/analysis_done/failed 這四類不會走到
+      // 補發通知路徑（見上方 NEEDS_NOTIFY），這裡只是保底分支，理論上不會
+      // 被呼叫到。
       return `⚠️ [需人工檢查] ${ticket}
 /create-mr 背景流程異常結束（分類：${classification}），沒有進入正常的成功/失敗/待釐清出口，請人工檢查 log：
 ${logLines}`
