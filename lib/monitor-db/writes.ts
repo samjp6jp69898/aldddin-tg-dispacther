@@ -14,7 +14,15 @@ import type { Pool, ResultSetHeader, RowDataPacket } from 'mysql2/promise'
 import { MON_HOST } from './env.ts'
 import { isoToMysqlDatetime3OrNull as dt } from './mysql-datetime.ts'
 import { parseUpdateInfo } from './parse-update-info.ts'
-import type { CancelResolvedBy, GuardedReason, MonitorHeartbeatWriter, RunKind, WriteOutcome } from './types.ts'
+import type {
+  CancelResolvedBy,
+  GuardedReason,
+  MonitorHeartbeatWriter,
+  RunKind,
+  TicketStage,
+  TicketStageStatus,
+  WriteOutcome,
+} from './types.ts'
 
 // 呼叫端一律傳絕對 ISO 字串（§6.5(a) 硬規則）；`dt()` 在 SQL 邊界轉成 MySQL
 // DATETIME(3) 字面字串——本輪對真實 mon-mysql 實測（S7）證實 mysql2 即使搭配
@@ -691,6 +699,180 @@ export async function upsertAgentRun(pool: MonitorDbExecutor, input: UpsertAgent
   if (affected === 1) return { kind: 'inserted' }
   if (affected === 2) return { kind: 'applied' }
   return { kind: 'guarded', guardedReason: 'guarded_other' }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// ticket_stages（migration 005；PK=(ticket, stage)；形狀 B，finished_at 單調守衛）
+// ─────────────────────────────────────────────────────────────────────────
+//
+// 【為什麼這張表不是形狀 A 的 first-write-wins，也不套 runs 的 R1 host 守衛】
+// （pipeline-modes-project-docs/plan-pipeline-modes-v1.md §3 與本檔既有紀律的
+// 交會點，2026-09-08 Phase 3 決定，偏離已回報）：
+//
+//  1. 語意不同。`runs` 的一列由 `run_id` 唯一擁有，擁有者恆為單一 host，別台
+//     host 去寫就是錯（r1_violation）。`ticket_stages` 的一列由 `(ticket, stage)`
+//     擁有，記的是「這個 stage 最近一次完成狀態，以及**產物現在在哪台機器**」
+//     ——同一張票本來就會在 head 與各 worker 之間移動（§4.3 親和派工要靠
+//     `host` 找回產物）。若照搬 R1 的「既有列 host 必須等於 MON_HOST 才准寫」，
+//     第一台寫入的機器會把 `host` 永久凍住，之後真正持有產物的機器再也更新不
+//     了這一列，`host` 這個欄位就會說謊——那正是本表存在的唯一理由。
+//     因此：`host` **值**照 MJ-E1 一律取自 env.ts 的 MON_HOST（不接受呼叫端
+//     傳入，型別上就沒有這個參數），但**不**拿它當「准不准寫」的守衛。
+//  2. 覆寫語意需要，但仍必須順序無關。「最新一次完成狀態」不能用 COALESCE
+//     補空欄（那是 first-write-wins，第二次 run 的結果永遠寫不進去），但也不能
+//     退化成無守衛的 last-write-wins——spool 重放會把一條數小時前的舊條目
+//     在任意時刻送達（§6.5），無守衛就會把新結果回捲。守衛因此下在
+//     `finished_at` 的單調性上（`WHERE … AND (finished_at IS NULL OR
+//     finished_at <= ?)`）：比現值舊的快照一律擋下，順序無關、不需要靠等待或
+//     鎖（CLAUDE.md 硬規則：正確性由結構保證）。用 `<=` 而不是 `<` 是刻意的
+//     ——`fix` 模式續跑時沿用前一輪的產物檔，mtime 一模一樣，但 `host`/
+//     `run_id`/`mode` 必須更新成這一輪的值。
+//  3. 形狀 B（守衛式 UPDATE →（matched=0 才）INSERT →（ER_DUP_ENTRY 才）再
+//     UPDATE）是本檔既有的守衛式寫入形狀，直接沿用（比照 upsertFileOffset /
+//     upsertMonitorHeartbeat）；R4 合規：守衛全在 WHERE，SET 全是裸參數綁定。
+//
+// 冷路徑分類：這張表沒有 r1_violation 這個概念（host 不是守衛），matched=0 只
+// 可能是「現值比較新」（guarded_rank——單調守衛擋下，與 rank/ts/event_seq 三個
+// 既有單調守衛同一種）或其他（guarded_other）。
+
+export const TICKET_STAGE_UPDATE_SQL = `
+UPDATE ticket_stages
+   SET status = ?, host = ?, run_id = ?, mode = ?, finished_at = ?
+ WHERE ticket = ? AND stage = ? AND (finished_at IS NULL OR finished_at <= ?)
+`.trim()
+
+export const TICKET_STAGE_INSERT_SQL = `
+INSERT INTO ticket_stages (ticket, stage, status, host, run_id, mode, finished_at) VALUES (?, ?, ?, ?, ?, ?, ?)
+`.trim()
+
+export const TICKET_STAGE_COLD_PATH_SQL = 'SELECT host, finished_at FROM ticket_stages WHERE ticket = ? AND stage = ?'
+
+export interface UpsertTicketStageInput {
+  ticket: string
+  stage: TicketStage
+  status: TicketStageStatus
+  /** 這個 stage 產物的時間（檔案 mtime，或無檔可依時的 run 結束時刻）。
+   * **必填**：它同時是單調守衛值，NULL 會讓這一列從此再也更新不了。 */
+  finishedAt: string
+  /** 這次快照所屬的 run（spool 條目的 run_id 也用它）；未知時允許 null。 */
+  runId?: string | null
+  mode?: string | null
+}
+
+/**
+ * 寫一個 stage 的最近一次完成狀態。`host` 恆為 MON_HOST（【G:MJ-E1】，型別上
+ * 就不收呼叫端的 host）；比現值舊的快照被 `finished_at` 單調守衛擋下。
+ */
+export async function upsertTicketStage(pool: MonitorDbExecutor, input: UpsertTicketStageInput): Promise<WriteOutcome> {
+  const finishedAt = dt(input.finishedAt)
+  const updateParams = [input.status, MON_HOST, input.runId ?? null, input.mode ?? null, finishedAt, input.ticket, input.stage, finishedAt]
+  let r = await execUpdate(pool, TICKET_STAGE_UPDATE_SQL, updateParams)
+  if (r.matched > 0) return { kind: 'applied' }
+
+  try {
+    await pool.execute(TICKET_STAGE_INSERT_SQL, [
+      input.ticket,
+      input.stage,
+      input.status,
+      MON_HOST,
+      input.runId ?? null,
+      input.mode ?? null,
+      finishedAt,
+    ])
+    return { kind: 'inserted' }
+  } catch (err) {
+    if (!isDupEntry(err)) throw err
+    r = await execUpdate(pool, TICKET_STAGE_UPDATE_SQL, updateParams)
+    if (r.matched > 0) return { kind: 'applied' }
+  }
+  return classifyTicketStageColdPath(pool, input.ticket, input.stage, finishedAt)
+}
+
+async function classifyTicketStageColdPath(
+  pool: MonitorDbExecutor,
+  ticket: string,
+  stage: string,
+  attemptedFinishedAt: string | null,
+): Promise<WriteOutcome> {
+  const [rows] = await pool.execute<RowDataPacket[]>(TICKET_STAGE_COLD_PATH_SQL, [ticket, stage])
+  const row = (rows as RowDataPacket[])[0] as { host: string; finished_at: string | null } | undefined
+  if (!row) return { kind: 'guarded', guardedReason: 'guarded_other' }
+  if (attemptedFinishedAt !== null && row.finished_at !== null && String(row.finished_at) > attemptedFinishedAt) {
+    return { kind: 'guarded', guardedReason: 'guarded_rank' }
+  }
+  return { kind: 'guarded', guardedReason: 'guarded_other' }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// ticket_artifact_sync（migration 005；PK=ticket；head only；last_attempt_at 單調守衛）
+// ─────────────────────────────────────────────────────────────────────────
+//
+// 只有 head 寫（§4.1：job-done 之後對 worker rsync 拉產物，成功/失敗都記一列）。
+// `source_host` 是**遠端**執行機名，這是本檔唯一一個合法由呼叫端傳入的 host
+// 參數——MJ-E1 禁的是「呼叫端宣稱自己是誰」，這裡記的是「產物在誰那裡」，
+// 兩件事不同。
+//
+// 五個欄位全部裸參數賦值（呼叫端傳什麼就是什麼），刻意不做 COALESCE 保留：
+// 一次拉取失敗**就是**代表「head 目前沒有與該次 run 對應的完整副本」，
+// head_synced_at 應該回到 NULL 讓 sweeper 重試，保留舊值反而會讓 head 拿著
+// 過期副本當成同步完成。守衛同樣下在單調的 `last_attempt_at` 上（spool 重放
+// 的舊條目擋下），理由與 ticket_stages 相同。
+
+export const TICKET_ARTIFACT_SYNC_UPDATE_SQL = `
+UPDATE ticket_artifact_sync
+   SET source_host = ?, head_synced_at = ?, last_attempt_at = ?, last_error = ?, file_count = ?
+ WHERE ticket = ? AND (last_attempt_at IS NULL OR last_attempt_at <= ?)
+`.trim()
+
+export const TICKET_ARTIFACT_SYNC_INSERT_SQL = `
+INSERT INTO ticket_artifact_sync (ticket, source_host, head_synced_at, last_attempt_at, last_error, file_count) VALUES (?, ?, ?, ?, ?, ?)
+`.trim()
+
+export interface UpsertTicketArtifactSyncInput {
+  ticket: string
+  /** 產物所在的**遠端**執行機（worker 名/host），不是 head 自己。 */
+  sourceHost: string
+  /** 這次拉取嘗試的時刻。**必填**：同時是單調守衛值。 */
+  lastAttemptAt: string
+  /** 拉取成功才給值；失敗傳 null（＝head 沒有完整副本，交給 sweeper 重試）。 */
+  headSyncedAt?: string | null
+  /** 呼叫端應截斷至 255 字元（欄寬）；本函式仍防禦性截斷一次。 */
+  lastError?: string | null
+  fileCount?: number | null
+}
+
+/** head 專用：記錄一次產物拉取的結果。比現值舊的嘗試被 `last_attempt_at` 守衛擋下。 */
+export async function upsertTicketArtifactSync(pool: MonitorDbExecutor, input: UpsertTicketArtifactSyncInput): Promise<WriteOutcome> {
+  const lastAttemptAt = dt(input.lastAttemptAt)
+  const lastError = input.lastError == null ? null : input.lastError.slice(0, 255)
+  const updateParams = [
+    input.sourceHost,
+    dt(input.headSyncedAt),
+    lastAttemptAt,
+    lastError,
+    input.fileCount ?? null,
+    input.ticket,
+    lastAttemptAt,
+  ]
+  let r = await execUpdate(pool, TICKET_ARTIFACT_SYNC_UPDATE_SQL, updateParams)
+  if (r.matched > 0) return { kind: 'applied' }
+
+  try {
+    await pool.execute(TICKET_ARTIFACT_SYNC_INSERT_SQL, [
+      input.ticket,
+      input.sourceHost,
+      dt(input.headSyncedAt),
+      lastAttemptAt,
+      lastError,
+      input.fileCount ?? null,
+    ])
+    return { kind: 'inserted' }
+  } catch (err) {
+    if (!isDupEntry(err)) throw err
+    r = await execUpdate(pool, TICKET_ARTIFACT_SYNC_UPDATE_SQL, updateParams)
+    if (r.matched > 0) return { kind: 'applied' }
+  }
+  return { kind: 'guarded', guardedReason: 'guarded_rank' }
 }
 
 // ─────────────────────────────────────────────────────────────────────────

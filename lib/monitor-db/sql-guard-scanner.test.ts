@@ -20,6 +20,9 @@ describe('sql-guard-scanner：規則 1/2 對 writes.ts 全部 UPDATE 常數', ()
     ['HEARTBEAT_UPDATE_SQL', W.HEARTBEAT_UPDATE_SQL],
     ['FILE_OFFSET_UPDATE_SQL', W.FILE_OFFSET_UPDATE_SQL],
     ['DISPATCH_ATTEMPT_ADVANCE_SQL', W.DISPATCH_ATTEMPT_ADVANCE_SQL],
+    // migration 005（pipeline-modes Phase 3）
+    ['TICKET_STAGE_UPDATE_SQL', W.TICKET_STAGE_UPDATE_SQL],
+    ['TICKET_ARTIFACT_SYNC_UPDATE_SQL', W.TICKET_ARTIFACT_SYNC_UPDATE_SQL],
   ]
 
   for (const [name, sql] of updates) {
@@ -55,6 +58,15 @@ describe('sql-guard-scanner：規則 3（守衛只能在 WHERE）', () => {
   })
   test('heartbeat 的 ts 守衛只出現在 WHERE', () => {
     expect(assertGuardOnlyInWhere(W.HEARTBEAT_UPDATE_SQL, ['ts'])).toEqual([])
+  })
+  // migration 005：ticket_stages / ticket_artifact_sync 的單調守衛（見 writes.ts
+  // 對應段落：這兩張表是「最近一次為準」覆寫語意，正確性靠 finished_at /
+  // last_attempt_at 的單調性，守衛必須在 WHERE，不得混進 SET）。
+  test('ticket_stages 的 finished_at 守衛只出現在 WHERE', () => {
+    expect(assertGuardOnlyInWhere(W.TICKET_STAGE_UPDATE_SQL, ['finished_at'])).toEqual([])
+  })
+  test('ticket_artifact_sync 的 last_attempt_at 守衛只出現在 WHERE', () => {
+    expect(assertGuardOnlyInWhere(W.TICKET_ARTIFACT_SYNC_UPDATE_SQL, ['last_attempt_at'])).toEqual([])
   })
 })
 

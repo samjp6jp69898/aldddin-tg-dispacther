@@ -26,6 +26,8 @@ import {
   upsertAgentRun,
   upsertFileOffset,
   upsertMonitorHeartbeat,
+  upsertTicketArtifactSync,
+  upsertTicketStage,
   writeCancelFlag,
   writeRunOutcomeAuthoritative,
   writeRunOutcomeProvisional,
@@ -91,6 +93,16 @@ export async function applyEntry(pool: MonitorDbExecutor, entry: ApplyEntryLike)
         return { ok: true }
       case 'upsertAgentRun':
         await upsertAgentRun(pool, input as Parameters<typeof upsertAgentRun>[1])
+        return { ok: true }
+      // migration 005（pipeline-modes Phase 3）。兩者的列身分是 ticket（不是
+      // run_id），因此**不**進 writer.ts 的 RUN_SCOPED_SPOOL_FNS；重放冪等性由
+      // 各自的單調守衛（finished_at / last_attempt_at）保證，重放任意次數、
+      // 任意順序都不會把新結果回捲。
+      case 'upsertTicketStage':
+        await upsertTicketStage(pool, input as Parameters<typeof upsertTicketStage>[1])
+        return { ok: true }
+      case 'upsertTicketArtifactSync':
+        await upsertTicketArtifactSync(pool, input as Parameters<typeof upsertTicketArtifactSync>[1])
         return { ok: true }
       case 'insertMcpUsage':
         await insertMcpUsage(pool, input as Parameters<typeof insertMcpUsage>[1])

@@ -18,6 +18,13 @@ import {
   DISPATCH_ATTEMPT_ADVANCE_SQL,
   DISPATCH_ATTEMPT_INSERT_SQL,
   fixCancelLateOutcome,
+  TICKET_ARTIFACT_SYNC_INSERT_SQL,
+  TICKET_ARTIFACT_SYNC_UPDATE_SQL,
+  TICKET_STAGE_COLD_PATH_SQL,
+  TICKET_STAGE_INSERT_SQL,
+  TICKET_STAGE_UPDATE_SQL,
+  upsertTicketArtifactSync,
+  upsertTicketStage,
   writeCancelFlag,
   writeRunOutcomeAuthoritative,
   writeRunOutcomeProvisional,
@@ -507,5 +514,280 @@ describe('advanceDispatchAttempt — worker_name/worker_url（整合修補：2C 
     for (const col of ['confirmed_at', 'cleared_at', 'clear_reason', 'remote_run_id', 'worker_name', 'worker_url']) {
       expect(DISPATCH_ATTEMPT_ADVANCE_SQL).toContain(`${col} = COALESCE(${col}, ?)`)
     }
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────
+// ticket_stages / ticket_artifact_sync（migration 005，pipeline-modes Phase 3）
+// ─────────────────────────────────────────────────────────────────────────
+//
+// 這兩張表刻意**不是** first-write-wins（理由見 writes.ts 對應段落的長註解：
+// 語意是「最近一次完成狀態 ＋ 產物現在在哪台機器」，COALESCE 補空欄會讓第二次
+// run 永遠寫不進去）。以下測試釘住取而代之的那道防線：單調守衛。
+
+interface FakeTicketStageRow {
+  ticket: string
+  stage: string
+  status: string
+  host: string
+  run_id: string | null
+  mode: string | null
+  finished_at: string | null
+}
+
+class FakeTicketStagesDb implements MonitorDbExecutor {
+  rows = new Map<string, FakeTicketStageRow>()
+  calls: Array<{ sql: string; params: unknown[] }> = []
+
+  async execute<T = ResultSetHeader>(sql: string, params: unknown[] = []): Promise<[T, unknown]> {
+    this.calls.push({ sql, params })
+    if (sql === TICKET_STAGE_UPDATE_SQL) {
+      const [status, host, runId, mode, finishedAt, ticket, stage, guard] = params as Array<string | null>
+      const row = this.rows.get(`${ticket} ${stage}`)
+      // 與 SQL 逐條對照：WHERE ticket=? AND stage=? AND (finished_at IS NULL OR finished_at <= ?)
+      if (!row || !(row.finished_at === null || (guard !== null && row.finished_at <= guard))) {
+        return [{ info: 'Rows matched: 0  Changed: 0  Warnings: 0' } as unknown as T, []]
+      }
+      row.status = status as string
+      row.host = host as string
+      row.run_id = runId
+      row.mode = mode
+      row.finished_at = finishedAt
+      return [{ info: 'Rows matched: 1  Changed: 1  Warnings: 0' } as unknown as T, []]
+    }
+    if (sql === TICKET_STAGE_INSERT_SQL) {
+      const [ticket, stage, status, host, runId, mode, finishedAt] = params as Array<string | null>
+      const key = `${ticket} ${stage}`
+      if (this.rows.has(key)) {
+        const err = new Error('dup') as Error & { code: string }
+        err.code = 'ER_DUP_ENTRY'
+        throw err
+      }
+      this.rows.set(key, {
+        ticket: ticket as string,
+        stage: stage as string,
+        status: status as string,
+        host: host as string,
+        run_id: runId,
+        mode,
+        finished_at: finishedAt,
+      })
+      return [{ affectedRows: 1 } as unknown as T, []]
+    }
+    if (sql === TICKET_STAGE_COLD_PATH_SQL) {
+      const [ticket, stage] = params as string[]
+      const row = this.rows.get(`${ticket} ${stage}`)
+      return [(row ? [{ host: row.host, finished_at: row.finished_at }] : []) as unknown as T, []]
+    }
+    throw new Error(`FakeTicketStagesDb: 未預期的 SQL：${sql}`)
+  }
+}
+
+describe('upsertTicketStage（ticket_stages，finished_at 單調守衛）', () => {
+  const base = { ticket: 'FAQ-1', stage: 'analysis-notes' as const, status: 'done' as const }
+
+  test('第一次寫入 → inserted，host 恆為 MON_HOST（呼叫端無從指定）', async () => {
+    const db = new FakeTicketStagesDb()
+    const r = await upsertTicketStage(db, { ...base, finishedAt: '2026-09-08T01:00:00.000Z', runId: 'run-1', mode: 'analysis' })
+    expect(r.kind).toBe('inserted')
+    const row = db.rows.get('FAQ-1 analysis-notes')!
+    expect(row.host).toBe(MON_HOST)
+    expect(row.run_id).toBe('run-1')
+    expect(row.mode).toBe('analysis')
+    expect(row.finished_at).toBe('2026-09-08 01:00:00.000')
+  })
+
+  test('較新的快照 → applied，覆寫 status/run_id/mode（不是 COALESCE 補空欄）', async () => {
+    const db = new FakeTicketStagesDb()
+    await upsertTicketStage(db, { ...base, finishedAt: '2026-09-08T01:00:00.000Z', runId: 'run-1', mode: 'analysis' })
+    const r = await upsertTicketStage(db, {
+      ...base,
+      status: 'failed',
+      finishedAt: '2026-09-08T02:00:00.000Z',
+      runId: 'run-2',
+      mode: 'fix',
+    })
+    expect(r.kind).toBe('applied')
+    const row = db.rows.get('FAQ-1 analysis-notes')!
+    expect(row.status).toBe('failed')
+    expect(row.run_id).toBe('run-2')
+    expect(row.mode).toBe('fix')
+  })
+
+  test('finished_at 相同（fix 續跑沿用同一份產物檔）→ 仍寫入，run_id/mode 更新成這一輪', async () => {
+    const db = new FakeTicketStagesDb()
+    await upsertTicketStage(db, { ...base, finishedAt: '2026-09-08T01:00:00.000Z', runId: 'run-1', mode: 'analysis' })
+    const r = await upsertTicketStage(db, { ...base, finishedAt: '2026-09-08T01:00:00.000Z', runId: 'run-2', mode: 'fix' })
+    expect(r.kind).toBe('applied')
+    expect(db.rows.get('FAQ-1 analysis-notes')!.run_id).toBe('run-2')
+  })
+
+  test('較舊的快照（spool 重放遲到）→ guarded_rank，不回捲', async () => {
+    const db = new FakeTicketStagesDb()
+    await upsertTicketStage(db, { ...base, finishedAt: '2026-09-08T02:00:00.000Z', runId: 'run-2', mode: 'fix' })
+    const r = await upsertTicketStage(db, { ...base, finishedAt: '2026-09-08T01:00:00.000Z', runId: 'run-1', mode: 'analysis' })
+    expect(r.kind).toBe('guarded')
+    expect(r.guardedReason).toBe('guarded_rank')
+    const row = db.rows.get('FAQ-1 analysis-notes')!
+    expect(row.run_id).toBe('run-2')
+    expect(row.mode).toBe('fix')
+  })
+
+  test('同一條重放三次 → 值不變（冪等）', async () => {
+    const db = new FakeTicketStagesDb()
+    const input = { ...base, finishedAt: '2026-09-08T01:00:00.000Z', runId: 'run-1', mode: 'analysis' }
+    await upsertTicketStage(db, input)
+    await upsertTicketStage(db, input)
+    await upsertTicketStage(db, input)
+    expect(db.rows.get('FAQ-1 analysis-notes')).toEqual({
+      ticket: 'FAQ-1',
+      stage: 'analysis-notes',
+      status: 'done',
+      host: MON_HOST,
+      run_id: 'run-1',
+      mode: 'analysis',
+      finished_at: '2026-09-08 01:00:00.000',
+    })
+  })
+
+  test('既有列 + 較新快照 → 第一次 UPDATE 就命中，不多跑 INSERT／冷路徑', async () => {
+    const db = new FakeTicketStagesDb()
+    await upsertTicketStage(db, { ...base, finishedAt: '2026-09-08T01:00:00.000Z' })
+    const before = db.calls.length
+    const r = await upsertTicketStage(db, { ...base, finishedAt: '2026-09-08T03:00:00.000Z' })
+    expect(r.kind).toBe('applied')
+    expect(db.calls.length - before).toBe(1)
+    expect(db.calls[db.calls.length - 1]!.sql).toBe(TICKET_STAGE_UPDATE_SQL)
+  })
+
+  test('SQL 文字釘：守衛在 WHERE、SET 全是裸參數（R4：守衛不得放在 SET）', () => {
+    expect(TICKET_STAGE_UPDATE_SQL).toContain('WHERE ticket = ? AND stage = ? AND (finished_at IS NULL OR finished_at <= ?)')
+    expect(TICKET_STAGE_UPDATE_SQL).toContain('SET status = ?, host = ?, run_id = ?, mode = ?, finished_at = ?')
+  })
+})
+
+interface FakeArtifactSyncRow {
+  ticket: string
+  source_host: string
+  head_synced_at: string | null
+  last_attempt_at: string | null
+  last_error: string | null
+  file_count: number | null
+}
+
+class FakeArtifactSyncDb implements MonitorDbExecutor {
+  rows = new Map<string, FakeArtifactSyncRow>()
+
+  async execute<T = ResultSetHeader>(sql: string, params: unknown[] = []): Promise<[T, unknown]> {
+    if (sql === TICKET_ARTIFACT_SYNC_UPDATE_SQL) {
+      const [sourceHost, headSyncedAt, lastAttemptAt, lastError, fileCount, ticket, guard] = params as [
+        string,
+        string | null,
+        string | null,
+        string | null,
+        number | null,
+        string,
+        string | null,
+      ]
+      const row = this.rows.get(ticket)
+      if (!row || !(row.last_attempt_at === null || (guard !== null && row.last_attempt_at <= guard))) {
+        return [{ info: 'Rows matched: 0  Changed: 0  Warnings: 0' } as unknown as T, []]
+      }
+      row.source_host = sourceHost
+      row.head_synced_at = headSyncedAt
+      row.last_attempt_at = lastAttemptAt
+      row.last_error = lastError
+      row.file_count = fileCount
+      return [{ info: 'Rows matched: 1  Changed: 1  Warnings: 0' } as unknown as T, []]
+    }
+    if (sql === TICKET_ARTIFACT_SYNC_INSERT_SQL) {
+      const [ticket, sourceHost, headSyncedAt, lastAttemptAt, lastError, fileCount] = params as [
+        string,
+        string,
+        string | null,
+        string | null,
+        string | null,
+        number | null,
+      ]
+      if (this.rows.has(ticket)) {
+        const err = new Error('dup') as Error & { code: string }
+        err.code = 'ER_DUP_ENTRY'
+        throw err
+      }
+      this.rows.set(ticket, {
+        ticket,
+        source_host: sourceHost,
+        head_synced_at: headSyncedAt,
+        last_attempt_at: lastAttemptAt,
+        last_error: lastError,
+        file_count: fileCount,
+      })
+      return [{ affectedRows: 1 } as unknown as T, []]
+    }
+    throw new Error(`FakeArtifactSyncDb: 未預期的 SQL：${sql}`)
+  }
+}
+
+describe('upsertTicketArtifactSync（ticket_artifact_sync，head only）', () => {
+  test('第一次拉取成功 → inserted，source_host 是遠端 worker（不是 MON_HOST）', async () => {
+    const db = new FakeArtifactSyncDb()
+    const r = await upsertTicketArtifactSync(db, {
+      ticket: 'FAQ-1',
+      sourceHost: 'landon2',
+      lastAttemptAt: '2026-09-08T01:00:00.000Z',
+      headSyncedAt: '2026-09-08T01:00:01.000Z',
+      fileCount: 9,
+    })
+    expect(r.kind).toBe('inserted')
+    const row = db.rows.get('FAQ-1')!
+    expect(row.source_host).toBe('landon2')
+    expect(row.head_synced_at).toBe('2026-09-08 01:00:01.000')
+    expect(row.file_count).toBe(9)
+  })
+
+  test('後續拉取失敗 → head_synced_at 回到 NULL（head 沒有與新 run 對應的完整副本）', async () => {
+    const db = new FakeArtifactSyncDb()
+    await upsertTicketArtifactSync(db, {
+      ticket: 'FAQ-1',
+      sourceHost: 'landon2',
+      lastAttemptAt: '2026-09-08T01:00:00.000Z',
+      headSyncedAt: '2026-09-08T01:00:01.000Z',
+      fileCount: 9,
+    })
+    const r = await upsertTicketArtifactSync(db, {
+      ticket: 'FAQ-1',
+      sourceHost: 'landon2',
+      lastAttemptAt: '2026-09-08T02:00:00.000Z',
+      headSyncedAt: null,
+      lastError: 'ssh: connect to host landon2 port 22: Operation timed out',
+    })
+    expect(r.kind).toBe('applied')
+    const row = db.rows.get('FAQ-1')!
+    expect(row.head_synced_at).toBeNull()
+    expect(row.last_error).toContain('Operation timed out')
+  })
+
+  test('較舊的嘗試（spool 重放）→ guarded_rank，不回捲', async () => {
+    const db = new FakeArtifactSyncDb()
+    await upsertTicketArtifactSync(db, { ticket: 'FAQ-1', sourceHost: 'landon2', lastAttemptAt: '2026-09-08T02:00:00.000Z' })
+    const r = await upsertTicketArtifactSync(db, {
+      ticket: 'FAQ-1',
+      sourceHost: 'landon3',
+      lastAttemptAt: '2026-09-08T01:00:00.000Z',
+    })
+    expect(r.kind).toBe('guarded')
+    expect(r.guardedReason).toBe('guarded_rank')
+    expect(db.rows.get('FAQ-1')!.source_host).toBe('landon2')
+  })
+
+  test('last_error 超過欄寬 255 → 防禦性截斷', async () => {
+    const db = new FakeArtifactSyncDb()
+    await upsertTicketArtifactSync(db, {
+      ticket: 'FAQ-1',
+      sourceHost: 'landon2',
+      lastAttemptAt: '2026-09-08T01:00:00.000Z',
+      lastError: 'x'.repeat(400),
+    })
+    expect(db.rows.get('FAQ-1')!.last_error!.length).toBe(255)
   })
 })

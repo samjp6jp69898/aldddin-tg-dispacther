@@ -100,6 +100,9 @@ GRANT SELECT ON pipeline_monitor.service_status_log TO 'mon_ui'@'%';
 GRANT SELECT ON pipeline_monitor.tg_webhook_status_log TO 'mon_ui'@'%';
 GRANT SELECT ON pipeline_monitor.mcp_usage TO 'mon_ui'@'%';
 GRANT SELECT ON pipeline_monitor.monitor_heartbeat TO 'mon_ui'@'%';
+-- migration 005（pipeline-modes Phase 3）：mon_ui 對兩張新表唯讀（面板顯示各票階段/產物所在機）。
+GRANT SELECT ON pipeline_monitor.ticket_stages TO 'mon_ui'@'%';
+GRANT SELECT ON pipeline_monitor.ticket_artifact_sync TO 'mon_ui'@'%';
 GRANT INSERT (run_id, host, ticket, kind, lifecycle_rank, cancel_requested_at, cancel_resolved_by, legacy_key, created_at, review_rounds, final_review_rounds) ON pipeline_monitor.runs TO 'mon_ui'@'%';
 GRANT UPDATE (cancel_requested_at, cancel_resolved_by, outcome, outcome_source, review_rounds, final_review_rounds) ON pipeline_monitor.runs TO 'mon_ui'@'%';
 
@@ -109,6 +112,10 @@ GRANT SELECT, INSERT, UPDATE ON pipeline_monitor.agent_runs TO 'mon_exec'@'%';
 GRANT SELECT, INSERT, UPDATE ON pipeline_monitor.file_offsets TO 'mon_exec'@'%';
 GRANT SELECT, INSERT, UPDATE ON pipeline_monitor.monitor_heartbeat TO 'mon_exec'@'%';
 GRANT SELECT, INSERT, UPDATE ON pipeline_monitor.worker_status_log TO 'mon_exec'@'%';
+-- migration 005（pipeline-modes Phase 3）：worker 在 run 結束時寫自己的 stage 快照；
+-- ticket_artifact_sync 只有 head 寫，worker 唯讀（Phase 4 的產物存在性檢查會查它）。
+GRANT SELECT, INSERT, UPDATE ON pipeline_monitor.ticket_stages TO 'mon_exec'@'%';
+GRANT SELECT ON pipeline_monitor.ticket_artifact_sync TO 'mon_exec'@'%';
 
 FLUSH PRIVILEGES;
 SQL

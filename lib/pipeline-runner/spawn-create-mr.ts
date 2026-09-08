@@ -11,6 +11,7 @@ import { writeRunProgress, writeRunOutcomeAuthoritative, type MonitorDbExecutor 
 import type { RunKind } from '../monitor-db/types.ts'
 import { dispatchMonitorWrite } from '../monitor-db/runtime.ts'
 import { BUG_MODES, coerceBugMode, isBugMode, type BugMode } from './bug-mode.ts'
+import { snapshotTicketStages } from './stage-snapshot.ts'
 
 // ─────────────────────────────────────────────────────────────────────────
 // 監控 DB 化（plan-db-as-truth-v3.2.md §9 Phase2；Bug pipeline 生命週期寫入
@@ -408,6 +409,13 @@ function spawnCreateMrNow(entry: QueueEntry<BugPayload>, onExit: () => void): { 
       // ticket，遞補的新 run 會先 markPipelineActive，後執行的 clear 會把
       // 新標記誤刪，讓新 run 脫離 stale-lock-reaper 保護。
       onExit: () => {
+        // 【pipeline-modes Phase 3】run 結束時把各 stage 的完成狀態與「產物在
+        // 這台機器上」寫進 ticket_stages（§3：確定性寫入，不靠 manager LLM 記得
+        // 呼叫）。runId/mode 直接取自本 closure，不去讀 marker——順序上更穩
+        // （clearPipelineActive 之後 marker 就沒了），值也更權威。非阻斷、
+        // 自己吞例外、MON_DB_ENABLED 關閉時整支 no-op，故意不 await：
+        // clearPipelineActive → onExit 的既有順序硬約束（見下）一個字不動。
+        void snapshotTicketStages(ticket, { runId, mode })
         clearPipelineActive(ticket)
         onExit()
       },

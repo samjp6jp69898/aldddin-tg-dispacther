@@ -90,6 +90,34 @@ export interface WriteOutcome {
   supersededProvisional?: boolean
 }
 
+/**
+ * `ticket_stages.stage` 值域（migration 005，pipeline-modes Phase 3）。
+ * 前七個對應 `lib/pipeline-runner/local-stage-files.ts` 的產物檔（review 由三份
+ * reviewer 報告合併成一個 stage），`worktree`/`fixer` 由 `mr/<ticket>` 分支上的
+ * commit 數判定，`exit` 由呼叫端傳入的 run outcome 決定。
+ */
+export const TICKET_STAGES = [
+  'analytics',
+  'spec',
+  'grounding',
+  'analysis-notes',
+  'worktree',
+  'fixer',
+  'review',
+  'final-review',
+  'solution',
+  'exit',
+] as const
+export type TicketStage = (typeof TICKET_STAGES)[number]
+
+/**
+ * `ticket_stages.status` 值域。刻意**沒有** `pending`/`missing`：沒有證據的
+ * stage 一律不寫列（「查無此列」就是「沒做到」），只有真的到達終點的 stage 才
+ * 進表。`skipped` 保留給「這個模式結構上不會做這一步」（例如 analysis 模式的
+ * worktree/fixer/review/final-review），與「跑到一半死掉所以沒有」區分得開。
+ */
+export type TicketStageStatus = 'done' | 'failed' | 'skipped'
+
 /** `runs.cancel_resolved_by` 值域（【G:MJ-G3】新增的稽核欄）。 */
 export type CancelResolvedBy = 'pid_match' | 'marker' | 'legacy_key' | 'latest_running' | 'placeholder'
 
