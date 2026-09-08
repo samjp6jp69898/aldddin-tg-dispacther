@@ -392,8 +392,8 @@ head 端比對是否等於 `origin/main`。
      模式來自該單 Notion「AI分析」的值（2026-09-08 起，對照表見
      `lib/notion-integration/candidate-tickets.ts` 的 `AI_ANALYSIS_TO_MODE`，
      設計見 `pipeline-modes-project-docs/plan-pipeline-modes-v1.md` §2）：
-     『一鍵分析＋修復＋開 MR』（舊名『待分析』）／『全部重跑』（舊名『需要
-     重跑』）／『只做問題分析（不改程式）』／『產出修復程式碼並開 MR』／
+     『一鍵分析＋修復＋開 MR』／『全部重跑』／『只做問題分析（不改程式）』
+     ／『產出修復程式碼並開 MR』／
      『依補充留言重新分析（仍不改程式）』。認領當下會重查 Notion 取**當時**
      的值決定模式，畫面舊了不會跑錯。
    - `/req` → 依 Notion『總需求池資料庫』列出你名下的候選需求單按鈕（T31/T32：

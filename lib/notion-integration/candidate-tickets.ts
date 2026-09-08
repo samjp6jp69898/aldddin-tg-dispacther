@@ -24,14 +24,10 @@ export const WANTED_STATUSES = ['仍有問題', '待處理']
 // 出現在這張表的值才算候選；其餘（空值、待規劃/待釐清/分析中/分析成功/
 // 分析失敗/不需分析/問題分析完成，待確認）一律不出現在候選清單。
 //
-// 『待分析』『需要重跑』是**舊名**：Phase 2 會在 Notion 把它們改名為『一鍵分析
-// ＋修復＋開 MR』『全部重跑』（option id 不變、歷史票自動跟著改）。改名前後這
-// 兩組字串都要能認，避免候選清單空窗；Notion 改名確認後再把舊名拿掉。
+// Notion 已於 2026-09-08 完成改名（舊名『待分析』『需要重跑』已不存在）。
 // ⚠ 需求池（demand-pool-tickets.ts）是另一顆 DB，它的『待分析』『需要重跑』
 // 不在本次改名範圍，不要動。
 export const AI_ANALYSIS_TO_MODE: Readonly<Record<string, BugMode>> = Object.freeze({
-  待分析: 'full',
-  需要重跑: 'full',
   '一鍵分析＋修復＋開 MR': 'full',
   全部重跑: 'full',
   '只做問題分析（不改程式）': 'analysis',
@@ -46,11 +42,16 @@ export const AI_ANALYSIS_TO_MODE: Readonly<Record<string, BugMode>> = Object.fre
 // 「當前指派 + 狀態」，AI分析 改由 candidatesFromResults 用上面的對照表在程式
 // 端過濾（每人名下 仍有問題/待處理 的票數量有限，多拉幾列成本可忽略）。
 //
-// WANTED_AI_ANALYSIS 保留給仍用 API filter 的消費端（lib/ops-ui/notion-tickets.ts
-// 的 buildBugFilter 直接 import）：這個清單**只能放 Notion 當下真的存在的
-// option 名稱**，Phase 2 在 Notion 新增/改名選項時要同一批更新，否則該消費端
-// 的查詢會 400。它是對照表 key 的子集，不是等價物。
-export const WANTED_AI_ANALYSIS: readonly string[] = ['待分析', '需要重跑']
+// Notion 已於 2026-09-08 完成改名；本清單＝Notion 現存五個可認領選項，供
+// ops-ui/notion-tickets.ts 的 API filter 使用，Notion 選項再變動時必須同批
+// 更新（API 對不存在的名稱回 400）。
+export const WANTED_AI_ANALYSIS: readonly string[] = [
+  '一鍵分析＋修復＋開 MR',
+  '全部重跑',
+  '只做問題分析（不改程式）',
+  '產出修復程式碼並開 MR',
+  '依補充留言重新分析（仍不改程式）',
+]
 
 export type CandidateTicket = { ticket: string; aiAnalysis: string; mode: BugMode }
 

@@ -91,7 +91,7 @@
   const outcomeChip = o => {
     if (!o) return '<span class="chip">—</span>'
     const good = ['success','already_fixed','recovered','already_satisfied']
-    const soft = ['needs_qa_clarification','needs_clarification','i18n','insufficient_spec','skipped','skipped_locked','skipped_expired','dispatched_to_worker','cancelled']
+    const soft = ['needs_qa_clarification','needs_clarification','i18n','insufficient_spec','skipped','skipped_locked','skipped_expired','dispatched_to_worker','cancelled','analysis_done']
     const cls = good.includes(o) ? 'ok' : soft.includes(o) ? 'warn' : 'bad'
     return `<span class="chip ${cls}">${esc(o)}</span>`
   }

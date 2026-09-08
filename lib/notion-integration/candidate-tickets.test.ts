@@ -22,15 +22,15 @@ describe('AI_ANALYSIS_TO_MODE / buildFilter（plan-pipeline-modes-v1 §2.1）', 
     expect(JSON.stringify(f)).not.toContain('AI分析')
   })
 
-  test('對照表涵蓋新舊七個值（Notion 改名前後皆可認）', () => {
-    for (const v of ['待分析', '需要重跑', '一鍵分析＋修復＋開 MR', '全部重跑', '只做問題分析（不改程式）', '產出修復程式碼並開 MR', '依補充留言重新分析（仍不改程式）']) {
+  test('對照表涵蓋 Notion 現存五個可認領值', () => {
+    for (const v of ['一鍵分析＋修復＋開 MR', '全部重跑', '只做問題分析（不改程式）', '產出修復程式碼並開 MR', '依補充留言重新分析（仍不改程式）']) {
       expect(AI_ANALYSIS_TO_MODE[v]).toBeDefined()
     }
   })
 
   test('WANTED_AI_ANALYSIS（給仍用 API filter 的 ops-ui）是對照表 key 的子集，且只含 Notion 當下存在的選項', () => {
     for (const v of WANTED_AI_ANALYSIS) expect(AI_ANALYSIS_TO_MODE[v]).toBeDefined()
-    expect([...WANTED_AI_ANALYSIS]).toEqual(['待分析', '需要重跑'])
+    expect([...WANTED_AI_ANALYSIS]).toEqual(['一鍵分析＋修復＋開 MR', '全部重跑', '只做問題分析（不改程式）', '產出修復程式碼並開 MR', '依補充留言重新分析（仍不改程式）'])
   })
 
   test('pipeline 自己設的終態值不在候選集合（問題分析完成，待確認 / 分析成功 / 待釐清 / 分析失敗）', () => {
@@ -39,26 +39,29 @@ describe('AI_ANALYSIS_TO_MODE / buildFilter（plan-pipeline-modes-v1 §2.1）', 
     }
   })
 
-  test('舊名與新名對到同一個 mode：待分析/一鍵 → full；需要重跑/全部重跑 → full', () => {
-    expect(AI_ANALYSIS_TO_MODE['待分析']).toBe('full')
+  test('舊名（待分析／需要重跑）已改名，不在對照表', () => {
+    expect(AI_ANALYSIS_TO_MODE['待分析']).toBeUndefined()
+    expect(AI_ANALYSIS_TO_MODE['需要重跑']).toBeUndefined()
+  })
+
+  test('新名對到正確的 mode：一鍵分析＋修復＋開 MR / 全部重跑 → full', () => {
     expect(AI_ANALYSIS_TO_MODE['一鍵分析＋修復＋開 MR']).toBe('full')
-    expect(AI_ANALYSIS_TO_MODE['需要重跑']).toBe('full')
     expect(AI_ANALYSIS_TO_MODE['全部重跑']).toBe('full')
   })
 })
 
 describe('candidatesFromResults', () => {
   test('每張單帶 ticket / aiAnalysis / mode', () => {
-    const out = candidatesFromResults([page(4616, '只做問題分析（不改程式）'), page(12, '待分析'), page(7, '產出修復程式碼並開 MR')])
+    const out = candidatesFromResults([page(4616, '只做問題分析（不改程式）'), page(12, '一鍵分析＋修復＋開 MR'), page(7, '產出修復程式碼並開 MR')])
     expect(out).toEqual([
       { ticket: 'FAQ-4616', aiAnalysis: '只做問題分析（不改程式）', mode: 'analysis' },
-      { ticket: 'FAQ-12', aiAnalysis: '待分析', mode: 'full' },
+      { ticket: 'FAQ-12', aiAnalysis: '一鍵分析＋修復＋開 MR', mode: 'full' },
       { ticket: 'FAQ-7', aiAnalysis: '產出修復程式碼並開 MR', mode: 'fix' },
     ])
   })
 
   test('單號缺、AI分析 空、或值不在對照表 → 略過（AI分析 的過濾就在這裡，API filter 不管它）', () => {
-    const out = candidatesFromResults([page(undefined, '待分析'), page(1, undefined), page(2, '分析成功'), page(3, '全部重跑')])
+    const out = candidatesFromResults([page(undefined, '一鍵分析＋修復＋開 MR'), page(1, undefined), page(2, '分析成功'), page(3, '全部重跑')])
     expect(out).toEqual([{ ticket: 'FAQ-3', aiAnalysis: '全部重跑', mode: 'full' }])
   })
 })
