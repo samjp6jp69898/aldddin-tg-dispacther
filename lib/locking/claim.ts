@@ -53,6 +53,11 @@ export type ClaimCode =
   | 'notion_update_failed'
   | 'spawn_error'
   | 'remote_started'
+  /** 既有分析產物所在機器離線/不在名冊（plan-pipeline-modes-v1 §4.3 A2）：
+   * 票維持可認領，機器回來再點一次即可，**不會**自動從頭重跑。 */
+  | 'artifact_host_offline'
+  /** 同上但該機滿載（它自己的併發上限拒單）：稍後再點一次。 */
+  | 'artifact_host_full'
   | 'already_running'
   | 'queued'
   | 'already_queued'
@@ -125,8 +130,25 @@ export async function claimBugTicket(techUser: TechUser, ticket: string): Promis
     return { code: 'spawn_error', text: `${ticket} 目前無法啟動：背景流程啟動失敗，請稍後再試或聯絡維運人員檢查 spawn-errors.log。` }
   }
 
+  // 產物親和派工的兩種「這次不受理」（plan-pipeline-modes-v1 §4.3 A2）：既有
+  // 分析產物只在某一台機器上，該機此刻接不了手。**不改派別台**（那等於從頭
+  // 重跑）、不排隊、不留派工登記——票維持可認領，請同事稍後再點一次。
+  if (result.status === 'artifact_host_offline') {
+    return {
+      code: 'artifact_host_offline',
+      text: `${ticket} 的既有分析產物在 ${result.worker}，該機目前離線；票仍可認領，機器恢復後再點一次即可（不會自動從頭重跑）`,
+    }
+  }
+  if (result.status === 'artifact_host_full') {
+    return { code: 'artifact_host_full', text: `${ticket} 的既有分析產物在 ${result.worker}，該機目前滿載，請稍後再點一次` }
+  }
+
+  // §4.3 A2 第一條：需要既有產物的模式（fix/reanalyze）但哪裡都找不到 → 已經
+  // 退回從頭分析，這件事必須讓認領人知道（否則他會以為是接續上一輪）。
+  const noPriorNote = (result as { note?: string }).note === 'no_prior_artifacts' ? '（找不到既有分析產物，將從頭分析）' : ''
+
   if (result.status === 'remote_started') {
-    return { code: 'remote_started', text: `已開始處理 ${ticket}${modeNote}（派工至另一台機器執行，完成後會自動通知你）` }
+    return { code: 'remote_started', text: `已開始處理 ${ticket}${modeNote}（派工至另一台機器執行，完成後會自動通知你）${noPriorNote}` }
   }
   if (result.status === 'already_running_remote') {
     return { code: 'already_running_remote', text: `${ticket} 已在另一台機器執行中，不需要重複認領，完成後會自動通知。` }
@@ -151,7 +173,7 @@ export async function claimBugTicket(techUser: TechUser, ticket: string): Promis
     return { code: 'already_queued', text: `${ticket} 已在等待佇列中（第 ${result.position} 順位，前面還有 ${result.ahead} 張），輪到時會自動開始，不需要重複認領。` }
   }
 
-  return { code: 'started', text: `已開始處理 ${ticket}${modeNote}` }
+  return { code: 'started', text: `已開始處理 ${ticket}${modeNote}${noPriorNote}` }
 }
 
 /**

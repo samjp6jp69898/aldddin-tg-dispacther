@@ -31,6 +31,15 @@ function makeHarness(opts: {
   postResults?: Record<string, PostJobResult>
   localBugStats?: QueueStats
   localHas?: 'running' | 'queued' | null
+  /** Phase 4（§4.3）：給了才注入 artifacts deps；不給＝完全等同 Phase 4 之前。 */
+  artifacts?: {
+    headHas?: boolean
+    /** ticket_artifact_sync/ticket_stages 查到的原執行機（null＝查無紀錄）。 */
+    host?: string | null
+    /** 各 worker 的產物存在性檢查結果：true=有、false=沒有、null=不可達。 */
+    remoteHas?: Record<string, boolean | null>
+    pushOk?: boolean
+  }
 }) {
   const dir = mkdtempSync(join(tmpdir(), 'dispatch-test-'))
   const registry = createDispatchRegistry(join(dir, 'dispatched.json'))
@@ -39,6 +48,9 @@ function makeHarness(opts: {
   const postedJobs: { worker: string; job: JobRequest }[] = []
   const probedTickets: { worker: string; ticket: string }[] = []
   const dispatchAttemptCalls: { fn: 'create' | 'advance' | 'supersedeOthers'; input: Record<string, unknown> }[] = []
+  /** 依序記錄 push/postJob，用來驗「push 一定在 postJob 之前」。 */
+  const events: string[] = []
+  const artifactCalls: string[] = []
   const deps: DispatchDeps = {
     registry,
     listWorkers: () => opts.workers ?? [],
@@ -50,8 +62,32 @@ function makeHarness(opts: {
     },
     postJob: async (w, job) => {
       postedJobs.push({ worker: w.name, job })
+      events.push(`post:${w.name}`)
       return opts.postResults?.[w.name] ?? { accepted: true, result: { ok: true, status: 'started', pid: 1 }, runId: null }
     },
+    ...(opts.artifacts
+      ? {
+          artifacts: {
+            headHas: () => {
+              artifactCalls.push('headHas')
+              return opts.artifacts?.headHas ?? false
+            },
+            lookupHost: async () => {
+              artifactCalls.push('lookupHost')
+              return opts.artifacts?.host ?? null
+            },
+            remoteHas: async w => {
+              artifactCalls.push(`remoteHas:${w.name}`)
+              return opts.artifacts?.remoteHas?.[w.name] ?? null
+            },
+            push: async w => {
+              artifactCalls.push(`push:${w.name}`)
+              events.push(`push:${w.name}`)
+              return opts.artifacts?.pushOk ?? true
+            },
+          },
+        }
+      : {}),
     dispatchAttempts: {
       supersedeOthers: input => dispatchAttemptCalls.push({ fn: 'supersedeOthers', input }),
       create: input => dispatchAttemptCalls.push({ fn: 'create', input }),
@@ -85,6 +121,8 @@ function makeHarness(opts: {
     postedJobs,
     probedTickets,
     dispatchAttemptCalls,
+    events,
+    artifactCalls,
     cleanup: () => rmSync(dir, { recursive: true, force: true }),
   }
 }
@@ -352,6 +390,157 @@ describe('createDispatcher — 執行模式 mode（2026-09-08，plan-pipeline-mo
     const h = makeHarness({ workers: [worker('w1')], capacities: { w1: cap(idle) }, localBugStats: full })
     await h.dispatcher.dispatchBug('FAQ-1', USER, { resume: true })
     expect(h.postedJobs[0]!.job.mode).toBeUndefined()
+    h.cleanup()
+  })
+})
+
+describe('createDispatcher — 產物親和派工（Phase 4，plan-pipeline-modes-v1 §4.3／§4.4.1）', () => {
+  test('親和 host 名額 0、另一台名額 5：仍派親和 host（忽略 capacity），postJob 只打那一台，連 capacity 都不探測', async () => {
+    const h = makeHarness({
+      workers: [worker('w1'), worker('w22')],
+      capacities: { w1: cap(full), w22: cap(idle) }, // 親和 host 滿載、另一台全空
+      artifacts: { headHas: false, host: 'w1', remoteHas: { w1: true } },
+      localBugStats: idle, // 本機也有名額，一樣不准搶走
+    })
+    const r = await h.dispatcher.dispatchBug('FAQ-1', USER, { mode: 'fix' })
+    expect(r).toEqual({ ok: true, status: 'remote_started', worker: 'w1' })
+    expect(h.postedJobs.map(p => p.worker)).toEqual(['w1'])
+    expect(h.postedJobs[0]!.job).toMatchObject({ kind: 'bug', ticket: 'FAQ-1', mode: 'fix' })
+    expect(h.probedTickets).toEqual([]) // 親和分支在 capacity 探測之前就 return
+    expect(h.localSubmits).toEqual([])
+    expect(h.registry.get('FAQ-1')).toMatchObject({ status: 'confirmed', worker: 'w1' })
+    h.cleanup()
+  })
+
+  test('reanalyze 同樣適用；親和 host 回 full → artifact_host_full，不改派別台、不排隊、登記清空', async () => {
+    const h = makeHarness({
+      workers: [worker('w1'), worker('w22')],
+      capacities: { w1: cap(full), w22: cap(idle) },
+      postResults: { w1: { accepted: false, reason: 'full' } },
+      artifacts: { headHas: false, host: 'w1', remoteHas: { w1: true } },
+      localBugStats: idle,
+    })
+    const r = await h.dispatcher.dispatchBug('FAQ-1', USER, { mode: 'reanalyze' })
+    expect(r).toEqual({ ok: true, status: 'artifact_host_full', worker: 'w1' })
+    expect(h.postedJobs.map(p => p.worker)).toEqual(['w1'])
+    expect(h.localSubmits).toEqual([])
+    expect(h.registry.get('FAQ-1')).toBe(null)
+    expect(h.dispatchAttemptCalls.at(-1)!.input).toMatchObject({ status: 'cleared', clearReason: 'artifact_host_full' })
+    h.cleanup()
+  })
+
+  test('親和 host 的 /stage-files 回 analysis-notes 為 null：退回既有流程，結果附 note=no_prior_artifacts', async () => {
+    const h = makeHarness({
+      workers: [worker('w1')],
+      capacities: { w1: cap(idle) },
+      artifacts: { headHas: false, host: 'w1', remoteHas: { w1: false } },
+      localBugStats: full,
+    })
+    const r = await h.dispatcher.dispatchBug('FAQ-1', USER, { mode: 'fix' })
+    expect(r).toEqual({ ok: true, status: 'remote_started', worker: 'w1', note: 'no_prior_artifacts' })
+    expect(h.probedTickets.map(p => p.worker)).toEqual(['w1']) // 有走既有 capacity 探測
+    expect(h.postedJobs.map(p => p.worker)).toEqual(['w1'])
+    h.cleanup()
+  })
+
+  test('查無紀錄（DB 關閉或沒跑過）：等同 full 流程，一樣只附 note=no_prior_artifacts', async () => {
+    const h = makeHarness({
+      workers: [worker('w1')],
+      capacities: { w1: cap(idle) },
+      artifacts: { headHas: false, host: null },
+      localBugStats: idle, // 本機優先
+    })
+    const r = await h.dispatcher.dispatchBug('FAQ-1', USER, { mode: 'fix' })
+    expect(r).toEqual({ ok: true, status: 'started', pid: 99, note: 'no_prior_artifacts' })
+    expect(h.localSubmits).toEqual(['FAQ-1'])
+    expect(h.artifactCalls).toContain('lookupHost')
+    h.cleanup()
+  })
+
+  test('親和 host 不可達（remoteHas=null）：artifact_host_offline，不 spawn、不排隊、登記清空', async () => {
+    const h = makeHarness({
+      workers: [worker('w1'), worker('w22')],
+      capacities: { w1: cap(idle), w22: cap(idle) },
+      artifacts: { headHas: false, host: 'w1', remoteHas: { w1: null } },
+      localBugStats: idle,
+    })
+    const r = await h.dispatcher.dispatchBug('FAQ-1', USER, { mode: 'fix' })
+    expect(r).toEqual({ ok: true, status: 'artifact_host_offline', worker: 'w1' })
+    expect(h.postedJobs).toEqual([])
+    expect(h.localSubmits).toEqual([])
+    expect(h.registry.get('FAQ-1')).toBe(null)
+    expect(h.dispatchAttemptCalls.at(-1)!.input).toMatchObject({ status: 'cleared', clearReason: 'artifact_host_offline' })
+    h.cleanup()
+  })
+
+  test('親和 host 已不在名冊（退役/停用）：同樣 artifact_host_offline，連 stage-files 都不問', async () => {
+    const h = makeHarness({
+      workers: [worker('w22')],
+      capacities: { w22: cap(idle) },
+      artifacts: { headHas: false, host: 'w1', remoteHas: { w1: true } },
+      localBugStats: idle,
+    })
+    const r = await h.dispatcher.dispatchBug('FAQ-1', USER, { mode: 'fix' })
+    expect(r).toEqual({ ok: true, status: 'artifact_host_offline', worker: 'w1' })
+    expect(h.artifactCalls).not.toContain('remoteHas:w1')
+    expect(h.postedJobs).toEqual([])
+    expect(h.registry.get('FAQ-1')).toBe(null)
+    h.cleanup()
+  })
+
+  test('head 本機有產物：走既有 capacity 流程，且 postJob 之前一定先 push 到選中的那台', async () => {
+    const h = makeHarness({
+      workers: [worker('w1'), worker('w22')],
+      capacities: { w1: cap(stats(4)), w22: cap(idle) }, // w22 剩 5 為最佳
+      artifacts: { headHas: true, pushOk: true },
+      localBugStats: full,
+    })
+    const r = await h.dispatcher.dispatchBug('FAQ-1', USER, { mode: 'fix' })
+    expect(r).toEqual({ ok: true, status: 'remote_started', worker: 'w22' })
+    expect(h.events).toEqual(['push:w22', 'post:w22']) // 順序：先推產物再派工
+    expect(h.artifactCalls).not.toContain('lookupHost') // head 有產物就不必查 DB
+    h.cleanup()
+  })
+
+  test('head 有產物但推送失敗：不派遠端，改本機 submit，clearReason=artifact_push_failed', async () => {
+    const h = makeHarness({
+      workers: [worker('w1')],
+      capacities: { w1: cap(idle) },
+      artifacts: { headHas: true, pushOk: false },
+      localBugStats: full,
+    })
+    const r = await h.dispatcher.dispatchBug('FAQ-1', USER, { mode: 'fix' })
+    expect(r).toEqual({ ok: true, status: 'started', pid: 99 })
+    expect(h.postedJobs).toEqual([])
+    expect(h.localSubmits).toEqual(['FAQ-1'])
+    expect(h.registry.get('FAQ-1')).toBe(null)
+    expect(h.dispatchAttemptCalls.at(-1)!.input).toMatchObject({ status: 'cleared', clearReason: 'artifact_push_failed' })
+    h.cleanup()
+  })
+
+  test('full/analysis/resume 模式：不查親和 host，但 head 有產物時一樣先推送（§4.3 B）', async () => {
+    const h = makeHarness({
+      workers: [worker('w1')],
+      capacities: { w1: cap(idle) },
+      artifacts: { headHas: true, host: 'w1' },
+      localBugStats: full,
+    })
+    const r = await h.dispatcher.dispatchBug('FAQ-1', USER, { resume: true })
+    expect(r).toEqual({ ok: true, status: 'remote_started', worker: 'w1' })
+    expect(h.artifactCalls).not.toContain('lookupHost')
+    expect(h.events).toEqual(['push:w1', 'post:w1'])
+    h.cleanup()
+  })
+
+  test('demand 單完全不走產物路徑（ALDREQ 沒有既有產物的概念）', async () => {
+    const h = makeHarness({
+      workers: [worker('w1')],
+      capacities: { w1: { worker: 'w1', bug: full, demand: stats(0, 0, 6) } },
+      artifacts: { headHas: true, host: 'w1' },
+    })
+    const r = await h.dispatcher.dispatchDemand('ALDREQ-9', 'a@x.tw', USER)
+    expect(r).toEqual({ ok: true, status: 'remote_started', worker: 'w1' })
+    expect(h.artifactCalls).toEqual([])
     h.cleanup()
   })
 })

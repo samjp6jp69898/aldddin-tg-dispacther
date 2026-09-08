@@ -41,10 +41,23 @@ import type { BugMode } from '../pipeline-runner/bug-mode.ts'
 //   （job-done 已清 + out-of-band 重跑 + 該機斷線三者疊加）是已接受的殘餘
 //   風險，靠 sweeper 的失聯保守策略與維運告警兜底。
 
+// 產物親和派工（2026-09-08，plan-pipeline-modes-v1 §4.3，Phase 4）：
+// `fix`/`reanalyze` 需要既有的分析產物才有意義。head 本機有產物就走既有的名額
+// 流程（派遠端前先推過去）；head 沒有時依 DB 紀錄**派回原執行機、忽略 capacity**
+// ——原機滿載/離線一律回報使用者、票維持可認領，**絕不自動改派到別台從頭重跑**
+// （使用者裁定 §0-5）。所有 I/O 都經 deps.artifacts 注入，本檔維持純邏輯。
+
+/** 只有「找不到既有分析產物、已改為從頭分析」這一個註記（§4.3 A2 第一條）。 */
+export type DispatchNote = 'no_prior_artifacts'
+
 export type DispatchResult =
-  | SubmitResult
-  | { ok: true; status: 'remote_started'; worker: string }
+  | (SubmitResult & { note?: DispatchNote })
+  | { ok: true; status: 'remote_started'; worker: string; note?: DispatchNote }
   | { ok: true; status: 'already_running_remote'; worker: string }
+  /** 產物所在機器不在名冊/停用/不可達：不 spawn、不排隊、不留登記，票維持可認領。 */
+  | { ok: true; status: 'artifact_host_offline'; worker: string }
+  /** 產物所在機器滿載（它自己的 GLOBAL_CONCURRENCY_LIMIT 拒單）：同上，請稍後再點。 */
+  | { ok: true; status: 'artifact_host_full'; worker: string }
 
 /**
  * monitor DB `dispatch_attempts` 的觀察面寫入（plan-db-as-truth-v3.md §5.3）。
@@ -91,6 +104,24 @@ export type DispatchAttemptWriteDeps = {
  * （執行模式，claim.ts 依 Notion AI分析 值決定）正交，可同時存在。 */
 export type BugDispatchOpts = { resume?: boolean; mode?: BugMode }
 
+/**
+ * §4.1–4.3 的產物 I/O（production 實作在 lib/cluster/artifact-sync.ts + wiring
+ * 在 cluster-head.ts；測試注入假件）。**optional**：省略時整套親和規則不啟用，
+ * 行為與 Phase 4 之前 100% 相同（單機部署與既有測試不受影響）。
+ */
+export type ArtifactDeps = {
+  /** head 本機有沒有這張票的分析產物（同步、純檔案系統判定）。 */
+  headHas: (ticket: string) => boolean
+  /** 依 DB 紀錄查產物在哪台（ticket_artifact_sync.source_host，缺則 ticket_stages
+   * 最新一列的 host）。查無/DB 關閉/例外一律 null＝視同沒有既有產物。 */
+  lookupHost: (ticket: string) => Promise<string | null>
+  /** 向該機驗證產物**真的存在**（GET /jobs/:ticket/stage-files 看 analysis-notes.md
+   * 是否非 null）。true=有、false=沒有、null=不可達（兩者語意完全不同，見 §4.3）。 */
+  remoteHas: (w: WorkerInfo, ticket: string) => Promise<boolean | null>
+  /** 把 head 本機的產物推到該機；false ＝ 推送失敗，呼叫端必須改走本機執行。 */
+  push: (w: WorkerInfo, ticket: string) => Promise<boolean>
+}
+
 export type DispatchDeps = {
   registry: DispatchRegistry
   listWorkers: () => WorkerInfo[]
@@ -113,6 +144,7 @@ export type DispatchDeps = {
     }
   }
   dispatchAttempts?: DispatchAttemptWriteDeps
+  artifacts?: ArtifactDeps
 }
 
 /** 剩餘名額判斷：有單在排隊代表名額實際上已滿（排隊者優先於新單），不論
@@ -161,7 +193,98 @@ export function createDispatcher(deps: DispatchDeps) {
     const dispatchedAt = new Date().toISOString()
     attempts?.supersedeOthers?.({ ticket, kind, excludeDispatchId: dispatchId })
     attempts?.create({ dispatchId, ticket, kind, status: 'dispatching', statusRank: DISPATCH_STATUS_RANK.dispatching, dispatchedAt, triggeredByEmail: techUser?.email })
+    const clearWith = (clearReason: string): void => {
+      deps.registry.clear(ticket)
+      attempts?.advance({
+        dispatchId,
+        status: 'cleared',
+        statusRank: DISPATCH_STATUS_RANK.terminal,
+        clearedAt: new Date().toISOString(),
+        clearReason,
+      })
+    }
+    const confirmWith = (w: WorkerInfo, remoteRunId?: string | null): void => {
+      deps.registry.confirmDispatched(ticket, w.name, w.url)
+      attempts?.advance({
+        dispatchId,
+        status: 'dispatched',
+        statusRank: DISPATCH_STATUS_RANK.dispatched,
+        confirmedAt: new Date().toISOString(),
+        remoteRunId: remoteRunId ?? null,
+        workerName: w.name,
+        workerUrl: w.url,
+      })
+    }
     try {
+      // job body 提前組好：親和派工（§4.3 A2）與既有的名額流程送的是同一份，
+      // 只差送給哪一台——內容不依賴選中的 worker。
+      const job: JobRequest =
+        kind === 'bug'
+          ? { kind, ticket, triggeredBy: techUser ?? undefined, dispatchId, ...(opts?.resume ? { resume: true } : {}), ...(opts?.mode ? { mode: opts.mode } : {}) }
+          : { kind, ticket, triggeredBy: techUser ?? undefined, assigneeEmail, dispatchId }
+
+      // ── §4.3：產物親和（插在 (4) capacity 探測之前）────────────────────
+      const art = kind === 'bug' ? deps.artifacts : undefined
+      const headHasArtifacts = art !== undefined && art.headHas(ticket)
+      // 「找不到既有分析產物，已改為從頭分析」——附在回傳結果上，由 claim.ts
+      // 轉成給使用者的一句話（§4.3 A2 第一條）。
+      let note: DispatchNote | undefined
+      const noted = <T extends object>(r: T): T => (note === undefined ? r : ({ ...r, note } as T))
+
+      if (art !== undefined && !headHasArtifacts && (opts?.mode === 'fix' || opts?.mode === 'reanalyze')) {
+        // A2：head 沒有產物，但這個模式需要它——查 DB 紀錄的原執行機。
+        const host = await art.lookupHost(ticket)
+        // 查無紀錄 → 等同 A1 無產物，走既有流程（＝從頭分析），只加註記。
+        if (host === null) note = 'no_prior_artifacts'
+        else {
+          const target = workers.find(w => w.name === host)
+          if (target === undefined) {
+            // 不在名冊（退役）或已被停用（wiring 的 listWorkers 已過濾 disabled）
+            // ——一律當離線：票維持可認領、不排隊、不留登記，等機器回來再點一次。
+            clearWith('artifact_host_offline')
+            console.error(`cluster-dispatch: ${ticket}（${opts?.mode}）的既有產物在 ${host}，該機不在可派工名冊 → 不改派、不從頭重跑`)
+            return { ok: true, status: 'artifact_host_offline', worker: host }
+          }
+          // **產物存在性檢查**（使用者指定的重點）：DB 紀錄可能過時，一律向該機
+          // 實查 analysis-notes.md 再決定。
+          const remoteHas = await art.remoteHas(target, ticket)
+          if (remoteHas === null) {
+            clearWith('artifact_host_offline')
+            console.error(`cluster-dispatch: ${ticket}（${opts?.mode}）的既有產物在 ${host}，該機目前不可達 → 不改派、不從頭重跑`)
+            return { ok: true, status: 'artifact_host_offline', worker: host }
+          }
+          if (remoteHas === false) {
+            // 該機可達但產物已不在（人工清理/覆寫）→ 同「查無紀錄」。
+            note = 'no_prior_artifacts'
+          } else {
+            // 產物確實在該機 → 直接派回去，**忽略 capacity**（§4.3 A2）。
+            console.error(`cluster-dispatch: ${ticket}（${opts?.mode}）affinity → ${target.name}（既有產物所在機器，忽略名額）`)
+            const r = await deps.postJob(target, job)
+            if (r.accepted) {
+              confirmWith(target, r.runId)
+              if (r.result.ok && r.result.status === 'already_running') {
+                return { ok: true, status: 'already_running_remote', worker: target.name }
+              }
+              return { ok: true, status: 'remote_started', worker: target.name }
+            }
+            if (r.reason === 'ambiguous') {
+              // 同既有 (6) 的保守語意：逾時不明＝當已接單，交給 sweeper 校正。
+              confirmWith(target)
+              return { ok: true, status: 'remote_started', worker: target.name }
+            }
+            if (r.reason === 'full') {
+              clearWith('artifact_host_full')
+              return { ok: true, status: 'artifact_host_full', worker: target.name }
+            }
+            // rejected / unreachable：該機此刻無法接手。**不改派別台**（別台沒有
+            // 產物，派過去等於從頭重跑，正是使用者裁定要避免的），回報離線語意。
+            clearWith('artifact_host_offline')
+            console.error(`cluster-dispatch: ${ticket}（${opts?.mode}）派回 ${target.name} 被拒（${r.reason}）→ 不改派、不從頭重跑`)
+            return { ok: true, status: 'artifact_host_offline', worker: target.name }
+          }
+        }
+      }
+
       // (4) 並行探測：名額 + 這張單在各 worker 的本機活動。
       const capacities = await Promise.all(workers.map(async w => ({ worker: w, cap: await deps.fetchCapacity(w, ticket) })))
 
@@ -199,16 +322,23 @@ export function createDispatcher(deps: DispatchDeps) {
           clearedAt: new Date().toISOString(),
           clearReason: 'no_remote_capacity',
         })
-        return submitLocal()
+        return noted(submitLocal())
+      }
+
+      // §4.2：head 本機有產物（A1，或 full/analysis/resume 續跑需要）→ 派遠端
+      // 之前先推過去。推不過去就**不派遠端**，改本機執行（head 有產物，本機續跑
+      // 最穩），絕不讓一台沒有產物的機器接手。
+      if (art !== undefined && headHasArtifacts) {
+        const pushed = await art.push(best.worker, ticket)
+        if (!pushed) {
+          clearWith('artifact_push_failed')
+          return noted(submitLocal())
+        }
       }
 
       // (6) 只試最佳一台（M-2 預算約束）。dispatchId 隨請求一併送出（§5.3）：
       // 即使 postJob 逾時拿不到回應 body，worker 端把它寫進自己鑄的 runs.dispatch_id
       // 欄，事後仍能用 runs.dispatch_id = dispatch_attempts.dispatch_id 精確 join。
-      const job: JobRequest =
-        kind === 'bug'
-          ? { kind, ticket, triggeredBy: techUser ?? undefined, dispatchId, ...(opts?.resume ? { resume: true } : {}), ...(opts?.mode ? { mode: opts.mode } : {}) }
-          : { kind, ticket, triggeredBy: techUser ?? undefined, assigneeEmail, dispatchId }
       const r = await deps.postJob(best.worker, job)
       if (r.accepted) {
         deps.registry.confirmDispatched(ticket, best.worker.name, best.worker.url)
@@ -226,7 +356,7 @@ export function createDispatcher(deps: DispatchDeps) {
         if (r.result.ok && r.result.status === 'already_running') {
           return { ok: true, status: 'already_running_remote', worker: best.worker.name }
         }
-        return { ok: true, status: 'remote_started', worker: best.worker.name }
+        return noted({ ok: true, status: 'remote_started', worker: best.worker.name })
       }
       if (r.reason === 'ambiguous') {
         // 見檔頭：逾時不明＝保守當已接單，交給 sweeper 校正。
@@ -239,7 +369,7 @@ export function createDispatcher(deps: DispatchDeps) {
           workerName: best.worker.name,
           workerUrl: best.worker.url,
         })
-        return { ok: true, status: 'remote_started', worker: best.worker.name }
+        return noted({ ok: true, status: 'remote_started', worker: best.worker.name })
       }
 
       // full / rejected / unreachable：確定沒接單，退回本機。
@@ -251,7 +381,7 @@ export function createDispatcher(deps: DispatchDeps) {
         clearedAt: new Date().toISOString(),
         clearReason: r.reason,
       })
-      return submitLocal()
+      return noted(submitLocal())
     } catch (err) {
       // 防禦性收尾：探測/選擇過程任何未預期例外都不能留下永久佔位（那會讓
       // 這張單直到 sweeper 清理前都無法認領），清掉並退回本機路徑。

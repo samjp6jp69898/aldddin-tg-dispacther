@@ -9,8 +9,9 @@ import { createDispatcher, type BugDispatchOpts, type DispatchAttemptWriteDeps, 
 import { createRemoteSweeper } from './remote-sweeper.ts'
 import { recordWorkerMonitorStatus } from './worker-monitor-status.ts'
 import { createBacklogDispatcher } from './backlog-dispatcher.ts'
-import { fetchWorkerCapacity, fetchWorkerJobStatus, postWorkerJob } from './worker-client.ts'
-import { isMonitorDbEnabled } from '../monitor-db/env.ts'
+import { fetchWorkerCapacity, fetchWorkerJobStatus, fetchRemoteStageFiles, postWorkerJob } from './worker-client.ts'
+import { headHasArtifacts, pullTicketArtifacts, pushTicketArtifacts, queryArtifactHost, retryPendingArtifactPulls } from './artifact-sync.ts'
+import { isMonitorDbEnabled, MON_HOST } from '../monitor-db/env.ts'
 import { createMonitorPool } from '../monitor-db/pool.ts'
 import { createDispatchAttempt, advanceDispatchAttempt, supersedeOtherDispatchAttempts } from '../monitor-db/writes.ts'
 import { submitCreateMr, getBugQueueStats, hasBugTicketActive, notifyQueueEvent, tryDispatchBugQueueFront } from '../pipeline-runner/spawn-create-mr.ts'
@@ -119,6 +120,19 @@ const dispatchAttemptWrites: DispatchAttemptWriteDeps = {
   },
 }
 
+/** §4.3 A2：這張票的既有產物在哪台。DB 關閉/查詢失敗一律 null＝「查無紀錄」
+ * ——派工絕不能因為監控 DB 不可用而失敗（plan §3 的降級紀律）。 */
+async function lookupArtifactHost(ticket: string): Promise<string | null> {
+  const pool = getMonitorPool()
+  if (pool === null) return null
+  try {
+    return await queryArtifactHost(pool, ticket, MON_HOST)
+  } catch (err) {
+    console.error(`cluster: ${ticket} 查詢既有產物所在機器失敗（視同查無紀錄）: ${err}`)
+    return null
+  }
+}
+
 const dispatcher = createDispatcher({
   registry: dispatchRegistry,
   // disabled 的 worker（tg-monitor Workers 分頁「中斷」按鈕，見 worker-registry.ts
@@ -143,6 +157,20 @@ const dispatcher = createDispatcher({
     },
   },
   dispatchAttempts: dispatchAttemptWrites,
+  // §4.1–4.3 的產物 I/O（Phase 4）。remoteHas 用既有的 `GET /jobs/:ticket/stage-files`
+  // ——不新增 worker 端路由，且它回的就是「這幾個檔在該機存不存在＋mtime」的
+  // 原始事實，正好是產物存在性檢查要的東西。打不通回 null（＝不可達，與「可達
+  // 但沒有產物」語意完全不同，見 dispatch.ts §4.3）。
+  artifacts: {
+    headHas: headHasArtifacts,
+    lookupHost: lookupArtifactHost,
+    remoteHas: async (w, ticket) => {
+      const files = await fetchRemoteStageFiles(w.url, secret ?? '', ticket)
+      if (files === null) return null
+      return files.debugFiles['analysis-notes.md'] != null
+    },
+    push: pushTicketArtifacts,
+  },
 })
 
 const sweeper = createRemoteSweeper({
@@ -329,6 +357,14 @@ export function registerClusterRoutes(app: Hono): void {
     // （已被移除/停用）就不遞補，理由見 worker-registry.ts「disabled」段落。
     const kind = body.ticket.startsWith('FAQ-') ? 'bug' : 'demand'
     const w = workerRegistry.list().find(x => x.name === worker && !x.disabled)
+    // §4.1（Phase 4）：這一輪的 Debug 產物只在該 worker 上——趁 job-done 立刻
+    // 拉回 head，之後同一張票要「產出修復程式碼」時就不必依賴那台機器活著。
+    // fire-and-forget（rsync 最長 30 秒，不能擋這支 HTTP 回應）；失敗只記
+    // ticket_artifact_sync，由 sweeper 每 10 分鐘那輪重試。只拉 bug 票。
+    // 名冊裡找不到該 worker（已移除/停用）時不拉——沒有 url 可連。
+    if (kind === 'bug' && w) {
+      void pullTicketArtifacts(w, body.ticket).catch(err => console.error(`cluster: ${body.ticket} 的產物拉取例外（sweeper 會重試）: ${err}`))
+    }
     if (w) void backlogDispatcher.fillFreedSlot(kind, w).catch(err => console.error(`cluster: ${body.ticket} 的 backlog 遞補失敗: ${err}`))
     return c.json({ ok: true })
   })
@@ -414,6 +450,14 @@ export function initClusterHead(): void {
     // job-done 回報遺失時的安全網（見 backlog-dispatcher.ts 檔頭）：同一顆
     // timer 順便補做一次 backlog 遞補探測，不另開新 timer。
     backlogDispatcher.sweepBacklog().catch(err => console.error(`cluster: backlog sweep 失敗: ${err}`))
+    // §4.1 的拉取重試（Phase 4）：head 沒有完整副本、且距上次嘗試超過 10 分鐘
+    // 的票再拉一次。同樣掛在這顆 timer 上（不新增 timer）；DB 關閉時 pool 為
+    // null，整段 no-op。
+    retryPendingArtifactPulls({ pool: getMonitorPool(), listWorkers: () => workerRegistry.list().filter(x => !x.disabled) })
+      .then(n => {
+        if (n > 0) console.error(`cluster: 本輪重試了 ${n} 張票的產物拉取`)
+      })
+      .catch(err => console.error(`cluster: 產物拉取重試失敗: ${err}`))
   }, SWEEP_INTERVAL_MS)
   console.error(
     `cluster: head 模式啟用（已登記 worker：${workerRegistry.list().map(w => w.name).join(', ') || '無'}；/cluster/* 的公網封鎖依賴 cloudflared 注入 CF-Connecting-IP，換 tunnel 需重新評估）`,

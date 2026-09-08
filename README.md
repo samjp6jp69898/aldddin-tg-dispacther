@@ -341,7 +341,9 @@ head 端比對是否等於 `origin/main`。
   由 head 的 remote sweeper 10 分鐘內補查——所以能等就等。
 - **一次性前提（每台 worker）**：系統設定 → 一般 → 共享 → 開「遠端登入」允許 `user`；
   從 head 執行 `ssh-copy-id user@<worker_ip>`；`doctor-worker.sh` 已加「Remote Login」
-  檢查（22 port 監聽 + `authorized_keys` 非空）。
+  檢查（22 port 監聽 + `authorized_keys` 非空）。這條 head→worker 的 ssh 信任本來就是
+  `sync-workers.sh` 的前提，2026-09-08 起的產物拉取/推送（`lib/cluster/artifact-sync.ts`）
+  沿用同一條信任鏈與同一組 ssh 參數，**不需要**額外開 worker→head 的反向登入。
 - 名冊來自 `logs/cluster-workers.json`（`disabled: true` 跳過）；ssh 用 `BatchMode`
   免密連線，連不上／權限不足會回 `WORKER_FAIL <name> ...` 並 exit 1，不會半途卡住。
 - 主程式碼 repo（agrabah/abu/lago/rajah）**不在派送範圍**——pipeline 自己每次
@@ -363,6 +365,18 @@ head 端比對是否等於 `origin/main`。
 - tg-monitor 只看得到自己機器上的 pipeline；派去 worker 的單要去 worker
   的 logs/ 看。tg-monitor 的重試按鈕也只影響本機，且看不到遠端登記表——
   避免對「派在別台跑的單」按重試。
+- （2026-09-08 Phase 4 起大幅改善，保留紀錄）舊版限制：重試/續跑可能落到跟
+  上一輪不同的 worker，而 `obsidian/Debug/<ticket>/` 的分析產物只在原本那台，
+  等於被迫從頭重跑。現在 head 會**拉回／推送產物並優先派回原機**
+  （`lib/cluster/artifact-sync.ts` + `lib/cluster/dispatch.ts` 的親和規則）：
+  worker 回報 `job-done` 後 head 立刻 rsync 把該票的 Debug 目錄拉回來（失敗的
+  由 remote sweeper 每 10 分鐘那輪重試）；派工到 worker 前若 head 有產物就先
+  推過去，推不過去就改在 head 本機跑。head 沒有產物、而模式又需要它
+  （`產出修復程式碼並開 MR` / `依補充留言重新分析`）時，依監控 DB 的
+  `ticket_artifact_sync` / `ticket_stages` 找出原執行機，先向該機驗證
+  analysis-notes.md 真的還在，再**忽略名額**直接派回去；該機滿載或離線就回覆
+  認領人「稍後再點一次 / 機器恢復後再點一次」，票維持可認領，**絕不自動改派
+  別台從頭重跑**。監控 DB 關閉時整套退化成「查無紀錄」＝既有的從頭分析行為。
 - `bug_analysis_tracker.md`（2026-09-03 起改為 head 唯一權威，取代舊的「每台
   各一份、事後靠 `/sync-bug-tracker` 補正」策略）：worker 接單前向 head 抓一份
   完整覆蓋本機（`GET /cluster/tracker`），跑完把該單終態隨 `job-done` 回寫
