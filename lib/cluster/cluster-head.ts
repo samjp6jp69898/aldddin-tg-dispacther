@@ -4,6 +4,7 @@ import { getClusterSecret, CLUSTER_TICKET_RE, WORKER_NAME_RE } from './cluster-e
 import { createClusterAuthGuard } from './cluster-auth.ts'
 import { createWorkerRegistry } from './worker-registry.ts'
 import { createDispatchRegistry, DISPATCH_STATUS_RANK, type DispatchEntry } from './dispatch-registry.ts'
+import { createMaintenanceModeStore } from '../maintenance/mode-store.ts'
 import { createDispatcher, type BugDispatchOpts, type DispatchAttemptWriteDeps, type DispatchResult } from './dispatch.ts'
 import { createRemoteSweeper } from './remote-sweeper.ts'
 import { recordWorkerMonitorStatus } from './worker-monitor-status.ts'
@@ -43,6 +44,19 @@ const LOG_DIR = '/Users/user/aladdin/telegram-dispatcher/logs'
 const secret = getClusterSecret()
 const workerRegistry = createWorkerRegistry(join(LOG_DIR, 'cluster-workers.json'))
 const dispatchRegistry = createDispatchRegistry(join(LOG_DIR, 'cluster-dispatched.json'))
+// 維護模式（2026-09-08）：這個 store 在模組層級無條件建立（不像
+// workerRegistry/dispatchRegistry 只服務多機派工），claim.ts／demand-claim.ts
+// 直接呼叫 isMaintenanceModeOn()（同一個長駐 head 行程內的記憶體讀取，不走
+// HTTP）在任何部署形態下都生效。
+//
+// ⚠️ 但「用 tg-monitor 切換」這件事目前綁在下面 registerClusterRoutes 掛的
+// POST /cluster/maintenance——那支路由跟其他 /cluster/* 一樣，secret 未設定
+// （單機部署）時 registerClusterRoutes 整個提前 return，路由不會掛上去，
+// 這種部署下沒有 HTTP 管道可以手動開關（跟既有 worker 名冊管理三個動作
+// 同一種限制，見下方該段落）。目前實際部署是多機（有設定 secret），這不是
+// 阻礙；真要在單機部署開關，只能直接編輯／刪除
+// logs/maintenance-mode.json 再重啟行程。
+const maintenanceMode = createMaintenanceModeStore(join(LOG_DIR, 'maintenance-mode.json'))
 
 // monitor DB 觀察面：dispatch_attempts 只有 head 寫（plan-db-as-truth-v3.md
 // §5.3；R1：head 對遠端 run 一律只寫 dispatch_attempts，絕不碰 runs）。
@@ -156,6 +170,12 @@ const backlogDispatcher = createBacklogDispatcher({
 
 export function isClusterEnabled(): boolean {
   return secret !== null
+}
+
+/** claim.ts／demand-claim.ts 的受理閘門：true 時一律拒絕新的認領（見兩檔
+ * 各自入口處的呼叫點）。與 cluster 是否啟用無關，單機部署也讀得到。 */
+export function isMaintenanceModeOn(): boolean {
+  return maintenanceMode.isOn()
 }
 
 /** claim.ts 的 submitCreateMr 替身：cluster 停用或無 worker 時走本機（等同
@@ -359,6 +379,21 @@ export function registerClusterRoutes(app: Hono): void {
     const ok = workerRegistry.remove(name)
     if (ok) console.error(`cluster: worker ${name} 已從名冊移除（若該機 worker-agent 行程仍在跑，30 分鐘內會自動重新登記回來——見 worker-registry.ts 檔頭）`)
     return c.json({ ok }, ok ? 200 : 404)
+  })
+
+  // 維護模式開關（2026-09-08，tg-monitor 手動控制）：呼叫端是本機的
+  // tg-monitor（打 127.0.0.1:8787），同一組 guard（LAN-only + secret），跟上面
+  // worker 名冊管理三個動作同一種模式。只管 head 自己這份（claim.ts／
+  // demand-claim.ts 的受理閘門）；worker 端各自獨立的旗標由 tg-monitor 另外
+  // 直接打每台 worker 自己的 POST /maintenance（見 worker-agent.ts），這裡不
+  // 代為轉發——head 對「還有哪些 worker 活著」的認知本來就可能落後，兩邊各自
+  // 收各自的請求比較不會有「head 轉發成功但實際上那台早就斷線」的假象。
+  app.post('/cluster/maintenance', guard, async c => {
+    const body = (await c.req.json().catch(() => null)) as { on?: unknown } | null
+    if (!body || typeof body.on !== 'boolean') return c.json({ ok: false, reason: 'bad_request' }, 400)
+    maintenanceMode.setOn(body.on)
+    console.error(`cluster: 維護模式已${body.on ? '開啟' : '關閉'}（head）`)
+    return c.json({ ok: true, on: body.on })
   })
 }
 

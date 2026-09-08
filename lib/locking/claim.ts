@@ -4,8 +4,9 @@ import { queryCandidateTicketsWithMode } from '../notion-integration/candidate-t
 import { BUG_MODE_LABEL } from '../pipeline-runner/bug-mode.ts'
 import { ensureTrackerPending } from '../pipeline-runner/tracker-sync.ts'
 import { GLOBAL_CONCURRENCY_LIMIT } from '../pipeline-runner/concurrency-limiter.ts'
-import { dispatchBug, getRemoteEntry, describeRemoteProgress } from '../cluster/cluster-head.ts'
+import { dispatchBug, getRemoteEntry, describeRemoteProgress, isMaintenanceModeOn } from '../cluster/cluster-head.ts'
 import { describeTicketProgress, isTicketLocked } from '../pipeline-runner/ticket-progress.ts'
+import { MAINTENANCE_MESSAGE } from '../maintenance/mode-store.ts'
 import type { TechUser } from '../user-resolution/tech-user.ts'
 
 const BUG_LOCK_SH = '/Users/user/aladdin/scripts/bug-lock.sh'
@@ -44,6 +45,7 @@ function releaseLock(ticket: string): void {
  * 給人看的訊息——TG handler 與 Web UI 回的是同一段文字，不維護兩套文案。 */
 export type ClaimOutcome = { code: ClaimCode; text: string }
 export type ClaimCode =
+  | 'maintenance'
   | 'already_running_local'
   | 'already_running_remote'
   | 'not_candidate'
@@ -65,6 +67,12 @@ export type ClaimCode =
  * 每個分支都回明確訊息，沒有安靜失敗的路徑。不碰 grammy ctx。
  */
 export async function claimBugTicket(techUser: TechUser, ticket: string): Promise<ClaimOutcome> {
+  // 維護模式（2026-09-08）：手動開關，開著時一律拒絕受理新單，排在所有其他
+  // 判斷之前——不查 Notion、不碰鎖、不派工，維護期間對這張單完全零副作用。
+  if (isMaintenanceModeOn()) {
+    return { code: 'maintenance', text: MAINTENANCE_MESSAGE }
+  }
+
   // 同事再次點選一張已經在跑的單：鎖目錄存在＝/create-mr 自己的 Step 0.1.3
   // 正持有這張票的鎖（見 ticket-progress.ts 檔頭註解），改回覆目前進度到
   // 哪個 stage，不要走下面的認領流程（那條路只會用「已被其他 session 認

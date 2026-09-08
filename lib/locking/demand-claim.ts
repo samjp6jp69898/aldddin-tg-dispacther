@@ -2,9 +2,10 @@ import { execFileSync } from 'node:child_process'
 import type { Context } from 'grammy'
 import { queryDemandPoolTickets, getDemandTicketNotionUrl } from '../notion-integration/demand-pool-tickets.ts'
 import { resetAiAnalysisForReclaim } from '../pipeline-runner/spawn-demand-pipeline.ts'
-import { dispatchDemand, getRemoteEntry, describeRemoteProgress } from '../cluster/cluster-head.ts'
+import { dispatchDemand, getRemoteEntry, describeRemoteProgress, isMaintenanceModeOn } from '../cluster/cluster-head.ts'
 import { DEMAND_CONCURRENCY_LIMIT } from '../pipeline-runner/concurrency-limiter.ts'
 import { describeTicketProgress, isTicketLocked } from '../pipeline-runner/ticket-progress.ts'
+import { MAINTENANCE_MESSAGE } from '../maintenance/mode-store.ts'
 import type { TechUser } from '../user-resolution/tech-user.ts'
 import type { ClaimOutcome } from './claim.ts'
 
@@ -73,6 +74,12 @@ function markAiAnalysisInProgress(ticket: string): void {
  * 流程自己管』的既有模式。
  */
 export async function claimDemandTicket(techUser: TechUser, ticket: string): Promise<ClaimOutcome> {
+  // 維護模式（2026-09-08）：比照 claim.ts 的 claimBugTicket，排在最前面，
+  // 開著時不查 Notion、不碰鎖、不派工。
+  if (isMaintenanceModeOn()) {
+    return { code: 'maintenance', text: MAINTENANCE_MESSAGE }
+  }
+
   // 同事再次點選一張已經在跑的需求單：鎖目錄存在＝run-demand-pipeline.ts
   // 的 main() 正持有這張票的鎖（見 ticket-progress.ts 檔頭註解，跟 claim.ts
   // 對 Bug 票的判斷同一套依據），改回覆目前進度，不要走下面的認領流程。

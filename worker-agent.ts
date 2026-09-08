@@ -5,6 +5,11 @@
 // server.ts 的那台）把認領到的 Bug/需求單派過來本機執行：
 //   GET  /health        存活探測（比照 server.ts /health：不驗證、最小資訊）
 //   GET  /capacity      本機兩條 pipeline 的名額實況（head 派工選擇用）
+//   GET  /maintenance   本機維護模式現況（2026-09-08 新增，tg-monitor 輪詢用）
+//   POST /maintenance   開關本機維護模式（2026-09-08 新增；開著時 /jobs 一律
+//                       拒絕新單，見 lib/maintenance/mode-store.ts 檔頭——
+//                       獨立於 head 的旗標，不經 head 轉發，tg-monitor 直接
+//                       打這台）
 //   POST /jobs          接單：直接走本機既有的 submitCreateMr/
 //                       submitDemandPipeline（佇列、併發上限、去重、
 //                       stale-lock 回收全部沿用單機機制，一行不改）
@@ -43,6 +48,7 @@ import { join } from 'node:path'
 import { getClusterSecret, WORKER_NAME_RE, WORKER_URL_RE } from './lib/cluster/cluster-env.ts'
 import { createClusterAuthGuard, CLUSTER_TOKEN_HEADER } from './lib/cluster/cluster-auth.ts'
 import { respondUniform401 } from './lib/security/uniform-401.ts'
+import { createMaintenanceModeStore } from './lib/maintenance/mode-store.ts'
 import {
   submitCreateMr,
   recoverBugQueue,
@@ -95,6 +101,10 @@ const secret: string = maybeSecret
 // launchd/run-worker-agent.sh）：worker 機上的 telegram-dispatcher checkout
 // 一律在這個固定路徑。
 const LOG_DIR = '/Users/user/aladdin/telegram-dispatcher/logs'
+// 維護模式（2026-09-08）：本機獨立於 head 的旗標，見 lib/maintenance/mode-store.ts
+// 檔頭「belt-and-braces」說明——tg-monitor 直接打這台的 POST /maintenance
+// 開關，不經過 head 轉發。
+const maintenanceMode = createMaintenanceModeStore(join(LOG_DIR, 'maintenance-mode.json'))
 const headUrl = (process.env.CLUSTER_HEAD_URL ?? '').trim().replace(/\/+$/, '')
 const workerName = (process.env.CLUSTER_WORKER_NAME ?? '').trim()
 const advertiseUrl = (process.env.CLUSTER_WORKER_URL ?? '').trim().replace(/\/+$/, '')
@@ -386,6 +396,20 @@ app.get('/capacity', guard, c => {
   })
 })
 
+// 維護模式（2026-09-08，tg-monitor 手動控制）：GET 給 tg-monitor 輪詢顯示
+// 現況（worker 在遠端機器，tg-monitor 沒有本機檔案可讀，跟 head 那份用
+// listWorkers() 直讀 JSON 檔的做法不同，見 lib/maintenance/mode-store.ts
+// 檔頭）；POST 切換，效果只影響下面 /jobs 這一台，不會被 head 轉發。
+app.get('/maintenance', guard, c => c.json({ on: maintenanceMode.isOn() }))
+
+app.post('/maintenance', guard, async c => {
+  const body = (await c.req.json().catch(() => null)) as { on?: unknown } | null
+  if (!body || typeof body.on !== 'boolean') return c.json({ ok: false, reason: 'bad_request' }, 400)
+  maintenanceMode.setOn(body.on)
+  console.error(`worker-agent: 維護模式已${body.on ? '開啟' : '關閉'}（${workerName}）`)
+  return c.json({ ok: true, on: body.on })
+})
+
 // body 欄位驗證（值會流進 tg-notify.sh 參數與落盤的 queue.json）：head 端
 // 這些值來自 tech-users.csv，worker 端對等地上一道廉價格式閘——不含控制
 // 字元、長度有界；email 另驗基本樣式。
@@ -425,6 +449,19 @@ function extractRunId(result: SubmitResult): string | null {
 }
 
 app.post('/jobs', guard, async c => {
+  // 維護模式（2026-09-08）：排在最前面，body 驗證之前——維護期間這台自己
+  // 絕不 spawn 任何背景流程，不管 head 傳了什麼都直接拒絕。
+  //
+  // ⚠️ 注意這只保證「這台不執行」，不保證「這張單完全沒人執行」：
+  // dispatch.ts 的 dispatchBug/dispatchDemand 把這個 503 當成一般的
+  // full/rejected/unreachable 拒絕理由處理，會 clear 派工登記、退回本機
+  // （submitLocal()）——跟現有「worker 名額已滿」「worker 連不上」「worker
+  // 被停用」踩到同一條 fallback，行為一致，不是新問題。也就是說：只單獨
+  // 開這一台的維護模式、head 本身沒開，這張單會改在 head 執行，不會停在候選
+  // 池不受理。要達成「這張單完全不受理」，head 自己的維護模式旗標
+  // （cluster-head.ts 的 isMaintenanceModeOn()）也要一起開——tg-monitor 的
+  // 一鍵切換本來就是 head + 全部 worker 一起打，就是為了避免只開這一台。
+  if (maintenanceMode.isOn()) return c.json({ ok: false, reason: 'maintenance' }, 503)
   const body = (await c.req.json().catch(() => null)) as
     | { kind?: string; ticket?: string; resume?: boolean; mode?: unknown; triggeredBy?: unknown; assigneeEmail?: string; dispatchId?: unknown }
     | null
