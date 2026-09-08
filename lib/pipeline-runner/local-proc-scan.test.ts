@@ -31,6 +31,21 @@ describe('parseRunningPipelineProcs', () => {
     expect(procs[0]!.extra).toBe('/path/FAQ-5.stdout.log')
   })
 
+  test('2026-09-08 起的 wrapper：尾端 `<mode>` 恆帶、`resume` 可選，四種 mode 皆命中且 extra 仍是 stdout 路徑', () => {
+    for (const tail of ['full', 'analysis', 'fix resume', 'reanalyze', 'full resume']) {
+      const ps = `  300     1 bash -c wrapper-script run-create-mr FAQ-5 /path/FAQ-5.stdout.log ${tail}`
+      const { procs } = parseRunningPipelineProcs(ps)
+      expect(procs).toHaveLength(1)
+      expect(procs[0]!.ticket).toBe('FAQ-5')
+      expect(procs[0]!.extra).toBe('/path/FAQ-5.stdout.log')
+    }
+  })
+
+  test('尾端帶不在值域內的 token（防注入面漂移）不命中', () => {
+    const ps = '  300     1 bash -c wrapper-script run-create-mr FAQ-5 /path/FAQ-5.stdout.log bogus'
+    expect(parseRunningPipelineProcs(ps).procs).toHaveLength(0)
+  })
+
   test('同一張票多行命中（wrapper + 子行程指令行剛好也符合正則）時只留 pid 最小的', () => {
     const ps = [
       '  500     1 bash -c wrapper run-create-mr FAQ-1 /path/FAQ-1.stdout.log',

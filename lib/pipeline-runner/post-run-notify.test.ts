@@ -347,6 +347,16 @@ describe('parseRunningBugTickets — 排除自己的 wrapper（2026-08-26 aladdi
     const psOutput = ['1 /sbin/launchd', '42 /usr/sbin/cron'].join('\n')
     expect(parseRunningBugTickets(psOutput, 99999)).toEqual([])
   })
+
+  test('2026-09-08 起 wrapper 尾端帶 mode（恆帶）與 resume（可選）仍能命中；舊格式（無 mode）也仍命中', () => {
+    const psOutput = [
+      `70001 bash -c trap "true" EXIT\\012sleep 3 run-create-mr FAQ-1 /tmp/a.log analysis`,
+      `70002 bash -c trap "true" EXIT\\012sleep 3 run-create-mr FAQ-2 /tmp/b.log fix resume`,
+      `70003 bash -c trap "true" EXIT\\012sleep 3 run-create-mr FAQ-3 /tmp/c.log`,
+      `70004 bash -c trap "true" EXIT\\012sleep 3 run-create-mr FAQ-4 /tmp/d.log resume`,
+    ].join('\n')
+    expect(parseRunningBugTickets(psOutput, 99999).sort()).toEqual(['FAQ-1', 'FAQ-2', 'FAQ-3', 'FAQ-4'])
+  })
 })
 
 describe('buildNotifyText — 2026-09-04：每種分類的通知文字要一眼看出是哪種結束方式（不能共用同一句泛用文字）', () => {

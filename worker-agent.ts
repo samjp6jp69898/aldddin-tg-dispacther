@@ -77,6 +77,7 @@ import { readLocalStageFiles } from './lib/pipeline-runner/local-stage-files.ts'
 import { inferCurrentBugStage } from './lib/pipeline-runner/local-current-stage.ts'
 import type { SubmitResult } from './lib/pipeline-runner/pipeline-queue.ts'
 import type { TechUser } from './lib/user-resolution/tech-user.ts'
+import { isBugMode, type BugMode } from './lib/pipeline-runner/bug-mode.ts'
 
 const BUG_TICKET_RE = /^FAQ-\d+$/
 const DEMAND_TICKET_RE = /^ALDREQ-\d+$/
@@ -425,9 +426,14 @@ function extractRunId(result: SubmitResult): string | null {
 
 app.post('/jobs', guard, async c => {
   const body = (await c.req.json().catch(() => null)) as
-    | { kind?: string; ticket?: string; resume?: boolean; triggeredBy?: unknown; assigneeEmail?: string; dispatchId?: unknown }
+    | { kind?: string; ticket?: string; resume?: boolean; mode?: unknown; triggeredBy?: unknown; assigneeEmail?: string; dispatchId?: unknown }
     | null
   if (!body || typeof body.ticket !== 'string') return c.json({ ok: false, reason: 'bad_request' }, 400)
+  // mode（plan-pipeline-modes-v1 §2.2）：值域封閉，會進 claude -p 的 prompt
+  // 位置參數——來自網路的值不在 BUG_MODES 內就整個請求拒絕，不「當沒帶」
+  // （當沒帶會把同事選的「只做問題分析」靜默跑成一鍵，比 400 更糟）。
+  if (body.mode !== undefined && !isBugMode(body.mode)) return c.json({ ok: false, reason: 'bad_request' }, 400)
+  const mode = body.mode as BugMode | undefined
   const triggeredBy = sanitizeTriggeredBy(body.triggeredBy)
   // §5.3：head 隨請求帶 dispatch_id，本機鑄 run_id 時把它一併寫進
   // runs.dispatch_id（形狀 A COALESCE 補空欄），讓
@@ -456,7 +462,7 @@ app.post('/jobs', guard, async c => {
     // 判 not claimable（2026-09-03 事故，見 tracker-sync.ts 檔內說明）。
     await pullTrackerFromHead(body.ticket)
     ensureTrackerPending(body.ticket)
-    const result = submitCreateMr(body.ticket, { resume: body.resume === true, triggeredBy, dispatchId: dispatchId ?? undefined })
+    const result = submitCreateMr(body.ticket, { resume: body.resume === true, mode, triggeredBy, dispatchId: dispatchId ?? undefined })
     // §5.4：submitCreateMr 現在會在 started/queued 兩種狀態鑄 run_id 並疊加進
     // SubmitResult（見 pipeline-queue.ts 的 SubmitResult.runId 註解）——直接
     // 透傳給 head，不需要另外維護 in-process Map<ticket, runId>。

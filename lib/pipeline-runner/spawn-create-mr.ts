@@ -10,6 +10,7 @@ import { resolveTechUserByEmail, type TechUser } from '../user-resolution/tech-u
 import { writeRunProgress, writeRunOutcomeAuthoritative, type MonitorDbExecutor } from '../monitor-db/writes.ts'
 import type { RunKind } from '../monitor-db/types.ts'
 import { dispatchMonitorWrite } from '../monitor-db/runtime.ts'
+import { BUG_MODES, coerceBugMode, isBugMode, type BugMode } from './bug-mode.ts'
 
 // ─────────────────────────────────────────────────────────────────────────
 // 監控 DB 化（plan-db-as-truth-v3.2.md §9 Phase2；Bug pipeline 生命週期寫入
@@ -237,7 +238,7 @@ trap '
 ' EXIT
 unset CLAUDE_EFFORT
 { echo "diag PATH=$PATH"; echo "diag which claude: $(which -a claude 2>&1 | tr '\\n' ' ')"; echo "diag version: $(${CLAUDE_BIN} --version 2>&1)"; } >&2
-timeout 10800 ${CLAUDE_BIN} -p "/create-mr:create-mr $1 $3" --model opus --permission-mode bypassPermissions --output-format stream-json --verbose
+timeout 10800 ${CLAUDE_BIN} -p "/create-mr:create-mr $1 $3 $4" --model opus --permission-mode bypassPermissions --output-format stream-json --verbose
 `
 // --output-format 於 2026-08-26 由 json 改為 stream-json（+ -p 模式必帶的
 // --verbose）：舊格式整包 JSON 在行程結束那一刻才 flush，執行中 stdout 永遠
@@ -246,12 +247,16 @@ timeout 10800 ${CLAUDE_BIN} -p "/create-mr:create-mr $1 $3" --model opus --permi
 // stream-json 逐行 JSONL 即時落盤，事件物件結構與舊格式陣列元素相同，最後
 // 一行仍是 type=result。下游解析（classify-result.ts、tg-monitor ingest）
 // 均已改為「先試整檔 JSON（相容歷史 log），失敗再逐行 JSONL」雙格式支援。
-// $3 = resume 模式參數：spawnCreateMr 只會傳字面 'resume' 或空字串（TS 端寫死，
-// 不接受任意字串，杜絕注入面）。空字串時 prompt 尾端多一個空白，無害。
-// ⚠ 這些位置參數是 ps 命令列掃描契約的一部分：tg-monitor lib/ingest.ts 與
-// 本目錄 post-run-notify.ts 都用 `run-create-mr <ticket> <stdout> [resume]` 的
-// 尾端樣式辨識 wrapper 行程——要再加新的位置參數，兩處 regex 必須同步放行
-// （2026-08-26 加 resume 時漏了，resume run 被監控面板誤判成已結束，實際踩過）。
+// $3 = 執行模式（2026-09-08，plan-pipeline-modes-v1 §2.2）：恆為 BUG_MODES 之一
+// （full|analysis|fix|reanalyze，spawnCreateMrNow 用 coerceBugMode 保證不會是
+// 空字串或任意字串——舊佇列檔恢復出來的 entry 沒有 mode 欄也會落回 full）。
+// $4 = resume 模式參數：只會傳字面 'resume' 或空字串（TS 端寫死，不接受任意
+// 字串，杜絕注入面）。空字串時 prompt 尾端多一個空白，無害。
+// ⚠ 這些位置參數是 ps 命令列掃描契約的一部分：tg-monitor lib/ingest.ts、本目錄
+// post-run-notify.ts 與 local-proc-scan.ts 都用
+// `run-create-mr <ticket> <stdout> [mode] [resume]` 的尾端樣式辨識 wrapper 行程
+// ——要再加新的位置參數，三處 regex 必須同步放行（2026-08-26 加 resume 時漏了，
+// resume run 被監控面板誤判成已結束，實際踩過；2026-09-08 加 mode 時三處已同步）。
 
 /**
  * T11：CLAIMED 後 fire-and-forget 觸發 /create-mr 背景流程。
@@ -311,7 +316,7 @@ timeout 10800 ${CLAUDE_BIN} -p "/create-mr:create-mr $1 $3" --model opus --permi
 // （§5.3），worker 端鑄 run_id 時一併寫進 runs.dispatch_id（W1 COALESCE 補
 // 空欄），讓 dispatch_attempts.dispatch_id = runs.dispatch_id 可以精確 join。
 // 本機直接觸發（head 自己跑、CLI、reaper auto-retry）沒有這個值，恆為 null。
-export type BugPayload = { resume: boolean; runId: string; retryOfRunId: string | null; dispatchId: string | null }
+export type BugPayload = { resume: boolean; mode: BugMode; runId: string; retryOfRunId: string | null; dispatchId: string | null }
 
 const BUG_RUN_KIND: RunKind = 'bug'
 
@@ -355,9 +360,11 @@ function spawnCreateMrNow(entry: QueueEntry<BugPayload>, onExit: () => void): { 
     // runId，寫入哪一種終態互斥於「有沒有真的拿到 pid」，不會重複寫。
     const legacyKey = base
 
-    // 第三個位置參數（$3）固定只有兩個可能值：'resume' 或 ''——見 WRAPPER_SCRIPT
-    // 尾註解，不把呼叫端任意字串放進 prompt。
-    const pid = spawnDetachedProcess('bash', ['-c', WRAPPER_SCRIPT, 'run-create-mr', ticket, stdoutPath, entry.payload.resume ? 'resume' : ''], {
+    // 位置參數 $3 = mode（BUG_MODES 封閉值域；佇列檔恢復出來的舊 entry 沒有
+    // mode 欄 → coerce 成 full）、$4 = 'resume' 或 ''——見 WRAPPER_SCRIPT 尾註解，
+    // 不把呼叫端任意字串放進 prompt。
+    const mode = coerceBugMode(entry.payload.mode)
+    const pid = spawnDetachedProcess('bash', ['-c', WRAPPER_SCRIPT, 'run-create-mr', ticket, stdoutPath, mode, entry.payload.resume ? 'resume' : ''], {
       cwd: '/Users/user/aladdin',
       stdoutPath,
       stderrPath,
@@ -367,7 +374,10 @@ function spawnCreateMrNow(entry: QueueEntry<BugPayload>, onExit: () => void): { 
       // /create-mrs 不會設這個環境變數，行為不受影響。
       // MON_RUN_ID（v3.2 §5.2）：一律顯式覆寫成這次 spawn 鑄好的 run_id——
       // post-run-notify.ts／auto-retry 沿這條 env 繼承鏈讀到的正是這個值。
-      env: { DISPATCHER_TRIGGERED: '1', MON_RUN_ID: runId },
+      // MON_BUG_MODE（2026-09-08）：同一招——EXIT trap 裡的 post-run-notify.ts
+      // 觸發 timeout 自動重試時，submitCreateMr 預設從這個 env 繼承模式，讓
+      // 「只做問題分析」的票重試後仍是只做問題分析，不會退化成一鍵。
+      env: { DISPATCHER_TRIGGERED: '1', MON_RUN_ID: runId, MON_BUG_MODE: mode },
       // 【v3.2 §9 Phase2】非同步 'error' 事件：child 從未真正開始執行，若
       // 上面已經（樂觀地）寫過 running，這裡要把它改寫成 spawn_error（W2 的
       // 守衛允許覆寫 outcome IS NULL 的列，不會跟下面成功路徑衝突——二者
@@ -658,17 +668,24 @@ export function tryDispatchBugQueueFront(attempt: (entry: QueueEntry<BugPayload>
  */
 export function submitCreateMr(
   ticket: string,
-  opts: { resume?: boolean; triggeredBy?: TechUser; retryOf?: string; dispatchId?: string } = {},
+  opts: { resume?: boolean; mode?: BugMode; triggeredBy?: TechUser; retryOf?: string; dispatchId?: string } = {},
 ): SubmitResult {
   if (!TICKET_RE.test(ticket)) {
     throw new Error(`拒絕 spawn：ticket 格式不對（${ticket}），可能是注入嘗試`)
+  }
+  if (opts.mode !== undefined && !isBugMode(opts.mode)) {
+    throw new Error(`拒絕 spawn：mode 不在值域內（${String(opts.mode)}），可能是注入嘗試`)
   }
   const triggeredBy: QueueTriggeredBy = opts.triggeredBy
     ? { name: opts.triggeredBy.notion_user_name, email: opts.triggeredBy.email }
     : null
   const runId = randomUUID()
   const retryOfRunId = opts.retryOf ?? ((process.env.MON_RUN_ID ?? '').trim() || null)
-  const result = bugQueue.submit(ticket, triggeredBy, { resume: !!opts.resume, runId, retryOfRunId, dispatchId: opts.dispatchId ?? null })
+  // mode 解析順序：呼叫端顯式指定 > 上一輪 run 的 MON_BUG_MODE（EXIT trap 子行程
+  // 自動重試繼承，與 retryOfRunId 同一條 env 鏈）> full。常駐 server/worker
+  // 行程沒有 MON_BUG_MODE，顯式未給就是 full——跟加 mode 之前的行為相同。
+  const mode: BugMode = opts.mode ?? coerceBugMode(process.env.MON_BUG_MODE)
+  const result = bugQueue.submit(ticket, triggeredBy, { resume: !!opts.resume, mode, runId, retryOfRunId, dispatchId: opts.dispatchId ?? null })
   if (result.ok && (result.status === 'started' || result.status === 'queued')) {
     return { ...result, runId }
   }
@@ -706,6 +723,19 @@ if (import.meta.main) {
   // 會把單留在一個馬上就要結束的 process 的 in-memory 佇列裡。真正的併發上限
   // 由呼叫端（tg-monitor）自己用 ps 現場計數把關，跟以前一樣。
   const resume = process.argv.includes('--resume')
+  // `--mode <full|analysis|fix|reanalyze>`（2026-09-08）：值域外直接拒絕 spawn
+  // （exit 1），比照 --triggered-by-email 的紀律——寧可讓呼叫端重來，不要靜默
+  // 跑成一鍵。省略時交給 submitCreateMr 的預設（MON_BUG_MODE 繼承 → full）。
+  let mode: BugMode | undefined
+  const modeFlagIdx = process.argv.indexOf('--mode')
+  if (modeFlagIdx !== -1) {
+    const raw = process.argv[modeFlagIdx + 1] ?? ''
+    if (!isBugMode(raw)) {
+      console.log(JSON.stringify({ ok: false, reason: `--mode 值不合法：${raw || '(空)'}（允許：${BUG_MODES.join('|')}）` }))
+      process.exit(1)
+    }
+    mode = raw
+  }
   // `--triggered-by-email <email>`（2026-09-01）：非 Telegram 觸發的重跑（人工
   // CLI、tg-monitor 重試）預設不會寫 triggered-by sidecar，tg-monitor「發起人」
   // 欄會空白。呼叫端可帶原認領人的 email，這裡查 tech-users.csv 換成 TechUser
@@ -723,7 +753,7 @@ if (import.meta.main) {
     }
     triggeredBy = user
   }
-  const result = submitCreateMr(ticket, { resume, triggeredBy })
+  const result = submitCreateMr(ticket, { resume, mode, triggeredBy })
   console.log(JSON.stringify(result))
   process.exit(result.ok ? 0 : 1)
 }

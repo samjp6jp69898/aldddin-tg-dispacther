@@ -13,6 +13,12 @@ import type { SpoolEntry } from '../monitor-db/spool/types.ts'
 // 這個字串常數做結構斷言：三個呼叫都在同一個 trap 區塊內、且順序是
 // release → cleanup-worktree → post-run-notify（T28 的順序取捨見
 // spawn-create-mr.ts 對應註解）。
+describe('WRAPPER_SCRIPT — prompt 位置參數（2026-09-08 plan-pipeline-modes-v1 §2.2）', () => {
+  test('claude -p 的 prompt 帶 `$1 $3 $4`（ticket / mode / resume），mode 在 resume 之前', () => {
+    expect(WRAPPER_SCRIPT).toContain('"/create-mr:create-mr $1 $3 $4"')
+  })
+})
+
 describe('WRAPPER_SCRIPT — EXIT trap 內收尾呼叫的順序（T13/T28 依賴的結構）', () => {
   test('bug-lock release → cleanup-worktree → post-run-notify，三者都在同一個 trap 區塊內', () => {
     const trapMatch = /trap '([\s\S]*?)' EXIT/.exec(WRAPPER_SCRIPT)

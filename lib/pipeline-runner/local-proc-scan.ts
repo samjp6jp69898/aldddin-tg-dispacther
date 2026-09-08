@@ -35,9 +35,11 @@ export function parseRunningPipelineProcs(psOutput: string): { procs: RunningPro
     const cmd = m[3]!
     ppidMap.set(pid, ppid)
     if (!cmd.startsWith('bash -c ')) continue
-    // 尾端可選的字面 `resume`（比照 spawn-create-mr.ts $3 只有 {'resume', ''}
-    // 兩個值，見 tg-monitor/lib/ingest.ts scanRunningPipelineProcs 同款正則）。
-    let mm = /^bash -c [\s\S]*\brun-create-mr\s+([A-Z]+-\d+)\s+(\S+?)(?:\s+resume)?\s*$/.exec(cmd)
+    // 尾端：`[mode] [resume]`（2026-09-08 起 spawn-create-mr.ts 的 $3 = mode
+    // full|analysis|fix|reanalyze 恆帶、$4 = 'resume' 可選；mode 群組寫可選以
+    // 相容加 mode 之前就 spawn 的舊 wrapper。見 tg-monitor/lib/ingest.ts
+    // scanRunningPipelineProcs 與 post-run-notify.ts RUN_CREATE_MR_PROC_RE 同款正則）。
+    let mm = /^bash -c [\s\S]*\brun-create-mr\s+([A-Z]+-\d+)\s+(\S+?)(?:\s+(?:full|analysis|fix|reanalyze))?(?:\s+resume)?\s*$/.exec(cmd)
     if (mm) {
       procs.push({ pid, kind: 'bug', ticket: mm[1]!, extra: mm[2]! })
       continue

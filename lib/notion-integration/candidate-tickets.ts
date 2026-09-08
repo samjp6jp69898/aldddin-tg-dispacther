@@ -1,10 +1,11 @@
 import { execFile, execFileSync } from 'node:child_process'
 import { promisify } from 'node:util'
+import type { BugMode } from '../pipeline-runner/bug-mode.ts'
 
 const execFileAsync = promisify(execFile)
 
 const NOTION_SH = '/Users/user/aladdin/scripts/notion.sh'
-const DATA_SOURCE_ID = '21c87d78-618a-817f-ae71-000baa9ab11b'
+export const DATA_SOURCE_ID = '21c87d78-618a-817f-ae71-000baa9ab11b'
 // 2026-08-23 review 發現：queryTicketPage 原本（getTicketNotionUrl 既有的
 // execFileSync 呼叫）沒有帶 timeout，跟這個檔案的 queryCandidateTickets、
 // post-run-notify.ts 其他所有 execFileSync 呼叫都刻意帶 timeout 的既有慣例
@@ -16,21 +17,51 @@ const EXEC_TIMEOUT_MS = 30_000
 
 // 唯一可認領判準（見 tasks.json architecture_summary / changelog：使用者定案，
 // 不再拿 tracker.sh row 的 pending/rerun 狀態做二次篩選）。
-const WANTED_STATUSES = ['仍有問題', '待處理']
+export const WANTED_STATUSES = ['仍有問題', '待處理']
 
-// 比照 demand-pool-tickets.ts 的 WANTED_AI_ANALYSIS：只有『待分析』（人工已
-// 標記可分析）與『需要重跑』（分析過但要求重來一次）才算候選，其餘值（含
-// 空值、待規劃/待釐清/分析中/分析成功/分析失敗/不需分析）一律不出現在候選
-// 清單。這裡是 select 型（Bug List 的『狀態』也是 select 型，跟需求池的
-// status 型不同，不要混用 { status: { equals } } 語法）。
-const WANTED_AI_ANALYSIS = ['待分析', '需要重跑']
+// Bug List「AI分析」值 → pipeline 執行模式（2026-09-08 起，見
+// pipeline-modes-project-docs/plan-pipeline-modes-v1.md §2.1 對照表）。只有
+// 出現在這張表的值才算候選；其餘（空值、待規劃/待釐清/分析中/分析成功/
+// 分析失敗/不需分析/問題分析完成，待確認）一律不出現在候選清單。
+//
+// 『待分析』『需要重跑』是**舊名**：Phase 2 會在 Notion 把它們改名為『一鍵分析
+// ＋修復＋開 MR』『全部重跑』（option id 不變、歷史票自動跟著改）。改名前後這
+// 兩組字串都要能認，避免候選清單空窗；Notion 改名確認後再把舊名拿掉。
+// ⚠ 需求池（demand-pool-tickets.ts）是另一顆 DB，它的『待分析』『需要重跑』
+// 不在本次改名範圍，不要動。
+export const AI_ANALYSIS_TO_MODE: Readonly<Record<string, BugMode>> = Object.freeze({
+  待分析: 'full',
+  需要重跑: 'full',
+  '一鍵分析＋修復＋開 MR': 'full',
+  全部重跑: 'full',
+  '只做問題分析（不改程式）': 'analysis',
+  '產出修復程式碼並開 MR': 'fix',
+  '依補充留言重新分析（仍不改程式）': 'reanalyze',
+})
 
-function buildFilter(notionUserId: string): object {
+// 2026-09-08 實測：Notion `select.equals` filter 帶**目前不存在**的 option 名稱
+// 會整個請求 400（`select option "…" not found for property "AI分析"`），所以
+// AI分析 的值域過濾**不能**放進 API filter——否則新舊名並存的過渡期、或任何
+// 一次 Notion 改名都會讓候選查詢直接炸掉。本檔的 buildFilter 只在 API 端過濾
+// 「當前指派 + 狀態」，AI分析 改由 candidatesFromResults 用上面的對照表在程式
+// 端過濾（每人名下 仍有問題/待處理 的票數量有限，多拉幾列成本可忽略）。
+//
+// WANTED_AI_ANALYSIS 保留給仍用 API filter 的消費端（lib/ops-ui/notion-tickets.ts
+// 的 buildBugFilter 直接 import）：這個清單**只能放 Notion 當下真的存在的
+// option 名稱**，Phase 2 在 Notion 新增/改名選項時要同一批更新，否則該消費端
+// 的查詢會 400。它是對照表 key 的子集，不是等價物。
+export const WANTED_AI_ANALYSIS: readonly string[] = ['待分析', '需要重跑']
+
+export type CandidateTicket = { ticket: string; aiAnalysis: string; mode: BugMode }
+
+/** API 端 filter：只過濾 當前指派 + 狀態（select 型；Bug List 的『狀態』也是
+ * select 型，跟需求池的 status 型不同，不要混用 { status: { equals } } 語法）。
+ * AI分析 的過濾在 candidatesFromResults，理由見上方 WANTED_AI_ANALYSIS 註解。 */
+export function buildFilter(notionUserId: string): object {
   return {
     and: [
       { property: '當前指派', people: { contains: notionUserId } },
       { or: WANTED_STATUSES.map(status => ({ property: '狀態', select: { equals: status } })) },
-      { or: WANTED_AI_ANALYSIS.map(value => ({ property: 'AI分析', select: { equals: value } })) },
     ],
   }
 }
@@ -63,6 +94,15 @@ function buildFilter(notionUserId: string): object {
  * 耗時 400-720ms，遠低於 grammy 10 秒 timeout。
  */
 export async function queryCandidateTickets(notionUserId: string): Promise<string[]> {
+  return (await queryCandidateTicketsWithMode(notionUserId)).map(c => c.ticket)
+}
+
+/**
+ * 同 queryCandidateTickets，但每張單附上 Notion 當下的「AI分析」值與對應的
+ * pipeline 模式（2026-09-08）。claim.ts 認領時用這個決定 spawn 帶哪個 mode；
+ * ticket-list.ts 用它在按鈕上標示會做到哪一步。
+ */
+export async function queryCandidateTicketsWithMode(notionUserId: string): Promise<CandidateTicket[]> {
   const filterJson = JSON.stringify(buildFilter(notionUserId))
   const { stdout: raw } = await execFileAsync('bash', [NOTION_SH, 'query-datasource', DATA_SOURCE_ID, filterJson], {
     encoding: 'utf8',
@@ -73,11 +113,22 @@ export async function queryCandidateTickets(notionUserId: string): Promise<strin
   if (!Array.isArray(parsed.results)) {
     throw new Error(`notion.sh query-datasource 回傳非預期格式: ${raw.slice(0, 500)}`)
   }
+  return candidatesFromResults(parsed.results)
+}
 
-  return parsed.results
-    .map((page: any) => page.properties?.['單號']?.unique_id?.number)
-    .filter((n: unknown): n is number => typeof n === 'number')
-    .map((n: number) => `FAQ-${n}`)
+/** 純函式（可測）：query-datasource 的 results → 候選單。單號缺失、或 AI分析
+ * 值不在對照表（理論上 filter 已擋掉，這裡是防禦）一律略過。 */
+export function candidatesFromResults(results: unknown[]): CandidateTicket[] {
+  const out: CandidateTicket[] = []
+  for (const page of results as any[]) {
+    const n = page?.properties?.['單號']?.unique_id?.number
+    const aiAnalysis = page?.properties?.['AI分析']?.select?.name
+    if (typeof n !== 'number' || typeof aiAnalysis !== 'string') continue
+    const mode = AI_ANALYSIS_TO_MODE[aiAnalysis]
+    if (!mode) continue
+    out.push({ ticket: `FAQ-${n}`, aiAnalysis, mode })
+  }
+  return out
 }
 
 /**

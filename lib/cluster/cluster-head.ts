@@ -4,7 +4,7 @@ import { getClusterSecret, CLUSTER_TICKET_RE, WORKER_NAME_RE } from './cluster-e
 import { createClusterAuthGuard } from './cluster-auth.ts'
 import { createWorkerRegistry } from './worker-registry.ts'
 import { createDispatchRegistry, DISPATCH_STATUS_RANK, type DispatchEntry } from './dispatch-registry.ts'
-import { createDispatcher, type DispatchAttemptWriteDeps, type DispatchResult } from './dispatch.ts'
+import { createDispatcher, type BugDispatchOpts, type DispatchAttemptWriteDeps, type DispatchResult } from './dispatch.ts'
 import { createRemoteSweeper } from './remote-sweeper.ts'
 import { recordWorkerMonitorStatus } from './worker-monitor-status.ts'
 import { createBacklogDispatcher } from './backlog-dispatcher.ts'
@@ -120,7 +120,7 @@ const dispatcher = createDispatcher({
       // techUser 可為 null、opts.resume 透傳給 submitCreateMr 的 `--resume`
       // 語意（2026-09-04，task 2：tg-monitor 續跑改走這條路徑，見下方
       // registerClusterRoutes 新增的 POST /cluster/retry）。
-      submit: (ticket, techUser, opts) => submitCreateMr(ticket, { triggeredBy: techUser ?? undefined, resume: opts?.resume }),
+      submit: (ticket, techUser, opts) => submitCreateMr(ticket, { triggeredBy: techUser ?? undefined, resume: opts?.resume, mode: opts?.mode }),
     },
     demand: {
       stats: getDemandQueueStats,
@@ -161,7 +161,7 @@ export function isClusterEnabled(): boolean {
 /** claim.ts 的 submitCreateMr 替身：cluster 停用或無 worker 時走本機（等同
  * 既有行為），否則依名額派工。techUser 可為 null（task 2：tg-monitor 續跑
  * 查不到原認領人 email 時）；opts.resume 透傳 `--resume` 語意。 */
-export function dispatchBug(ticket: string, techUser: TechUser | null, opts?: { resume?: boolean }): Promise<DispatchResult> {
+export function dispatchBug(ticket: string, techUser: TechUser | null, opts?: BugDispatchOpts): Promise<DispatchResult> {
   return dispatcher.dispatchBug(ticket, techUser, opts)
 }
 

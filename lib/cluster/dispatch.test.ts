@@ -35,7 +35,7 @@ function makeHarness(opts: {
   const dir = mkdtempSync(join(tmpdir(), 'dispatch-test-'))
   const registry = createDispatchRegistry(join(dir, 'dispatched.json'))
   const localSubmits: string[] = []
-  const localSubmitOpts: ({ resume?: boolean } | undefined)[] = []
+  const localSubmitOpts: ({ resume?: boolean; mode?: string } | undefined)[] = []
   const postedJobs: { worker: string; job: JobRequest }[] = []
   const probedTickets: { worker: string; ticket: string }[] = []
   const dispatchAttemptCalls: { fn: 'create' | 'advance' | 'supersedeOthers'; input: Record<string, unknown> }[] = []
@@ -328,6 +328,31 @@ describe('createDispatcher — dispatch_attempts 觀察面寫入（plan §5.3）
     const r = await createDispatcher(deps).dispatchBug('FAQ-1', USER)
     expect(r).toEqual({ ok: true, status: 'remote_started', worker: 'w1' })
     rmSync(dir, { recursive: true, force: true })
+  })
+})
+
+describe('createDispatcher — 執行模式 mode（2026-09-08，plan-pipeline-modes-v1 §2.2）：與 resume 正交，兩條路徑都透傳', () => {
+  test('本機優先時：mode 透傳進 local.bug.submit 的 opts', async () => {
+    const h = makeHarness({ workers: [worker('w1')], capacities: { w1: cap(stats(4)) }, localBugStats: idle })
+    const r = await h.dispatcher.dispatchBug('FAQ-1', USER, { mode: 'analysis' })
+    expect(r).toEqual({ ok: true, status: 'started', pid: 99 })
+    expect(h.localSubmitOpts).toEqual([{ mode: 'analysis' }])
+    h.cleanup()
+  })
+
+  test('派到 worker 時：job body 帶 mode；resume 同時存在時兩者都在', async () => {
+    const h = makeHarness({ workers: [worker('w1')], capacities: { w1: cap(idle) }, localBugStats: full })
+    const r = await h.dispatcher.dispatchBug('FAQ-1', USER, { mode: 'fix', resume: true })
+    expect(r).toEqual({ ok: true, status: 'remote_started', worker: 'w1' })
+    expect(h.postedJobs[0]!.job).toMatchObject({ kind: 'bug', ticket: 'FAQ-1', mode: 'fix', resume: true })
+    h.cleanup()
+  })
+
+  test('不帶 mode（既有呼叫端／續跑）：job body 不含 mode 欄位——由執行端 submitCreateMr 決定預設', async () => {
+    const h = makeHarness({ workers: [worker('w1')], capacities: { w1: cap(idle) }, localBugStats: full })
+    await h.dispatcher.dispatchBug('FAQ-1', USER, { resume: true })
+    expect(h.postedJobs[0]!.job.mode).toBeUndefined()
+    h.cleanup()
   })
 })
 

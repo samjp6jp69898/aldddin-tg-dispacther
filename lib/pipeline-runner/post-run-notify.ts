@@ -48,7 +48,10 @@ const BUG_PIPELINE_CONCURRENCY_LIMIT = 5
 // {'resume', ''}——resume 模式的 wrapper 命令列多一個尾 token，不允許它的話
 // resume run 會完全掃不到（tg-monitor lib/ingest.ts 同一條 regex 實際踩過，
 // 兩處要同步維護）。
-const RUN_CREATE_MR_PROC_RE = /^bash -c [\s\S]*\brun-create-mr\s+([A-Z]+-\d+)\s+(\S+?)(?:\s+resume)?\s*$/
+// 2026-09-08 起 $3 = mode（full|analysis|fix|reanalyze，恆帶）、$4 = resume 可選：
+// `run-create-mr <ticket> <stdout> [mode] [resume]`。mode 群組寫成可選是為了
+// 相容加 mode 之前就 spawn、還在跑的舊 wrapper。
+const RUN_CREATE_MR_PROC_RE = /^bash -c [\s\S]*\brun-create-mr\s+([A-Z]+-\d+)\s+(\S+?)(?:\s+(?:full|analysis|fix|reanalyze))?(?:\s+resume)?\s*$/
 
 // T13：create-mr.md 自己的出口表已經處理過這三種——不重複發：
 //   - success / needs_qa_clarification：Step 7b.1 / 7c 已發過 TG。

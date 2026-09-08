@@ -2,6 +2,7 @@ import { CLUSTER_TOKEN_HEADER } from './cluster-auth.ts'
 import type { SubmitResult } from '../pipeline-runner/pipeline-queue.ts'
 import type { TechUser } from '../user-resolution/tech-user.ts'
 import type { ProgressStage } from '../pipeline-runner/ticket-progress.ts'
+import type { BugMode } from '../pipeline-runner/bug-mode.ts'
 
 // head → worker 的 HTTP client。所有呼叫都帶 AbortSignal.timeout——這是
 // 網路 I/O 的逾時上限（打不通就放棄、走下一個候選），不是用等待解決任何
@@ -31,6 +32,9 @@ export type JobRequest = {
   kind: 'bug' | 'demand'
   ticket: string
   resume?: boolean
+  /** bug 專用：pipeline 執行模式（plan-pipeline-modes-v1 §2.2）。省略＝full。
+   * worker 端 /jobs 會用 isBugMode() 驗值域，不合法整個請求 400。 */
+  mode?: BugMode
   triggeredBy?: TechUser
   assigneeEmail?: string
   /** head 端 dispatch-registry.ts 鑄的 monitor DB `dispatch_attempts.dispatch_id`

@@ -3,6 +3,7 @@ import { DISPATCH_STATUS_RANK, type DispatchRegistry } from './dispatch-registry
 import type { WorkerInfo } from './worker-registry.ts'
 import type { CapacityReport, JobRequest, PostJobResult, QueueStats } from './worker-client.ts'
 import type { TechUser } from '../user-resolution/tech-user.ts'
+import type { BugMode } from '../pipeline-runner/bug-mode.ts'
 
 // 派工選擇邏輯（head 專用）。純邏輯、全部依賴注入，不直接 import 任何會
 // spawn/打網路的模組——production 接線在 cluster-head.ts，測試各自注入假件。
@@ -86,6 +87,10 @@ export type DispatchAttemptWriteDeps = {
   }) => void
 }
 
+/** bug 派工的附加選項：resume（續跑，tg-monitor 重試/自動重試）與 mode
+ * （執行模式，claim.ts 依 Notion AI分析 值決定）正交，可同時存在。 */
+export type BugDispatchOpts = { resume?: boolean; mode?: BugMode }
+
 export type DispatchDeps = {
   registry: DispatchRegistry
   listWorkers: () => WorkerInfo[]
@@ -99,7 +104,7 @@ export type DispatchDeps = {
       /** triggeredBy 可為 null（2026-09-04，task 2：tg-monitor 的續跑不一定
        * 查得到原認領人 email）；opts.resume 同上新增，讓 tg-monitor 的
        * `/api/pipelines/retry` 走這條分派路徑時能帶 `--resume` 語意。 */
-      submit: (ticket: string, triggeredBy: TechUser | null, opts?: { resume?: boolean }) => SubmitResult
+      submit: (ticket: string, triggeredBy: TechUser | null, opts?: BugDispatchOpts) => SubmitResult
     }
     demand: {
       stats: () => QueueStats
@@ -134,7 +139,7 @@ export function createDispatcher(deps: DispatchDeps) {
     ticket: string,
     techUser: TechUser | null,
     assigneeEmail: string,
-    opts?: { resume?: boolean },
+    opts?: BugDispatchOpts,
   ): Promise<DispatchResult> {
     const localSide = deps.local[kind]
     const submitLocal = (): SubmitResult =>
@@ -202,7 +207,7 @@ export function createDispatcher(deps: DispatchDeps) {
       // 欄，事後仍能用 runs.dispatch_id = dispatch_attempts.dispatch_id 精確 join。
       const job: JobRequest =
         kind === 'bug'
-          ? { kind, ticket, triggeredBy: techUser ?? undefined, dispatchId, ...(opts?.resume ? { resume: true } : {}) }
+          ? { kind, ticket, triggeredBy: techUser ?? undefined, dispatchId, ...(opts?.resume ? { resume: true } : {}), ...(opts?.mode ? { mode: opts.mode } : {}) }
           : { kind, ticket, triggeredBy: techUser ?? undefined, assigneeEmail, dispatchId }
       const r = await deps.postJob(best.worker, job)
       if (r.accepted) {
@@ -264,7 +269,7 @@ export function createDispatcher(deps: DispatchDeps) {
   }
 
   return {
-    dispatchBug: (ticket: string, techUser: TechUser | null, opts?: { resume?: boolean }) => dispatch('bug', ticket, techUser, '', opts),
+    dispatchBug: (ticket: string, techUser: TechUser | null, opts?: BugDispatchOpts) => dispatch('bug', ticket, techUser, '', opts),
     dispatchDemand: (ticket: string, assigneeEmail: string, techUser: TechUser | null) => dispatch('demand', ticket, techUser, assigneeEmail),
   }
 }
