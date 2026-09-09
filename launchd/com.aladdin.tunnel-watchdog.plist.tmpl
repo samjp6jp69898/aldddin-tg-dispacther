@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.aladdin.tunnel-watchdog.__WORKER__</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/zsh</string>
+        <string>/Users/user/aladdin/telegram-dispatcher/launchd/tunnel-watchdog.sh</string>
+        <string>__WORKER__</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/user/aladdin/telegram-dispatcher</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/user/.bun/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>LANG</key>
+        <string>en_US.UTF-8</string>
+    </dict>
+
+    <!-- 跟 monitor-tunnel.<worker> 本身（KeepAlive 常駐）不同：這支是「每隔
+         一段時間跑一次、跑完就結束」的探測腳本，用 StartInterval 週期觸發，
+         不用 KeepAlive。60 秒一次（跟 worker heartbeat 寫入頻率一致）：配合
+         腳本內 STALE_THRESHOLD_SECONDS=180 + FAILURE_THRESHOLD=2，最慢在
+         tunnel 真的卡死後約 4 分鐘內完成偵測＋通知＋嘗試自動重啟。 -->
+    <key>StartInterval</key>
+    <integer>60</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/user/aladdin/telegram-dispatcher/logs/launchd-tunnel-watchdog.__WORKER__.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/user/aladdin/telegram-dispatcher/logs/launchd-tunnel-watchdog.__WORKER__.err.log</string>
+</dict>
+</plist>

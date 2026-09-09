@@ -189,3 +189,48 @@ loopback，讓 worker 能像連本機一樣連監控 DB、把 log 經同一條�
   且已載入，供 `doctor-monitor.sh` 日後引用。名冊 JSON parse 失敗時直接
   `exit 1`、不做任何 teardown，避免把所有現存 tunnel job 誤刪。部分失敗語意
   與 `set-monitor-flag.sh` 一致：逐台續跑、結束時非 0 並列出失敗機、重跑冪等。
+
+## tunnel watchdog（2026-09-09，ALDREQ-812 事故後新增，已上線）
+
+`monitor-tunnel.<worker>` 有一種 launchd `KeepAlive` 抓不到的故障模式：SSH
+process 沒退出，但底層的反向 tunnel 半死——TCP port 還在 accept（`nc -z`
+測得到），實際 MySQL 查詢卻會卡住/逾時。2026-09-09 實測踩過一次：worker 掉線
+又重連後，tunnel 表面上恢復但一直半死，導致該 worker 的所有監控 DB 寫入
+（含 heartbeat 自己）持續失敗、落 spool 且沒有東西會主動重放，直到人工發現
+才 `launchctl kickstart -k` 手動重啟解決。跟 `launchd/health-watchdog.sh`
+（T19，補 webhook server event loop 卡死的缺口）同一種思路，這裡補的是
+tunnel 這一層的等價缺口。
+
+- **偵測手法**：不從 worker 端量（worker 自己卡在同一條壞掉的 tunnel 上量不
+  出來），改從 head 端讀 `monitor_heartbeat`——worker 每 60 秒該寫一次心跳，
+  head 讀這張表走本機直連（不經任何 tunnel）。心跳新鮮＝tunnel 通；心跳過期
+  ＝tunnel 卡死。查詢邏輯獨立成
+  `lib/monitor-db/check-worker-heartbeat.ts <worker-name>`，輸出
+  `AGE_SECONDS <n>` / `NO_ROW` / `DB_ERROR <msg>` 三種結果，後者兩種都不當
+  tunnel 壞掉的證據（`NO_ROW`＝worker 可能還沒部署完成；`DB_ERROR`＝head 自己
+  的 DB 有問題，不該拿去重啟 worker 的 tunnel）。
+- **腳本**：`launchd/tunnel-watchdog.sh <worker-name>`，跟 `health-watchdog.sh`
+  同一套慣例——`STALE_THRESHOLD_SECONDS=180`（允許漏跳 2 拍心跳）+
+  `FAILURE_THRESHOLD=2`（連續 2 輪過期才動手，避免單次慢查詢誤報），翻轉那
+  一刻才通知＋`launchctl kickstart -k gui/$(id -u)/com.aladdin.monitor-tunnel.<worker>`
+  一次（不會每次都重啟造成迴圈），持續卡死不重複通知，恢復時另外報一次恢復。
+  狀態記在 `logs/watchdog-state.tunnel.<worker>`。測試用替身：
+  `WATCHDOG_CHECK_CMD`（整條檢查指令）、`WATCHDOG_KICKSTART_CMD`、
+  `WATCHDOG_TG_NOTIFY_SH`、`WATCHDOG_STATE_FILE`、`WATCHDOG_LOG_FILE`。
+- **plist 模板**：`launchd/com.aladdin.tunnel-watchdog.plist.tmpl`，佔位符
+  `__WORKER__`，`StartInterval=60`（跟心跳頻率一致）。跟 monitor-tunnel 本身
+  同一個慣例：repo 只放模板，per-worker 的實體 plist 手動渲染（或未來併入
+  `sync-tunnels.sh`）到 `~/Library/LaunchAgents/`，不進 repo；模板不得出現
+  任何 IP/host。
+- **跟 `health-watchdog.sh`（webhook server watchdog）的差異**：後者故意
+  「預設未啟用」，因為誤判重啟有已知的交互作用風險（`stale-lock-reaper.ts`
+  同步鎖住整條 event loop 時可能被誤判成卡死，見上方主 README 的「已知操作
+  風險」）。tunnel watchdog 沒有這個風險——`monitor-tunnel.<worker>` 只是一個
+  無狀態的 `ssh -N` port-forward，重啟它頂多讓當下正在途中的查詢改走既有的
+  spool-fallback 路徑（設計上本來就允許、也是這整套監控 DB 的核心正確性
+  保證），不會遺失資料，所以**這支 watchdog 已直接上線、不是選配**。
+- **狀態（2026-09-09，已對 landon2 上線）**：已渲染 `com.aladdin.tunnel-
+  watchdog.landon2.plist` 並 `launchctl bootstrap`，實測跑過兩輪（`launchctl
+  print` 的 `runs`／`last exit code` 可查），`watchdog-state.tunnel.landon2`
+  正確回報 `state=healthy`。之後新增 worker 時記得比照這個手動步驟另外裝一份
+  （或等 `sync-tunnels.sh` 併入這支 job 之後改回自動化）。
