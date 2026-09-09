@@ -25,7 +25,6 @@ const SPAWN_ERROR_LOG = join(LOG_DIR, 'spawn-errors.log')
 const RUN_DEMAND_PIPELINE_TS = '/Users/user/aladdin/telegram-dispatcher/lib/pipeline-runner/run-demand-pipeline.ts'
 const POST_RUN_DEMAND_TS = '/Users/user/aladdin/telegram-dispatcher/lib/pipeline-runner/post-run-demand.ts'
 const BUG_LOCK_SH = '/Users/user/aladdin/scripts/bug-lock.sh'
-const TG_NOTIFY_SH = '/Users/user/aladdin/scripts/tg-notify.sh'
 
 // review 發現：run-demand-pipeline.ts 內部每個外部呼叫都各自有 timeout，
 // 但整支腳本本身沒有一個外層總時限——跟 create-mr 的 WRAPPER_SCRIPT 用
@@ -48,17 +47,24 @@ const OUTER_TIMEOUT_SECONDS = 10800 // 跟 create-mr 的既有值一致，run-de
 // 「demand 終態（trap 側）」列）。post-run-demand.ts 只是安全網——正常路徑
 // 的結構化終態由 run-demand-pipeline.ts 自己的 finalize() 寫（見該檔）；
 // 這裡只補「行程被 timeout/SIGKILL 中途打斷、完全沒機會跑到 finally」的
-// 情況。同一個 shell（不是 subshell），MON_RUN_ID 已由 spawnDetachedProcess
-// 的 env 覆寫帶進來，trap 內直接繼承，不需要另外查 DB／讀檔。
+// 情況（monitor 頁面手動取消也走這條路：cancelPipeline 對子孫送 SIGTERM，
+// 這行 timeout/bun 就是被中途打斷，不會跑到 run-demand-pipeline.ts 自己的
+// finally）。同一個 shell（不是 subshell），MON_RUN_ID 已由
+// spawnDetachedProcess 的 env 覆寫帶進來，trap 內直接繼承，不需要另外查
+// DB／讀檔。
 // `>/dev/null 2>&1`：跟 release 同理，不弄髒 stdout log。
+// 2026-09-09（使用者實測回報：手動取消 ALDREQ-746 後 Notion AI分析 沒改回
+// 去、TG 也沒查到送達紀錄）：TG 通知與（新增的）Notion AI分析 重置都改移進
+// post-run-demand.ts 裡統一處理（見該檔），不再由這裡直接呼叫
+// tg-notify.sh——原本 `[ "$EC" -ne 0 ]` 才發 TG 的判斷，還有 Notion 完全沒被
+// 動過的缺口，都收斂進同一支腳本，並留下有時間戳記的 log（比照
+// post-run-notify.log），失敗不再無聲吞掉。$2（assigneeEmail）一併傳給
+// post-run-demand.ts 供它發通知用。
 const WRAPPER_SCRIPT = `
 trap '
   EC=$?
   bash ${BUG_LOCK_SH} release "$1" >/dev/null 2>&1
-  bun ${POST_RUN_DEMAND_TS} "$1" "$EC" >/dev/null 2>&1
-  if [ "$EC" -ne 0 ]; then
-    bash ${TG_NOTIFY_SH} --email "$2" --text "⚠️ $1 需求 pipeline 異常終止（exit=$EC，可能是被逾時強制中止），請人工檢查 logs/demand-pipeline.log 與工作目錄 worktrees/$1/。" >/dev/null 2>&1
-  fi
+  bun ${POST_RUN_DEMAND_TS} "$1" "$EC" "$2" >/dev/null 2>&1
 ' EXIT
 timeout ${OUTER_TIMEOUT_SECONDS} bun ${RUN_DEMAND_PIPELINE_TS} "$1" "$2"
 `
