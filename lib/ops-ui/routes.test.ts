@@ -48,6 +48,7 @@ function build(overrides: Partial<OpsDeps> = {}) {
       calls.push(`history:${user.email}`)
       return { ...history, limit: q.limit ?? 0, offset: q.offset ?? 0 }
     },
+    getStatus: () => ({ maintenance: false }),
     pageHtml: PAGE,
     now: () => NOW,
     onDeny: () => {},
@@ -74,7 +75,7 @@ function build(overrides: Partial<OpsDeps> = {}) {
 describe('公司網路門檻', () => {
   test('白名單外的 IP：所有 /ops 路徑一律 401 空 body（含登入頁與 auth 回呼）', async () => {
     const { req } = build()
-    for (const path of ['/ops', '/ops/', `/ops/auth/telegram?${signedQuery()}`, '/ops/api/me']) {
+    for (const path of ['/ops', '/ops/', `/ops/auth/telegram?${signedQuery()}`, '/ops/api/me', '/ops/api/status']) {
       const res = await req(path, { ip: '8.8.8.8' })
       expect(res.status).toBe(401)
       expect(await res.text()).toBe('')
@@ -171,6 +172,12 @@ describe('API 與 session', () => {
     const { req, login } = build()
     const { cookie } = await login()
     expect((await req('/ops/api/me', { cookie, ip: '8.8.8.8' })).status).toBe(401)
+  })
+  test('/ops/api/status 不需要 session（公司網路內未登入也看得到維護燈號），反映 getStatus()', async () => {
+    const { req } = build({ getStatus: () => ({ maintenance: true }) })
+    const r = await req('/ops/api/status')
+    expect(r.status).toBe(200)
+    expect(await r.json()).toEqual({ maintenance: true })
   })
 })
 

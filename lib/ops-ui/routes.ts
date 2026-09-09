@@ -66,6 +66,8 @@ export type ActivePayload = {
 export type HistoryRow = RunRow & { title: string | null; url: string | null; aiAnalysis: string | null; notionStatus: string | null }
 export type HistoryPayload = { rows: HistoryRow[]; total: number; limit: number; offset: number; monitorDb: boolean; fetchedAt: string }
 
+export type StatusPayload = { maintenance: boolean }
+
 export type OpsDeps = {
   botToken: string
   botUsername: string
@@ -80,6 +82,9 @@ export type OpsDeps = {
    * 是要求傳入的實作內部就只回登入者自己的資料。 */
   listActive: (user: TechUser) => Promise<ActivePayload>
   listHistory: (user: TechUser, q: HistoryQuery) => Promise<HistoryPayload>
+  /** 頂部維護狀態燈號用；刻意不要求登入（見下方路由註冊處），公司網路內
+   * 任何人開頁面都該立刻看到目前是否在維護中，不用先登入才看得到。 */
+  getStatus: () => StatusPayload
   /** static/index.html 的內容，含 __BOT_USERNAME__／__AUTH_URL__ 佔位符。 */
   pageHtml: string
   /** 對外 origin（如 https://mcp.aladdin-assistant.cc）；未設則從 Host／
@@ -181,6 +186,12 @@ export function registerOpsRoutes(app: Hono, deps: OpsDeps): void {
   })
 
   const api = `${OPS_PREFIX}/api`
+
+  // 維護燈號刻意放在 requireSession 之前註冊：公司網路內任何人（含尚未用
+  // Telegram 登入的人）打開 /ops/ 都該立刻看到目前是不是維護中，不用先登入。
+  // 只回一個布林值，不含任何工單／個資，公開這一項不構成資安疑慮。
+  app.get(`${api}/status`, c => c.json(deps.getStatus()))
+
   app.use(`${api}/*`, requireSession)
 
   app.get(`${api}/me`, c => {

@@ -65,6 +65,7 @@
 
   const state = {
     me: null,
+    status: null,
     tab: localStorage.getItem('ops.tab') || 'active',
     filter: '',
     histFilter: '',
@@ -120,6 +121,9 @@
   }
 
   // ---------- data ----------
+  async function loadStatus() {
+    try { state.status = await api('/status') } catch (e) { /* 燈號是錦上添花，查不到就不顯示，不擋畫面 */ }
+  }
   async function loadTab(tab) {
     state.loading = true; state.error = null; renderBarOnly()
     try {
@@ -134,7 +138,10 @@
   }
   function schedule() {
     clearTimeout(state.timer)
-    state.timer = setTimeout(() => { if (state.me && !document.hidden) loadTab(state.tab); schedule() }, POLL_MS)
+    state.timer = setTimeout(() => {
+      if (!document.hidden) { loadStatus().then(render); if (state.me) loadTab(state.tab) }
+      schedule()
+    }, POLL_MS)
   }
 
   async function start(ticket) {
@@ -158,9 +165,16 @@
   }
 
   // ---------- render ----------
+  function statusBadge() {
+    if (!state.status) return ''
+    return state.status.maintenance
+      ? '<span class="chip bad">🔴 維護中</span>'
+      : '<span class="chip ok">🟢 Healthy</span>'
+  }
+
   function renderLogin() {
     $app.innerHTML = `
-      <header><h1>工單派工台</h1></header>
+      <header><h1>工單派工台</h1>${statusBadge()}</header>
       <div class="login">
         <h2 style="margin-top:0">請用 Telegram 登入</h2>
         <p>需要綁定 <b>@${esc(BOT_USERNAME)}</b> 才能使用</p>
@@ -188,6 +202,7 @@
     $app.innerHTML = `
       <header>
         <h1>工單派工台</h1>
+        ${statusBadge()}
         <span class="spacer"></span>
         <span class="who">${esc(state.me.name)} &lt;${esc(state.me.email)}&gt;</span>
         <button class="ghost" id="logout">登出</button>
@@ -286,6 +301,7 @@
 
   // ---------- boot ----------
   ;(async () => {
+    await loadStatus() // 不需要登入就查得到，讓還沒登入的人也能立刻看到維護燈號
     try { state.me = await api('/me') } catch (e) { state.me = null }
     render()
     if (state.me) {

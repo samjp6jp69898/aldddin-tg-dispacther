@@ -7,7 +7,7 @@ import { resolveTechUserByChatId, type TechUser } from '../user-resolution/tech-
 import { describeTicketProgress, isTicketLocked } from '../pipeline-runner/ticket-progress.ts'
 import { getBugQueueStats, getBugRunningTickets } from '../pipeline-runner/spawn-create-mr.ts'
 import { getDemandQueueStats, getDemandRunningTickets } from '../pipeline-runner/spawn-demand-pipeline.ts'
-import { describeRemoteProgress, listRemoteEntries } from '../cluster/cluster-head.ts'
+import { describeRemoteProgress, isMaintenanceModeOn, listRemoteEntries } from '../cluster/cluster-head.ts'
 import { getLongLivedMonitorPool } from '../monitor-db/runtime.ts'
 import { parseCidrList } from './ip-allowlist.ts'
 import { createSessionStore } from './session-store.ts'
@@ -257,6 +257,7 @@ export function mountOpsUi(app: Hono, opts: { botUsername: string }): void {
     listPending: buildPending,
     listActive: buildActive,
     listHistory: buildHistory,
+    getStatus: () => ({ maintenance: isMaintenanceModeOn() }),
     pageHtml,
     publicOrigin: process.env.OPS_PUBLIC_ORIGIN || undefined,
   })
