@@ -7,6 +7,13 @@
 // `lib/monitor-db/pool.ts:37-38` 把這件事明確指派給呼叫端：「`connectTimeout: 500`
 // 只約束建立連線，不涵蓋單一 query 卡住的情況……那是呼叫端的責任」。
 //
+// 2026-09-09（ALDREQ-812 事故、使用者核准偏離上面這條 §6.7 逐字值）：
+// `connectTimeout` 已從 500ms 放寬到 3000ms（見 pool.ts 該常數旁的完整說明）
+// ——worker 連 DB 全部經反向 SSH tunnel，天生比同機直連多一段 RTT，500ms
+// 在 tunnel 場景下太容易把「其實連得上、只是慢一點」誤判成「連不上」而白白
+// 落 spool。本檔這支「單次查詢 1000ms deadline」維持不變，未受影響——建立
+// 連線與查詢執行是兩段各自獨立的計時，互不共用預算。
+//
 // 為什麼需要一支共用函式：`runtime.ts` 的 `dispatchMonitorWrite` 內嵌了一份
 // 同語意的 `Promise.race`，但 collectors／heartbeat 的**對位 SELECT 與非
 // dispatch 路徑的寫入**是裸 await（2026-09-02 對抗性審查 B1）。失敗情境是

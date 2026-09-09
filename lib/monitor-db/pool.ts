@@ -34,10 +34,20 @@ export interface CreateMonitorPoolOptions {
  *   - `timezone: 'Z'` + `dateStrings: ['DATE','DATETIME']`：容器以
  *     `--default-time-zone=+00:00` 存 UTC，client 端也一律當 UTC 處理，
  *     時間欄一律以 ISO 字串往返（S7/S11）。
- *   - `connectTimeout: 500`：只約束建立連線，不涵蓋單一 query 卡住的情況
+ *   - `connectTimeout`：只約束建立連線，不涵蓋單一 query 卡住的情況
  *     （見 §6.7／§6.4(2) 的 Promise.race 說明，那是呼叫端的責任）。
+ *     §6.7 原文寫的是 500ms；2026-09-09（ALDREQ-812 事故、使用者核准）放寬到
+ *     3000ms——worker 連 DB 全部要經反向 SSH tunnel（見
+ *     launchd/run-monitor-tunnel.sh），比起同機直連天生多一段 RTT／tunnel
+ *     channel 建立的開銷，實測 head 直連穩定在個位數 ms，但 tunnel 那端偶爾
+ *     真的在 500ms 內連得上、只是卡在 550～2000ms 之間，跟這裡就會被誤判成
+ *     「連不上」而不必要地落 spool。3000ms 仍遠低於下面 §6.7 查詢逾時的
+ *     1000ms 預算之外的獨立階段（建立連線與跑查詢是兩段不同的計時，互不影
+ *     響對方的預算），也遠低於「pipeline 熱路徑不能被卡住」的容忍上限（背景
+ *     pipeline 本身的逾時是分鐘級）。
  *   - `enableKeepAlive: true`、`waitForConnections: false`：pool 耗盡時立即
- *     失敗，不排隊等待（§6.7 熱路徑非阻斷紀律的一部分）。
+ *     失敗，不排隊等待（§6.7 熱路徑非阻斷紀律的一部分——這條原則不受上面的
+ *     connectTimeout 放寬影響，pool 滿了一樣立刻失敗，不會排隊）。
  */
 export function createMonitorPool(role: MonitorRole, opts: CreateMonitorPoolOptions): Pool {
   const env = loadMonitorEnv(role)
@@ -51,7 +61,7 @@ export function createMonitorPool(role: MonitorRole, opts: CreateMonitorPoolOpti
     dateStrings: ['DATE', 'DATETIME'],
     // 見上方檔頭說明：明確移除 mysql2 預設開啟的 CLIENT_FOUND_ROWS。
     flags: ['-FOUND_ROWS'],
-    connectTimeout: 500,
+    connectTimeout: 3000,
     enableKeepAlive: true,
     waitForConnections: false,
     connectionLimit: opts.connectionLimit,
