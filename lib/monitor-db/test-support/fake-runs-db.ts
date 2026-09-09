@@ -35,6 +35,7 @@ export interface FakeRunRow {
   outcome_source: string | null
   finished_at: string | null
   exit_code: number | null
+  failure_reason: string | null
   cancel_requested_at: string | null
   cancel_resolved_by: string | null
 }
@@ -105,6 +106,7 @@ export class FakeRunsDb implements MonitorDbExecutor {
       outcome_source: null,
       finished_at: null,
       exit_code: null,
+      failure_reason: null,
       cancel_requested_at: null,
       cancel_resolved_by: null,
     }
@@ -193,12 +195,13 @@ export class FakeRunsDb implements MonitorDbExecutor {
 
   // W2：守衛式 UPDATE（tier 2，cancel 合成）
   private handleW2Update(params: unknown[]): ResultSetHeader {
-    const [rawOutcome, , outcomeSource, finishedAt, exitCode, runId, host] = params as [
+    const [rawOutcome, , outcomeSource, finishedAt, exitCode, failureReason, runId, host] = params as [
       string,
       string,
       string,
       string,
       number | null,
+      string | null,
       string,
       string,
     ]
@@ -212,6 +215,7 @@ export class FakeRunsDb implements MonitorDbExecutor {
     row.outcome_source = outcomeSource
     row.finished_at = finishedAt
     row.exit_code = exitCode
+    row.failure_reason = failureReason
     row.lifecycle_rank = 100
     const changed = JSON.stringify(row) !== before
     return updateHeader(1, changed ? 1 : 0)
@@ -268,6 +272,7 @@ export class FakeRunsDb implements MonitorDbExecutor {
         outcomeSource,
         finishedAt,
         exitCode,
+        failureReason,
         legacyKey,
         stdoutPath,
         stderrPath,
@@ -291,6 +296,7 @@ export class FakeRunsDb implements MonitorDbExecutor {
         string | null,
         string | null,
         string | null,
+        string | null,
       ]
       runId = rId
       host = h
@@ -302,6 +308,7 @@ export class FakeRunsDb implements MonitorDbExecutor {
         outcome_source: outcomeSource,
         finished_at: finishedAt,
         exit_code: exitCode,
+        failure_reason: failureReason,
         legacy_key: legacyKey,
         stdout_path: stdoutPath,
         stderr_path: stderrPath,

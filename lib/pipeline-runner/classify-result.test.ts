@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { classifyPipelineResult } from './classify-result.ts'
+import { classifyPipelineResult, extractFailureReason } from './classify-result.ts'
 
 function fakeStdout(opts: { subtype?: string; is_error?: boolean; result: string }): string {
   const resultEvent = {
@@ -118,5 +118,40 @@ describe('classifyPipelineResult — 兩個獨立 review agent 都抓到的真�
       '- failure_reason: 上一次 attempt 回報 Pipeline status: success 但 lint 沒過，本次重跑失敗',
     ].join('\n')
     expect(classifyPipelineResult(0, fakeStdout({ result }))).toBe('failed')
+  })
+})
+
+describe('extractFailureReason（2026-09-09，tracker.md 退役後續：保留失敗原因進 DB）', () => {
+  test('failed 出口的「- Failure reason:」一行 → 抓出原始值', () => {
+    const result = ['- Pipeline status: failed', '- Failure reason: step5 fixer 超過重試上限'].join('\n')
+    expect(extractFailureReason(fakeStdout({ result }))).toBe('step5 fixer 超過重試上限')
+  })
+
+  test('容忍 markdown 裝飾（粗體標籤、反引號包值），比照 pipeline_status 同一套規則', () => {
+    const result = '- **Failure reason**: `Step 1 無法產出 analytics.md`'
+    expect(extractFailureReason(fakeStdout({ result }))).toBe('Step 1 無法產出 analytics.md')
+  })
+
+  test('非 failed 出口的模板保留字 N/A → null，不硬填假值', () => {
+    const result = ['- Pipeline status: success', '- Failure reason: N/A'].join('\n')
+    expect(extractFailureReason(fakeStdout({ result }))).toBeNull()
+  })
+
+  test('完全沒有這一行（早退分支的 SKIPPED 訊息）→ null', () => {
+    expect(extractFailureReason(fakeStdout({ result: 'SKIPPED: FAQ-1234 not claimable' }))).toBeNull()
+  })
+
+  test('值裡巧合出現 "success" 字樣不該被別的判斷誤用；只回傳原始字串本身', () => {
+    const result = ['- Pipeline status: failed', '- Failure reason: 上一次 attempt 回報 success 但 lint 沒過'].join('\n')
+    expect(extractFailureReason(fakeStdout({ result }))).toBe('上一次 attempt 回報 success 但 lint 沒過')
+  })
+
+  test('超過 500 字元截斷（runs.failure_reason 是 VARCHAR(500)）', () => {
+    const longReason = 'x'.repeat(600)
+    const result = `- Failure reason: ${longReason}`
+    const extracted = extractFailureReason(fakeStdout({ result }))
+    expect(extracted).not.toBeNull()
+    expect(extracted!.length).toBeLessThanOrEqual(500)
+    expect(extracted!.endsWith('...')).toBe(true)
   })
 })

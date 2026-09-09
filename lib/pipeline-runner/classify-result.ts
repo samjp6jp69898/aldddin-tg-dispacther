@@ -277,3 +277,27 @@ export function classifyPipelineResult(exitCode: number, stdoutContent: string):
 
   return 'unknown_failure'
 }
+
+/**
+ * 從完成報告抓「- Failure reason: {值}」那一行（create-mr.md Step 9 模板，
+ * 2026-09-09 新增，使用者核准：tracker.md 退役後，原本 tracker.sh log-fail
+ * 寫進本機 pipeline-failures.md 的失敗原因改保留進監控 DB 的 runs.failure_reason）。
+ * 跟 pipeline_status 用同一份 result 文字、同一套 markdown 裝飾容忍規則
+ * （粗體或反引號包住的值），行首錨定；沒有這一行、或值是模板保留字 `N/A`
+ * （非 failed 出口）都回 null，不硬填假值。post-run-notify.ts 的
+ * writeAuthoritativeOutcome() 呼叫本函式取得 failureReason 傳給 W2 寫入。
+ */
+export function extractFailureReason(stdoutContent: string): string | null {
+  const resultEvent = extractResultEvent(stdoutContent)
+  const result = typeof resultEvent?.result === 'string' ? resultEvent.result : stdoutContent
+  const match = /^-\s*\*{0,2}Failure reason\*{0,2}\s*:\s*(.+)$/m.exec(result)
+  if (!match) return null
+  // 值本身是自由文字（不像 pipeline_status 只有 \w token 好界定），這裡只
+  // 剝除「整個值」外層包一層的 markdown 裝飾（**粗體**／`反引號`），不動
+  // 值內部可能出現的星號/反引號。
+  const value = match[1]!.trim().replace(/^\*{1,2}(.*)\*{1,2}$/, '$1').replace(/^`(.*)`$/, '$1').trim()
+  if (!value || value === 'N/A') return null
+  // runs.failure_reason 是 VARCHAR(500)（migration 006）：截斷但保留可讀性，
+  // 不讓過長訊息讓寫入失敗。
+  return value.length > 500 ? `${value.slice(0, 497)}...` : value
+}

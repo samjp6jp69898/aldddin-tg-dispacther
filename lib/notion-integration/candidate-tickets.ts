@@ -137,7 +137,7 @@ export function candidatesFromResults(results: unknown[]): CandidateTicket[] {
  * getTicketNotionUrl／getTicketAiAnalysisStatus 共用同一次查詢邏輯。ticket
  * 格式不是 FAQ-{number} 或查無此單都回傳 null，不丟例外。
  */
-function queryTicketPage(ticket: string): { url?: string; properties?: Record<string, unknown> } | null {
+function queryTicketPage(ticket: string): { url?: string; id?: string; properties?: Record<string, unknown> } | null {
   const match = /^FAQ-(\d+)$/.exec(ticket)
   if (!match) return null
 
@@ -173,4 +173,16 @@ export function getTicketAiAnalysisStatus(ticket: string): string | null {
   const prop = page?.properties?.['AI分析'] as { select?: { name?: unknown } } | undefined
   const name = prop?.select?.name
   return typeof name === 'string' ? name : null
+}
+
+/**
+ * 查單一 ticket 目前在 Notion 的 page id（UUID 格式，即 update-prop 需要的
+ * `<page_id>`）。給 post-run-notify.ts 在 CLI 崩潰分類（NEEDS_NOTIFY：
+ * skipped/timeout/infra_failure/cli_failure/unknown_failure/session_limit）
+ * 時呼叫 `notion.sh update-prop` 寫入 AI分析=分析失敗用（2026-09-09，tracker.md
+ * 退役後 CLI 崩潰也要留下 Notion 記錄，見該檔案 main() 呼叫處）。查無此單或
+ * 欄位不存在都回傳 null，不丟例外，同一套 best-effort 慣例。
+ */
+export function getTicketPageId(ticket: string): string | null {
+  return queryTicketPage(ticket)?.id ?? null
 }

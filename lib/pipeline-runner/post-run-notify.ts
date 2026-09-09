@@ -1,8 +1,8 @@
 import { readFileSync, appendFileSync, mkdirSync } from 'node:fs'
 import { execFileSync } from 'node:child_process'
 import { basename, dirname, join } from 'node:path'
-import { classifyPipelineResult, type Classification } from './classify-result.ts'
-import { getTicketNotionUrl, getTicketAiAnalysisStatus } from '../notion-integration/candidate-tickets.ts'
+import { classifyPipelineResult, extractFailureReason, type Classification } from './classify-result.ts'
+import { getTicketNotionUrl, getTicketAiAnalysisStatus, getTicketPageId } from '../notion-integration/candidate-tickets.ts'
 import { notifyOperator } from '../notify/operator.ts'
 import { submitCreateMr } from './spawn-create-mr.ts'
 import { declareMonitorRoleFromLocalEnv, isMonitorDbEnabled, MON_HOST } from '../monitor-db/env.ts'
@@ -13,6 +13,7 @@ import type { RunKind } from '../monitor-db/types.ts'
 
 const RESOLVE_REVIEWER_SH = '/Users/user/aladdin/scripts/resolve-reviewer.sh'
 const TG_NOTIFY_SH = '/Users/user/aladdin/scripts/tg-notify.sh'
+const NOTION_SH = '/Users/user/aladdin/scripts/notion.sh'
 const LOG_DIR = '/Users/user/aladdin/telegram-dispatcher/logs'
 const POST_RUN_LOG = join(LOG_DIR, 'post-run-notify.log')
 // resolve-reviewer.sh／tg-notify.sh 內部各自呼叫一次 curl 打 Notion／Telegram
@@ -27,7 +28,6 @@ const EXEC_TIMEOUT_MS = 30_000
 // 「遇到 timeout 一定要發 TG 通知到 landon」，不能讓這條路徑跟著指派解析
 // 一起 best-effort 放棄，所以獨立於下面 main() 的 email 分支之外，永遠嘗試。
 const TIMEOUT_ESCALATION_EMAIL = 'pkh_samjp6jp69898@photons.com.tw'
-const TRACKER_SH = '/Users/user/aladdin/scripts/tracker.sh'
 // 2026-08-26 使用者定案：timeout 分類不能只發通知乾等人工，要能自己重試——
 // 但「resume 模式重跑」本身也可能再度 timeout（例如這張票本來就結構性偏
 // 大，任何一輪都跑不完 180 分鐘），沒有上限會對同一張票無限燒 opus。跟
@@ -133,6 +133,30 @@ function notifyViaEmail(email: string, text: string): boolean {
     return true
   } catch {
     return false
+  }
+}
+
+/**
+ * 2026-09-09（tracker.md 退役，使用者定案：CLI 崩潰也要留下 Notion 記錄）：
+ * NEEDS_NOTIFY 那六種分類（skipped/timeout/infra_failure/cli_failure/
+ * unknown_failure/session_limit）代表 create-mr 完全沒機會跑到自己的 Step 7c
+ * /8（那裡才會正常寫 Notion AI分析），這裡補上同一份權威記錄，讓 Notion
+ * 不再停留在「分析中」看不出真實結果。best-effort：查無 page id 或
+ * notion.sh 失敗都只記 log，不阻斷後續 TG 通知（同檔案其他通知邏輯的既有
+ * 慣例）。timeout 分類即使自動重試成功，這裡先寫的「分析失敗」會被 create-mr
+ * 正常出口覆蓋回「分析成功」——可接受的暫態，不特別處理。
+ */
+function markNotionAnalysisFailed(ticket: string): void {
+  const pageId = getTicketPageId(ticket)
+  if (!pageId) {
+    log(`${ticket} 無法標記 Notion AI分析=分析失敗：查無 page id`)
+    return
+  }
+  try {
+    execFileSync('bash', [NOTION_SH, 'update-prop', pageId, 'AI分析', 'select', '分析失敗'], { encoding: 'utf8', timeout: EXEC_TIMEOUT_MS })
+    log(`${ticket} 已標記 Notion AI分析=分析失敗`)
+  } catch (err) {
+    log(`${ticket} 標記 Notion AI分析=分析失敗失敗: ${err}`)
   }
 }
 
@@ -417,6 +441,17 @@ export async function writeAuthoritativeOutcome(
   const finishedAt = new Date().toISOString()
   const legacyKey = deriveLegacyKeyFromStdoutPath(stdoutPath)
   const triggeredBy = readTriggeredBy(legacyKey)
+  // 2026-09-09（tracker.md 退役後續，使用者核准）：失敗原因保留進 DB，取代
+  // 原本 tracker.sh log-fail 寫的本機 pipeline-failures.md。只有 failed 出口
+  // 的完成報告會有「- Failure reason:」那一行，其餘分類 extractFailureReason
+  // 回 null，欄位維持 NULL，不硬填假值。獨立讀檔＋try/catch：這裡失敗不能
+  // 擋掉其餘欄位的寫入，本來就是 best-effort 補充資訊。
+  let failureReason: string | null = null
+  try {
+    failureReason = extractFailureReason(readFileSync(stdoutPath, 'utf8'))
+  } catch {
+    // 讀不到 stdout（極端狀況）——不填，其餘欄位照常寫。
+  }
   const input = {
     runId,
     ticket,
@@ -425,6 +460,7 @@ export async function writeAuthoritativeOutcome(
     outcomeSource: 'post-run-notify',
     finishedAt,
     exitCode,
+    failureReason,
     legacyKey,
     stdoutPath,
     stderrPath,
@@ -556,9 +592,9 @@ type RetryDecision = { attempted: boolean; note: string }
  * timeout 分類的自動重試判斷（不含實際觸發，觸發交給呼叫端）：依序檢查
  * 「這張票連續 timeout 是否已達上限」→「這張票此刻是否仍在跑（不該發生，
  * 防禦用）」→「全域 bug pipeline 併發是否已滿」。任一條件擋下就不重試，只
- * 回傳給人看的說明文字，不做任何有副作用的動作（tracker.sh set / spawn 由
- * main() 在拿到 attempted=true 之後才執行，讓「決定」與「動作」分開，方便
- * 各自獨立記 log 追蹤）。
+ * 回傳給人看的說明文字，不做任何有副作用的動作（spawn 由 main() 在拿到
+ * attempted=true 之後才執行，讓「決定」與「動作」分開，方便各自獨立記 log
+ * 追蹤）。
  */
 function planAutoRetry(ticket: string): RetryDecision {
   const trailingTimeouts = countTrailingTimeouts(ticket)
@@ -575,14 +611,11 @@ function planAutoRetry(ticket: string): RetryDecision {
   return { attempted: true, note: `已觸發第 ${trailingTimeouts} 次自動重試（resume 模式，上限 ${AUTO_RETRY_LIMIT} 次）——` }
 }
 
-/** 真正執行重試：claim 前置（tracker 設回 rerun）+ resume 模式 spawn。任何一步失敗都記 log、不拋例外。 */
+/** 真正執行重試：resume 模式 spawn。2026-09-09 tracker.md 退役後不再需要
+ *  「先 tracker set rerun 讓候選檢查放行」這個前置動作——claim-ticket.sh 的
+ *  `--resume` 旗標本身就會跳過候選值域檢查，見該檔案。任何一步失敗都記
+ *  log、不拋例外。 */
 function executeAutoRetry(ticket: string): void {
-  try {
-    execFileSync('bash', [TRACKER_SH, 'set', ticket, 'rerun'], { encoding: 'utf8', timeout: EXEC_TIMEOUT_MS })
-  } catch (err) {
-    log(`${ticket} 自動重試中止：tracker.sh set rerun 失敗: ${err}`)
-    return
-  }
   // 本檔是一次性 CLI 子行程（見檔頭註解）：submitCreateMr 的 in-memory 佇列
   // 在這個 process 裡永遠是空的、limiter 從 0 起算，實際只會走 started /
   // spawn_error 兩種結果——排隊語意只存在於常駐的 webhook server process。
@@ -648,8 +681,17 @@ async function main(): Promise<void> {
 
   if (!shouldNotify(classification)) return
 
+  // 2026-09-09：CLI 崩潰也要留下 Notion 記錄（見 markNotionAnalysisFailed
+  // 檔頭註解）。獨立包 try/catch，排在自動重試/TG 通知之前——這裡失敗不能
+  // 連坐擋掉下面既有的通知保證。
+  try {
+    markNotionAnalysisFailed(ticket)
+  } catch (err) {
+    log(`${ticket} markNotionAnalysisFailed 例外: ${err}`)
+  }
+
   // 自動重試判斷＋執行也獨立包 try/catch、排在 Landon 升級通知**之前**——
-  // 跟下面 Landon 那塊同一個理由：不能讓這裡任何一步的例外（ps／tracker.sh／
+  // 跟下面 Landon 那塊同一個理由：不能讓這裡任何一步的例外（ps／
   // spawnCreateMr 都可能拋）連坐擋掉「timeout 一定通知到 Landon」的保證。
   // retryNote 預設空字串，即使這整塊失敗，下面的通知文字仍然完整可讀，只是
   // 少一句重試狀態說明，不影響「有沒有發出通知」這個更重要的保證。

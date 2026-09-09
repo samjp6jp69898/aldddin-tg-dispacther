@@ -154,6 +154,7 @@ UPDATE runs
        outcome_source = ?,
        finished_at    = ?,
        exit_code      = ?,
+       failure_reason = ?,
        lifecycle_rank = 100
  WHERE run_id = ? AND host = ?
    AND (outcome IS NULL OR outcome_tier < 2)
@@ -177,8 +178,8 @@ UPDATE runs
 // `pipeline_runs.started_at` 完全同構（兩邊都是從同一個 log 檔名時間戳反推，
 // 見 switch-readiness.ts 檔頭「`started_at` 的兩軌容差」說明），不是臆測值。
 export const W2_INSERT_SQL = `
-INSERT INTO runs (run_id, host, ticket, kind, lifecycle_rank, outcome, outcome_tier, outcome_source, finished_at, exit_code, legacy_key, stdout_path, stderr_path, started_at, trigger_source, triggered_by_email, triggered_by_name, created_at)
-VALUES (?, ?, ?, ?, 100, ?, 2, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(3))
+INSERT INTO runs (run_id, host, ticket, kind, lifecycle_rank, outcome, outcome_tier, outcome_source, finished_at, exit_code, failure_reason, legacy_key, stdout_path, stderr_path, started_at, trigger_source, triggered_by_email, triggered_by_name, created_at)
+VALUES (?, ?, ?, ?, 100, ?, 2, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(3))
 `.trim()
 
 export const RUNS_COLD_PATH_TERMINAL_SQL = 'SELECT host, outcome, outcome_tier FROM runs WHERE run_id = ?'
@@ -190,6 +191,13 @@ export interface WriteRunOutcomeAuthoritativeInput extends RunIdentity {
   outcomeSource: string
   finishedAt: string
   exitCode?: number | null
+  /**
+   * 2026-09-09（tracker.md 退役後續，使用者核准）：create-mr.md Step 9 完成
+   * 報告的「- Failure reason:」那一行（僅 failed 出口有意義；其餘分類傳
+   * null，欄位保持 NULL，不硬填假值）。取代原本只寫本機 pipeline-failures.md
+   * 的 tracker.sh log-fail。UPDATE 與 INSERT 兩條路徑都寫，不分歧。
+   */
+  failureReason?: string | null
   /**
    * 2026-09-03 根因修復：只在 W2 走 INSERT fallback（W1 從未落地）時派上用場——
    * UPDATE 路徑代表列已存在（多半是 W1 寫的），這三欄早已由 W1 補齊，這裡不重複
@@ -236,7 +244,16 @@ export async function writeRunOutcomeAuthoritative(
     wasProvisional = false
   }
 
-  const updateParams = [input.outcome, input.outcome, input.outcomeSource, dt(input.finishedAt), input.exitCode ?? null, input.runId, MON_HOST]
+  const updateParams = [
+    input.outcome,
+    input.outcome,
+    input.outcomeSource,
+    dt(input.finishedAt),
+    input.exitCode ?? null,
+    input.failureReason ?? null,
+    input.runId,
+    MON_HOST,
+  ]
   let r = await execUpdate(pool, W2_UPDATE_SQL, updateParams)
   if (r.matched > 0) {
     return { kind: 'applied', supersededProvisional: wasProvisional && r.changed > 0 }
@@ -252,6 +269,7 @@ export async function writeRunOutcomeAuthoritative(
       input.outcomeSource,
       dt(input.finishedAt),
       input.exitCode ?? null,
+      input.failureReason ?? null,
       input.legacyKey ?? null,
       input.stdoutPath ?? null,
       input.stderrPath ?? null,

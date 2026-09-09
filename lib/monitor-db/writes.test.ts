@@ -144,6 +144,49 @@ describe("writeRunOutcomeAuthoritative（W2，tier 2）與 writeRunOutcomeProvis
     expect(db.rows.get('run-1')!.outcome_tier).toBe(2)
   })
 
+  test('2026-09-09：failureReason 隨權威終態一起寫入（UPDATE 與 INSERT fallback 兩條路徑都要落地）', async () => {
+    const db = new FakeRunsDb()
+    // UPDATE 路徑：列已存在（W1 先寫過）。
+    await writeRunProgress(db, { ...ident(), lifecycleRank: 30 })
+    const r1 = await writeRunOutcomeAuthoritative(db, {
+      ...ident(),
+      outcome: 'failed',
+      outcomeSource: 'exit_trap',
+      finishedAt: '2026-09-02T00:01:00.000Z',
+      exitCode: 1,
+      failureReason: 'step5 fixer 超過重試上限',
+    })
+    expect(r1.kind).toBe('applied')
+    expect(db.rows.get('run-1')!.failure_reason).toBe('step5 fixer 超過重試上限')
+
+    // INSERT fallback 路徑：run_id 在表裡完全不存在。
+    const r2 = await writeRunOutcomeAuthoritative(db, {
+      runId: 'run-2',
+      ticket: 'FAQ-2',
+      kind: 'bug',
+      outcome: 'failed',
+      outcomeSource: 'exit_trap',
+      finishedAt: '2026-09-02T00:02:00.000Z',
+      exitCode: 1,
+      failureReason: 'Step 1 無法產出 analytics.md',
+    })
+    expect(r2.kind).toBe('inserted')
+    expect(db.rows.get('run-2')!.failure_reason).toBe('Step 1 無法產出 analytics.md')
+
+    // 非 failed 分類不帶 failureReason（undefined）→ 欄位維持 NULL，不硬填假值。
+    const r3 = await writeRunOutcomeAuthoritative(db, {
+      runId: 'run-3',
+      ticket: 'FAQ-3',
+      kind: 'bug',
+      outcome: 'success',
+      outcomeSource: 'exit_trap',
+      finishedAt: '2026-09-02T00:03:00.000Z',
+      exitCode: 0,
+    })
+    expect(r3.kind).toBe('inserted')
+    expect(db.rows.get('run-3')!.failure_reason).toBeNull()
+  })
+
   test('權威終態 → 權威終態不覆寫（先到先定）', async () => {
     const db = new FakeRunsDb()
     await writeRunOutcomeAuthoritative(db, { ...ident(), outcome: 'success', outcomeSource: 'exit_trap', finishedAt: '2026-09-02T00:01:00.000Z' })

@@ -133,6 +133,7 @@ describe('S4：形狀 B 的 Rows matched:/Changed: 三態判定 ＋ lc_messages'
       'exit_trap',
       isoToMysqlDatetime3('2026-09-02T00:00:00.000Z'),
       1,
+      null,
       tRunId(),
       MON_HOST,
     ])
@@ -153,6 +154,7 @@ describe('S4：形狀 B 的 Rows matched:/Changed: 三態判定 ＋ lc_messages'
       'exit_trap',
       isoToMysqlDatetime3('2026-09-02T00:00:00.000Z'),
       0,
+      null,
       runId,
       MON_HOST,
     ])
@@ -169,6 +171,7 @@ describe('S4：形狀 B 的 Rows matched:/Changed: 三態判定 ＋ lc_messages'
       'exit_trap',
       isoToMysqlDatetime3('2026-09-02T00:00:00.000Z'),
       0,
+      null,
       runId,
       MON_HOST,
     ])
