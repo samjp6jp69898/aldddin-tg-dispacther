@@ -6,7 +6,7 @@ import { ensureTrackerPending } from '../pipeline-runner/tracker-sync.ts'
 import { GLOBAL_CONCURRENCY_LIMIT } from '../pipeline-runner/concurrency-limiter.ts'
 import { dispatchBug, getRemoteEntry, describeRemoteProgress, isMaintenanceModeOn } from '../cluster/cluster-head.ts'
 import { describeTicketProgress, isTicketLocked } from '../pipeline-runner/ticket-progress.ts'
-import { MAINTENANCE_MESSAGE } from '../maintenance/mode-store.ts'
+import { enqueueMaintenanceRequest, registerMaintenanceProcessor, notifyMaintenanceOutcome } from '../maintenance/request-queue.ts'
 import type { TechUser } from '../user-resolution/tech-user.ts'
 
 const BUG_LOCK_SH = '/Users/user/aladdin/scripts/bug-lock.sh'
@@ -45,7 +45,8 @@ function releaseLock(ticket: string): void {
  * 給人看的訊息——TG handler 與 Web UI 回的是同一段文字，不維護兩套文案。 */
 export type ClaimOutcome = { code: ClaimCode; text: string }
 export type ClaimCode =
-  | 'maintenance'
+  | 'maintenance_queued'
+  | 'maintenance_already_queued'
   | 'already_running_local'
   | 'already_running_remote'
   | 'not_candidate'
@@ -72,10 +73,24 @@ export type ClaimCode =
  * 每個分支都回明確訊息，沒有安靜失敗的路徑。不碰 grammy ctx。
  */
 export async function claimBugTicket(techUser: TechUser, ticket: string): Promise<ClaimOutcome> {
-  // 維護模式（2026-09-08）：手動開關，開著時一律拒絕受理新單，排在所有其他
-  // 判斷之前——不查 Notion、不碰鎖、不派工，維護期間對這張單完全零副作用。
+  // 維護模式（2026-09-08，2026-09-09 改為「照收不拒絕」）：排在所有其他判斷
+  // 之前——維護中不查 Notion、不碰鎖、不派工，收下這筆請求本身零副作用，
+  // 只記下 ticket／認領人排入 FIFO 佇列，維護結束後由下面 registerMaintenanceProcessor
+  // 註冊的 callback 依序重新完整跑一次本函式（見 request-queue.ts 檔頭）。
   if (isMaintenanceModeOn()) {
-    return { code: 'maintenance', text: MAINTENANCE_MESSAGE }
+    const r = enqueueMaintenanceRequest('bug', techUser, ticket)
+    return r.status === 'queued'
+      ? {
+          code: 'maintenance_queued',
+          text:
+            `系統目前維護中，${ticket} 的認領請求已收到，排入等待佇列第 ${r.position} 順位` +
+            (r.ahead > 0 ? `（前面還有 ${r.ahead} 張在排隊）` : `（你是第一位）`) +
+            `。維護結束後會依收到順序自動處理，完成後 TG 通知你，不需要重新認領。`,
+        }
+      : {
+          code: 'maintenance_already_queued',
+          text: `${ticket} 已在維護等待佇列中（第 ${r.position} 順位，前面還有 ${r.ahead} 張），維護結束後會依序處理，不需要重複送出。`,
+        }
   }
 
   // 同事再次點選一張已經在跑的單：鎖目錄存在＝/create-mr 自己的 Step 0.1.3
@@ -175,6 +190,21 @@ export async function claimBugTicket(techUser: TechUser, ticket: string): Promis
 
   return { code: 'started', text: `已開始處理 ${ticket}${modeNote}${noPriorNote}` }
 }
+
+// 維護結束時的重新處理 callback（request-queue.ts 的 drainMaintenanceQueue()
+// 依 FIFO 呼叫）：直接重新完整跑一次 claimBugTicket——此時 isMaintenanceModeOn()
+// 已經是 false，會自然往下走完整流程（Notion 候選重驗、鎖、既有併發 FIFO
+// 佇列全部照舊套用）。原本的 TG/Web UI 互動早已結束，改用 tg-notify.sh 主動
+// 通知結果。
+registerMaintenanceProcessor('bug', async entry => {
+  const outcome = await claimBugTicket(entry.techUser, entry.ticket)
+  // 維護在這次 drain 跑到一半時又被重新開啟：claimBugTicket 自己會把這張單
+  // 重新排回佇列尾端（見 request-queue.ts drainAll 的自我修正說明），這種
+  // 情況不通知——不然會發出「維護結束，重新處理…：系統目前維護中」這種
+  // 自相矛盾的訊息，等它真的輪到下一次 drain 再通知。
+  if (outcome.code === 'maintenance_queued' || outcome.code === 'maintenance_already_queued') return
+  notifyMaintenanceOutcome(entry.techUser, `🔧 維護結束，重新處理 ${entry.ticket}：${outcome.text}`)
+})
 
 /**
  * claim:{ticket} callback handler（見 tasks.json T10）。

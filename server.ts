@@ -14,7 +14,8 @@ import { registerProxyRoutes } from './lib/webhook-server/mcp-proxy.ts'
 import { startStaleLockReaper } from './lib/pipeline-runner/stale-lock-reaper.ts'
 import { recoverBugQueue, hasBugTicketActive } from './lib/pipeline-runner/spawn-create-mr.ts'
 import { recoverDemandQueue, hasDemandTicketActive } from './lib/pipeline-runner/spawn-demand-pipeline.ts'
-import { registerClusterRoutes, initClusterHead } from './lib/cluster/cluster-head.ts'
+import { registerClusterRoutes, initClusterHead, isMaintenanceModeOn } from './lib/cluster/cluster-head.ts'
+import { recoverMaintenanceQueue, drainMaintenanceQueue, maintenanceQueueSize } from './lib/maintenance/request-queue.ts'
 import { startMonitorMaintenance, runRestartSweep } from './lib/monitor-db/maintenance.ts'
 import { declareMonitorRole } from './lib/monitor-db/env.ts'
 import { startMonitorCollectors } from './lib/monitor-db/collectors/index.ts'
@@ -226,6 +227,21 @@ declareMonitorRole('mon_head')
 // 名額上限，屬已接受的取捨。
 const bugRecovered = recoverBugQueue()
 const demandRecovered = recoverDemandQueue()
+
+// 2026-09-09：維護模式請求佇列的重啟恢復，比照上面 bug/demand 佇列——只在
+// 這裡呼叫一次（CLI 短命行程絕不能呼叫，見 request-queue.ts recoverFromDisk
+// 註解）。安全網：正常情況下維護關閉時 POST /cluster/maintenance 已經把
+// 佇列 drain 過一次；這裡多檢查一次是為了涵蓋「維護關閉當下 head 剛好重啟，
+// drain 還沒跑完就中斷」這種罕見窗口（見 drainMaintenanceQueue 已知限制
+// 註解）——重啟後維護若已是關閉狀態，就把撿回來的殘留請求直接補跑一次。
+recoverMaintenanceQueue()
+const recoveredMaintenanceCount = maintenanceQueueSize()
+if (recoveredMaintenanceCount > 0) {
+  console.error(`telegram-dispatcher: 撿回 ${recoveredMaintenanceCount} 筆維護期間排隊的請求`)
+  if (!isMaintenanceModeOn()) {
+    void drainMaintenanceQueue().catch(err => console.error(`telegram-dispatcher: 重啟後補跑維護排隊請求失敗: ${err}`))
+  }
+}
 if (
   bugRecovered.started.length + bugRecovered.requeued.length + bugRecovered.skipped.length + demandRecovered.started.length + demandRecovered.requeued.length + demandRecovered.skipped.length >
   0

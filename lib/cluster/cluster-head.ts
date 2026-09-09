@@ -5,6 +5,7 @@ import { createClusterAuthGuard } from './cluster-auth.ts'
 import { createWorkerRegistry } from './worker-registry.ts'
 import { createDispatchRegistry, DISPATCH_STATUS_RANK, type DispatchEntry } from './dispatch-registry.ts'
 import { createMaintenanceModeStore } from '../maintenance/mode-store.ts'
+import { drainMaintenanceQueue } from '../maintenance/request-queue.ts'
 import { createDispatcher, type BugDispatchOpts, type DispatchAttemptWriteDeps, type DispatchResult } from './dispatch.ts'
 import { createRemoteSweeper } from './remote-sweeper.ts'
 import { recordWorkerMonitorStatus } from './worker-monitor-status.ts'
@@ -427,8 +428,17 @@ export function registerClusterRoutes(app: Hono): void {
   app.post('/cluster/maintenance', guard, async c => {
     const body = (await c.req.json().catch(() => null)) as { on?: unknown } | null
     if (!body || typeof body.on !== 'boolean') return c.json({ ok: false, reason: 'bad_request' }, 400)
+    const wasOn = maintenanceMode.isOn()
     maintenanceMode.setOn(body.on)
     console.error(`cluster: 維護模式已${body.on ? '開啟' : '關閉'}（head）`)
+    // 維護剛從開轉關：把 request-queue.ts 累積的排隊請求依 FIFO 重新完整跑
+    // 一次（見該檔 drainMaintenanceQueue 註解）。fire-and-forget——不讓
+    // tg-monitor 的這次切換請求等整批重新處理跑完才回應，理由同其他熱路徑
+    // 非阻斷紀律（見 spawn-create-mr.ts 檔頭）；drainMaintenanceQueue() 內部
+    // 已經逐筆包 try/catch，這裡的 catch 只是最後一道防線。
+    if (wasOn && !body.on) {
+      void drainMaintenanceQueue().catch(err => console.error(`cluster: 維護結束後重新處理排隊請求失敗: ${err}`))
+    }
     return c.json({ ok: true, on: body.on })
   })
 }

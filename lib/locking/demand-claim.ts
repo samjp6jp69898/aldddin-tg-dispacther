@@ -5,7 +5,7 @@ import { resetAiAnalysisForReclaim } from '../pipeline-runner/spawn-demand-pipel
 import { dispatchDemand, getRemoteEntry, describeRemoteProgress, isMaintenanceModeOn } from '../cluster/cluster-head.ts'
 import { DEMAND_CONCURRENCY_LIMIT } from '../pipeline-runner/concurrency-limiter.ts'
 import { describeTicketProgress, isTicketLocked } from '../pipeline-runner/ticket-progress.ts'
-import { MAINTENANCE_MESSAGE } from '../maintenance/mode-store.ts'
+import { enqueueMaintenanceRequest, registerMaintenanceProcessor, notifyMaintenanceOutcome } from '../maintenance/request-queue.ts'
 import type { TechUser } from '../user-resolution/tech-user.ts'
 import type { ClaimOutcome } from './claim.ts'
 
@@ -74,10 +74,24 @@ function markAiAnalysisInProgress(ticket: string): void {
  * 流程自己管』的既有模式。
  */
 export async function claimDemandTicket(techUser: TechUser, ticket: string): Promise<ClaimOutcome> {
-  // 維護模式（2026-09-08）：比照 claim.ts 的 claimBugTicket，排在最前面，
-  // 開著時不查 Notion、不碰鎖、不派工。
+  // 維護模式（2026-09-08，2026-09-09 改為「照收不拒絕」）：比照 claim.ts 的
+  // claimBugTicket，排在最前面，開著時不查 Notion、不碰鎖、不派工，只是把
+  // 這筆請求記下來排入 FIFO 佇列，維護結束後依序重新完整跑一次（見
+  // request-queue.ts 檔頭）。
   if (isMaintenanceModeOn()) {
-    return { code: 'maintenance', text: MAINTENANCE_MESSAGE }
+    const r = enqueueMaintenanceRequest('demand', techUser, ticket)
+    return r.status === 'queued'
+      ? {
+          code: 'maintenance_queued',
+          text:
+            `系統目前維護中，${ticket} 的認領請求已收到，排入等待佇列第 ${r.position} 順位` +
+            (r.ahead > 0 ? `（前面還有 ${r.ahead} 張在排隊）` : `（你是第一位）`) +
+            `。維護結束後會依收到順序自動處理，完成後 TG 通知你，不需要重新認領。`,
+        }
+      : {
+          code: 'maintenance_already_queued',
+          text: `${ticket} 已在維護等待佇列中（第 ${r.position} 順位，前面還有 ${r.ahead} 張），維護結束後會依序處理，不需要重複送出。`,
+        }
   }
 
   // 同事再次點選一張已經在跑的需求單：鎖目錄存在＝run-demand-pipeline.ts
@@ -167,6 +181,14 @@ export async function claimDemandTicket(techUser: TechUser, ticket: string): Pro
 
   return { code: 'started', text: `已認領 ${ticket}，Notion AI分析已標記「分析中」，背景開始評估規格與範圍，完成後會再通知你。這是輔助草稿流程，產出需要人工複核，不是自動完成。` }
 }
+
+// 維護結束時的重新處理 callback，理由與寫法同 claim.ts 對應段落（含「維護
+// 又被重新開啟時不發自相矛盾通知」的處理）。
+registerMaintenanceProcessor('demand', async entry => {
+  const outcome = await claimDemandTicket(entry.techUser, entry.ticket)
+  if (outcome.code === 'maintenance_queued' || outcome.code === 'maintenance_already_queued') return
+  notifyMaintenanceOutcome(entry.techUser, `🔧 維護結束，重新處理 ${entry.ticket}：${outcome.text}`)
+})
 
 /**
  * demand-claim:{ticket} callback handler（見 tasks.json T33/T36）。

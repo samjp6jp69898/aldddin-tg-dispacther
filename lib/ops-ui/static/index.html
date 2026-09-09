@@ -148,7 +148,7 @@
     try {
       const r = await api('/start', { method: 'POST', headers: { 'content-type': 'application/json', 'x-ops-ui': '1' }, body: JSON.stringify({ ticket }) })
       const good = ['started','queued','remote_started']
-      toast(r.text, good.includes(r.code) ? 'ok' : (r.code === 'already_running' || r.code === 'already_queued' || r.code === 'already_running_local' || r.code === 'already_running_remote') ? '' : 'bad')
+      toast(r.text, good.includes(r.code) ? 'ok' : (r.code === 'already_running' || r.code === 'already_queued' || r.code === 'already_running_local' || r.code === 'already_running_remote' || r.code === 'maintenance_queued' || r.code === 'maintenance_already_queued') ? '' : 'bad')
       if (good.includes(r.code)) { state.tab = 'active'; localStorage.setItem('ops.tab', 'active') }
       await Promise.all([loadTab('pending'), loadTab('active')])
     } catch (e) {
