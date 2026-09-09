@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process'
 import type { Context } from 'grammy'
-import { queryDemandPoolTickets, getDemandTicketNotionUrl } from '../notion-integration/demand-pool-tickets.ts'
+import { queryDemandPoolTicketsWithAiAnalysis, getDemandTicketNotionUrl } from '../notion-integration/demand-pool-tickets.ts'
 import { resetAiAnalysisForReclaim } from '../pipeline-runner/spawn-demand-pipeline.ts'
 import { dispatchDemand, getRemoteEntry, describeRemoteProgress, isMaintenanceModeOn } from '../cluster/cluster-head.ts'
 import { DEMAND_CONCURRENCY_LIMIT } from '../pipeline-runner/concurrency-limiter.ts'
@@ -109,9 +109,12 @@ export async function claimDemandTicket(techUser: TechUser, ticket: string): Pro
   }
 
   // 防禦性重驗：訊息可能是舊的，畫面上的單這期間可能已被別人處理完、或
-  // Notion『技術處理人員』／『狀態』已經變了。
-  const stillCandidate = (await queryDemandPoolTickets(techUser.notion_user_id)).includes(ticket)
-  if (!stillCandidate) {
+  // Notion『技術處理人員』／『狀態』已經變了。同一次查詢也取回這張單**當下**
+  // 的 AI分析 原始值（tg-monitor 詳情頁顯示這一輪的起始狀態用，見
+  // monitor-db migration 007）——下面 markAiAnalysisInProgress 會把它改成
+  // 「分析中」，要在那之前留住這份快照。
+  const candidate = (await queryDemandPoolTicketsWithAiAnalysis(techUser.notion_user_id)).find(c => c.ticket === ticket)
+  if (!candidate) {
     return { code: 'not_candidate', text: `${ticket} 目前已不是你的可認領需求單（可能已被處理或狀態已變更），請重新傳 /req 取得最新清單。` }
   }
 
@@ -139,7 +142,7 @@ export async function claimDemandTicket(techUser: TechUser, ticket: string): Pro
   // Notion AI分析 維持上面剛標記的「分析中」，語意一致。
   // 多機派工：dispatchDemand 內部依名額決定本機 spawn 或派給 worker；
   // cluster 停用/無 worker 時完全等同原本的 submitDemandPipeline。
-  const spawnResult = await dispatchDemand(ticket, techUser.email, techUser)
+  const spawnResult = await dispatchDemand(ticket, techUser.email, techUser, { aiAnalysis: candidate.aiAnalysis })
   if (!spawnResult.ok) {
     // spawn 本身失敗：明確回覆，不能讓使用者以為流程已經在跑。鎖已在上面
     // release 過；但 AI分析 已被標成「分析中」，不改回可認領值（需要重跑）

@@ -57,6 +57,19 @@ export function buildFilter(notionUserId: string): object {
  * 現況，不代表查詢邏輯有問題。
  */
 export async function queryDemandPoolTickets(notionUserId: string): Promise<string[]> {
+  return (await queryDemandPoolTicketsWithAiAnalysis(notionUserId)).map(c => c.ticket)
+}
+
+export type DemandCandidateTicket = { ticket: string; aiAnalysis: string }
+
+/**
+ * 同 queryDemandPoolTickets，但每張單附上 Notion 當下的「AI分析」原始值
+ * （待分析／需要重跑）——demand-claim.ts 認領時用這個，在改寫成「分析中」
+ * 之前留一份快照，寫進這一輪 run 的 initial_ai_analysis（tg-monitor 詳情頁
+ * 顯示用，見 monitor-db migration 007；比照 candidate-tickets.ts 的
+ * queryCandidateTicketsWithMode）。
+ */
+export async function queryDemandPoolTicketsWithAiAnalysis(notionUserId: string): Promise<DemandCandidateTicket[]> {
   const filterJson = JSON.stringify(buildFilter(notionUserId))
   const { stdout: raw } = await execFileAsync('bash', [NOTION_SH, 'query-datasource', DATA_SOURCE_ID, filterJson], {
     encoding: 'utf8',
@@ -80,11 +93,16 @@ export async function queryDemandPoolTickets(notionUserId: string): Promise<stri
 
   // 這個 database 的 unique_id 屬性名稱是『ID』（Bug List 是『單號』）——
   // 兩個 database 各自的實際欄位命名就是不同，已用 notion.sh 實測確認，
-  // 不是疏漏或複製時漏改。
-  return parsed.results
-    .map((page: any) => page.properties?.['ID']?.unique_id?.number)
-    .filter((n: unknown): n is number => typeof n === 'number')
-    .map((n: number) => `ALDREQ-${n}`)
+  // 不是疏漏或複製時漏改。單號缺失、或 AI分析 不是字串（理論上 filter 已擋
+  // 掉只剩 待分析/需要重跑，這裡是防禦）一律略過，不強行塞入不完整的列。
+  const out: DemandCandidateTicket[] = []
+  for (const page of parsed.results as any[]) {
+    const n = page?.properties?.['ID']?.unique_id?.number
+    const aiAnalysis = page?.properties?.['AI分析']?.select?.name
+    if (typeof n !== 'number' || typeof aiAnalysis !== 'string') continue
+    out.push({ ticket: `ALDREQ-${n}`, aiAnalysis })
+  }
+  return out
 }
 
 // /status 指令用：需求單一認領（demand-claim.ts 的 markAiAnalysisInProgress）

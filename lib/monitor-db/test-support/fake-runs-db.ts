@@ -19,6 +19,7 @@ export interface FakeRunRow {
   host: string
   ticket: string
   kind: string
+  initial_ai_analysis: string | null
   lifecycle_rank: number
   started_at: string | null
   pid: number | null
@@ -84,12 +85,13 @@ export class FakeRunsDb implements MonitorDbExecutor {
     throw new Error(`FakeRunsDb: 未預期的 SQL（沒有對應的 handler）：${sql}`)
   }
 
-  private blank(runId: string, host: string, ticket: string, kind: string, rank: number): FakeRunRow {
+  private blank(runId: string, host: string, ticket: string, kind: string, initialAiAnalysis: string | null, rank: number): FakeRunRow {
     return {
       run_id: runId,
       host,
       ticket,
       kind,
+      initial_ai_analysis: initialAiAnalysis,
       lifecycle_rank: rank,
       started_at: null,
       pid: null,
@@ -128,6 +130,7 @@ export class FakeRunsDb implements MonitorDbExecutor {
       host,
       ticket,
       kind,
+      initialAiAnalysis,
       rank,
       startedAt,
       pid,
@@ -144,6 +147,7 @@ export class FakeRunsDb implements MonitorDbExecutor {
       string,
       string,
       string,
+      string | null,
       number,
       string | null,
       number | null,
@@ -159,7 +163,7 @@ export class FakeRunsDb implements MonitorDbExecutor {
     const existing = this.rows.get(runId)
     if (!existing) {
       this.rows.set(runId, {
-        ...this.blank(runId, host, ticket, kind, rank),
+        ...this.blank(runId, host, ticket, kind, initialAiAnalysis, rank),
         started_at: startedAt,
         pid,
         stdout_path: stdoutPath,
@@ -179,6 +183,7 @@ export class FakeRunsDb implements MonitorDbExecutor {
     }
     const before = JSON.stringify(existing)
     existing.lifecycle_rank = Math.max(existing.lifecycle_rank, rank)
+    existing.initial_ai_analysis = existing.initial_ai_analysis ?? initialAiAnalysis
     existing.started_at = existing.started_at ?? startedAt
     existing.pid = existing.pid ?? pid
     existing.stdout_path = existing.stdout_path ?? stdoutPath
@@ -302,7 +307,7 @@ export class FakeRunsDb implements MonitorDbExecutor {
       host = h
       if (this.rows.has(runId)) throw new DupEntryError('duplicate run_id')
       this.rows.set(runId, {
-        ...this.blank(runId, host, ticket, kind, 100),
+        ...this.blank(runId, host, ticket, kind, null, 100),
         outcome,
         outcome_tier: 2,
         outcome_source: outcomeSource,
@@ -323,7 +328,7 @@ export class FakeRunsDb implements MonitorDbExecutor {
       host = h
       if (this.rows.has(runId)) throw new DupEntryError('duplicate run_id')
       this.rows.set(runId, {
-        ...this.blank(runId, host, ticket, kind, 100),
+        ...this.blank(runId, host, ticket, kind, null, 100),
         outcome,
         outcome_tier: 1,
         outcome_source: outcomeSource,
@@ -363,7 +368,7 @@ export class FakeRunsDb implements MonitorDbExecutor {
       host = h
       if (this.rows.has(runId)) throw new DupEntryError('duplicate run_id')
       this.rows.set(runId, {
-        ...this.blank(runId, host, ticket, kind, 10),
+        ...this.blank(runId, host, ticket, kind, null, 10),
         cancel_requested_at: cancelRequestedAt,
         cancel_resolved_by: resolvedBy,
         legacy_key: legacyKey,

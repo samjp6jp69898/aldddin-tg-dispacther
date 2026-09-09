@@ -137,7 +137,10 @@ export async function claimBugTicket(techUser: TechUser, ticket: string): Promis
   // （見 pipeline-queue.ts 檔頭註解）。
   // 多機派工：dispatchBug 內部依名額決定本機 spawn 或派給 worker；cluster
   // 停用/無 worker 時完全等同原本的 submitCreateMr（見 cluster-head.ts）。
-  const result = await dispatchBug(ticket, techUser, { mode })
+  // aiAnalysis：認領當下 Notion「AI分析」的原始值（tg-monitor 詳情頁顯示
+  // 這一輪起始狀態用，見 monitor-db migration 007），跟 mode 同一次查詢
+  // 取得，不多打一次 Notion。
+  const result = await dispatchBug(ticket, techUser, { mode, aiAnalysis: candidate.aiAnalysis })
   if (!result.ok) {
     // spawn 本身失敗（磁碟/fd 用盡等）：明確回覆，不能讓使用者在例外未接住
     // 的舊版行為下完全收不到任何訊息。per-ticket 鎖已經 release，可以重新

@@ -100,9 +100,11 @@ export type DispatchAttemptWriteDeps = {
   }) => void
 }
 
-/** bug 派工的附加選項：resume（續跑，tg-monitor 重試/自動重試）與 mode
- * （執行模式，claim.ts 依 Notion AI分析 值決定）正交，可同時存在。 */
-export type BugDispatchOpts = { resume?: boolean; mode?: BugMode }
+/** 派工的附加選項：resume（續跑，tg-monitor 重試/自動重試，bug 專用）、mode
+ * （bug 執行模式，claim.ts 依 Notion AI分析 值決定）、aiAnalysis（bug/demand
+ * 共用：認領當下 Notion「AI分析」的原始值，供 tg-monitor 詳情頁顯示這一輪
+ * 的起始狀態，見 monitor-db migration 007）三者互相正交，可同時存在。 */
+export type BugDispatchOpts = { resume?: boolean; mode?: BugMode; aiAnalysis?: string }
 
 /**
  * §4.1–4.3 的產物 I/O（production 實作在 lib/cluster/artifact-sync.ts + wiring
@@ -140,7 +142,11 @@ export type DispatchDeps = {
     demand: {
       stats: () => QueueStats
       has: (ticket: string) => 'running' | 'queued' | null
-      submit: (ticket: string, assigneeEmail: string, triggeredBy: TechUser | null) => SubmitResult
+      /** opts 目前只用得到 aiAnalysis（demand 沒有 resume/mode 概念）；只走
+       * 本機 submitLocal() 這條路徑消費，不轉發進遠端 JobRequest——demand 的
+       * 遠端執行本來就還沒鑄 run_id（見 worker-agent.ts 註解），這個欄位在
+       * 那條路徑上目前寫了也沒有地方接住，故意不做。 */
+      submit: (ticket: string, assigneeEmail: string, triggeredBy: TechUser | null, opts?: BugDispatchOpts) => SubmitResult
     }
   }
   dispatchAttempts?: DispatchAttemptWriteDeps
@@ -175,7 +181,7 @@ export function createDispatcher(deps: DispatchDeps) {
   ): Promise<DispatchResult> {
     const localSide = deps.local[kind]
     const submitLocal = (): SubmitResult =>
-      kind === 'bug' ? deps.local.bug.submit(ticket, techUser, opts) : deps.local.demand.submit(ticket, assigneeEmail, techUser)
+      kind === 'bug' ? deps.local.bug.submit(ticket, techUser, opts) : deps.local.demand.submit(ticket, assigneeEmail, techUser, opts)
 
     // (1)(2) 重複防護——這兩個檢查與 (3) 佔位之間沒有任何 await，同一條
     // event loop 上的併發認領不可能雙雙通過。
@@ -220,7 +226,15 @@ export function createDispatcher(deps: DispatchDeps) {
       // 只差送給哪一台——內容不依賴選中的 worker。
       const job: JobRequest =
         kind === 'bug'
-          ? { kind, ticket, triggeredBy: techUser ?? undefined, dispatchId, ...(opts?.resume ? { resume: true } : {}), ...(opts?.mode ? { mode: opts.mode } : {}) }
+          ? {
+              kind,
+              ticket,
+              triggeredBy: techUser ?? undefined,
+              dispatchId,
+              ...(opts?.resume ? { resume: true } : {}),
+              ...(opts?.mode ? { mode: opts.mode } : {}),
+              ...(opts?.aiAnalysis ? { aiAnalysis: opts.aiAnalysis } : {}),
+            }
           : { kind, ticket, triggeredBy: techUser ?? undefined, assigneeEmail, dispatchId }
 
       // ── §4.3：產物親和（插在 (4) capacity 探測之前）────────────────────
@@ -400,6 +414,7 @@ export function createDispatcher(deps: DispatchDeps) {
 
   return {
     dispatchBug: (ticket: string, techUser: TechUser | null, opts?: BugDispatchOpts) => dispatch('bug', ticket, techUser, '', opts),
-    dispatchDemand: (ticket: string, assigneeEmail: string, techUser: TechUser | null) => dispatch('demand', ticket, techUser, assigneeEmail),
+    dispatchDemand: (ticket: string, assigneeEmail: string, techUser: TechUser | null, opts?: BugDispatchOpts) =>
+      dispatch('demand', ticket, techUser, assigneeEmail, opts),
   }
 }

@@ -75,11 +75,12 @@ export interface RunIdentity {
  */
 export const W1_SQL = `
 INSERT INTO runs
-  (run_id, host, ticket, kind, lifecycle_rank, started_at, pid, stdout_path, stderr_path,
+  (run_id, host, ticket, kind, initial_ai_analysis, lifecycle_rank, started_at, pid, stdout_path, stderr_path,
    trigger_source, retry_of_run_id, dispatch_id, legacy_key, triggered_by_email, triggered_by_name, created_at)
-VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, NOW(3)) AS new
+VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, NOW(3)) AS new
 ON DUPLICATE KEY UPDATE
-  lifecycle_rank     = IF(runs.host = new.host, GREATEST(runs.lifecycle_rank, new.lifecycle_rank), runs.lifecycle_rank),
+  lifecycle_rank      = IF(runs.host = new.host, GREATEST(runs.lifecycle_rank, new.lifecycle_rank), runs.lifecycle_rank),
+  initial_ai_analysis = IF(runs.host = new.host, COALESCE(runs.initial_ai_analysis, new.initial_ai_analysis), runs.initial_ai_analysis),
   started_at         = IF(runs.host = new.host, COALESCE(runs.started_at,         new.started_at),         runs.started_at),
   pid                = IF(runs.host = new.host, COALESCE(runs.pid,                new.pid),                runs.pid),
   stdout_path        = IF(runs.host = new.host, COALESCE(runs.stdout_path,        new.stdout_path),        runs.stdout_path),
@@ -96,6 +97,10 @@ export const RUNS_COLD_PATH_W1_SQL = 'SELECT host, lifecycle_rank FROM runs WHER
 
 export interface WriteRunProgressInput extends RunIdentity {
   lifecycleRank: 10 | 30
+  /** run 建立當下 Notion「AI分析」欄位的原始值（bug/demand 共用，見 migration
+   * 007）——set-once，COALESCE 守衛保證不會被之後的寫入覆蓋。呼叫端沒有值
+   * （如舊佇列檔恢復出來的 entry）就傳 null/省略，欄位維持 NULL，不硬填假值。 */
+  initialAiAnalysis?: string | null
   startedAt?: string | null
   pid?: number | null
   stdoutPath?: string | null
@@ -114,6 +119,7 @@ export async function writeRunProgress(pool: MonitorDbExecutor, input: WriteRunP
     MON_HOST,
     input.ticket,
     input.kind,
+    input.initialAiAnalysis ?? null,
     input.lifecycleRank,
     dt(input.startedAt),
     input.pid ?? null,

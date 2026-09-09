@@ -463,7 +463,16 @@ app.post('/jobs', guard, async c => {
   // 一鍵切換本來就是 head + 全部 worker 一起打，就是為了避免只開這一台。
   if (maintenanceMode.isOn()) return c.json({ ok: false, reason: 'maintenance' }, 503)
   const body = (await c.req.json().catch(() => null)) as
-    | { kind?: string; ticket?: string; resume?: boolean; mode?: unknown; triggeredBy?: unknown; assigneeEmail?: string; dispatchId?: unknown }
+    | {
+        kind?: string
+        ticket?: string
+        resume?: boolean
+        mode?: unknown
+        aiAnalysis?: unknown
+        triggeredBy?: unknown
+        assigneeEmail?: string
+        dispatchId?: unknown
+      }
     | null
   if (!body || typeof body.ticket !== 'string') return c.json({ ok: false, reason: 'bad_request' }, 400)
   // mode（plan-pipeline-modes-v1 §2.2）：值域封閉，會進 claude -p 的 prompt
@@ -471,6 +480,9 @@ app.post('/jobs', guard, async c => {
   // （當沒帶會把同事選的「只做問題分析」靜默跑成一鍵，比 400 更糟）。
   if (body.mode !== undefined && !isBugMode(body.mode)) return c.json({ ok: false, reason: 'bad_request' }, 400)
   const mode = body.mode as BugMode | undefined
+  // aiAnalysis：純顯示用途的自由文字（tg-monitor 詳情頁），不像 mode 進
+  // claude -p 的 prompt 位置參數，不需要封閉值域驗證——非字串就當沒帶。
+  const aiAnalysis = typeof body.aiAnalysis === 'string' ? body.aiAnalysis : undefined
   const triggeredBy = sanitizeTriggeredBy(body.triggeredBy)
   // §5.3：head 隨請求帶 dispatch_id，本機鑄 run_id 時把它一併寫進
   // runs.dispatch_id（形狀 A COALESCE 補空欄），讓
@@ -499,7 +511,7 @@ app.post('/jobs', guard, async c => {
     // 判 not claimable（2026-09-03 事故，見 tracker-sync.ts 檔內說明）。
     await pullTrackerFromHead(body.ticket)
     ensureTrackerPending(body.ticket)
-    const result = submitCreateMr(body.ticket, { resume: body.resume === true, mode, triggeredBy, dispatchId: dispatchId ?? undefined })
+    const result = submitCreateMr(body.ticket, { resume: body.resume === true, mode, aiAnalysis, triggeredBy, dispatchId: dispatchId ?? undefined })
     // §5.4：submitCreateMr 現在會在 started/queued 兩種狀態鑄 run_id 並疊加進
     // SubmitResult（見 pipeline-queue.ts 的 SubmitResult.runId 註解）——直接
     // 透傳給 head，不需要另外維護 in-process Map<ticket, runId>。

@@ -35,6 +35,10 @@ export type JobRequest = {
   /** bug 專用：pipeline 執行模式（plan-pipeline-modes-v1 §2.2）。省略＝full。
    * worker 端 /jobs 會用 isBugMode() 驗值域，不合法整個請求 400。 */
   mode?: BugMode
+  /** bug 專用：認領當下 Notion「AI分析」的原始值，worker 收到後原樣寫進自己
+   * 鑄的 runs.initial_ai_analysis（見 monitor-db migration 007）。demand 目前
+   * 不走這條（demand 的遠端執行還沒鑄 run_id，見 worker-agent.ts 註解）。 */
+  aiAnalysis?: string
   triggeredBy?: TechUser
   assigneeEmail?: string
   /** head 端 dispatch-registry.ts 鑄的 monitor DB `dispatch_attempts.dispatch_id`

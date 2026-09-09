@@ -317,13 +317,23 @@ timeout 10800 ${CLAUDE_BIN} -p "/create-mr:create-mr $1 $3 $4" --model opus --pe
 // （§5.3），worker 端鑄 run_id 時一併寫進 runs.dispatch_id（W1 COALESCE 補
 // 空欄），讓 dispatch_attempts.dispatch_id = runs.dispatch_id 可以精確 join。
 // 本機直接觸發（head 自己跑、CLI、reaper auto-retry）沒有這個值，恆為 null。
-export type BugPayload = { resume: boolean; mode: BugMode; runId: string; retryOfRunId: string | null; dispatchId: string | null }
+export type BugPayload = {
+  resume: boolean
+  mode: BugMode
+  /** 認領當下 Notion「AI分析」的原始值，供 tg-monitor 詳情頁顯示這一輪的
+   * 起始狀態（見 monitor-db migration 007）。舊佇列檔恢復出來的 entry 沒有
+   * 這欄時為 null，不強行補值。 */
+  aiAnalysis: string | null
+  runId: string
+  retryOfRunId: string | null
+  dispatchId: string | null
+}
 
 const BUG_RUN_KIND: RunKind = 'bug'
 
 function spawnCreateMrNow(entry: QueueEntry<BugPayload>, onExit: () => void): { ok: true; pid: number | undefined } | { ok: false } {
   const { ticket } = entry
-  const { runId, retryOfRunId, dispatchId } = entry.payload
+  const { runId, retryOfRunId, dispatchId, aiAnalysis } = entry.payload
   try {
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-')
     const base = `${ticket}.${timestamp}`
@@ -444,6 +454,7 @@ function spawnCreateMrNow(entry: QueueEntry<BugPayload>, onExit: () => void): { 
           runId,
           ticket,
           kind: BUG_RUN_KIND,
+          initialAiAnalysis: aiAnalysis,
           lifecycleRank: 30 as const,
           startedAt: new Date().toISOString(),
           pid,
@@ -461,6 +472,7 @@ function spawnCreateMrNow(entry: QueueEntry<BugPayload>, onExit: () => void): { 
             runId,
             ticket,
             kind: BUG_RUN_KIND,
+            initialAiAnalysis: aiAnalysis,
             lifecycleRank: 30,
             startedAt: new Date().toISOString(),
             pid,
@@ -676,7 +688,7 @@ export function tryDispatchBugQueueFront(attempt: (entry: QueueEntry<BugPayload>
  */
 export function submitCreateMr(
   ticket: string,
-  opts: { resume?: boolean; mode?: BugMode; triggeredBy?: TechUser; retryOf?: string; dispatchId?: string } = {},
+  opts: { resume?: boolean; mode?: BugMode; aiAnalysis?: string; triggeredBy?: TechUser; retryOf?: string; dispatchId?: string } = {},
 ): SubmitResult {
   if (!TICKET_RE.test(ticket)) {
     throw new Error(`拒絕 spawn：ticket 格式不對（${ticket}），可能是注入嘗試`)
@@ -693,7 +705,11 @@ export function submitCreateMr(
   // 自動重試繼承，與 retryOfRunId 同一條 env 鏈）> full。常駐 server/worker
   // 行程沒有 MON_BUG_MODE，顯式未給就是 full——跟加 mode 之前的行為相同。
   const mode: BugMode = opts.mode ?? coerceBugMode(process.env.MON_BUG_MODE)
-  const result = bugQueue.submit(ticket, triggeredBy, { resume: !!opts.resume, mode, runId, retryOfRunId, dispatchId: opts.dispatchId ?? null })
+  // aiAnalysis：純顯示用途，不像 mode 需要跨行程 env 繼承鏈——auto-retry
+  // 沒有顯式帶的話就是 null（這一輪並非源自一次新的 Notion 認領，留白比
+  // 硬套一個不準確的值更誠實）。
+  const aiAnalysis = opts.aiAnalysis ?? null
+  const result = bugQueue.submit(ticket, triggeredBy, { resume: !!opts.resume, mode, aiAnalysis, runId, retryOfRunId, dispatchId: opts.dispatchId ?? null })
   if (result.ok && (result.status === 'started' || result.status === 'queued')) {
     return { ...result, runId }
   }

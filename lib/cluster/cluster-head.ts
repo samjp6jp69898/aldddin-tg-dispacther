@@ -149,12 +149,14 @@ const dispatcher = createDispatcher({
       // techUser 可為 null、opts.resume 透傳給 submitCreateMr 的 `--resume`
       // 語意（2026-09-04，task 2：tg-monitor 續跑改走這條路徑，見下方
       // registerClusterRoutes 新增的 POST /cluster/retry）。
-      submit: (ticket, techUser, opts) => submitCreateMr(ticket, { triggeredBy: techUser ?? undefined, resume: opts?.resume, mode: opts?.mode }),
+      submit: (ticket, techUser, opts) =>
+        submitCreateMr(ticket, { triggeredBy: techUser ?? undefined, resume: opts?.resume, mode: opts?.mode, aiAnalysis: opts?.aiAnalysis }),
     },
     demand: {
       stats: getDemandQueueStats,
       has: hasDemandTicketActive,
-      submit: (ticket, assigneeEmail, techUser) => submitDemandPipeline(ticket, assigneeEmail, techUser ?? undefined),
+      submit: (ticket, assigneeEmail, techUser, opts) =>
+        submitDemandPipeline(ticket, assigneeEmail, techUser ?? undefined, undefined, opts?.aiAnalysis),
     },
   },
   dispatchAttempts: dispatchAttemptWrites,
@@ -214,8 +216,13 @@ export function dispatchBug(ticket: string, techUser: TechUser | null, opts?: Bu
   return dispatcher.dispatchBug(ticket, techUser, opts)
 }
 
-export function dispatchDemand(ticket: string, assigneeEmail: string, techUser: TechUser | null): Promise<DispatchResult> {
-  return dispatcher.dispatchDemand(ticket, assigneeEmail, techUser)
+export function dispatchDemand(
+  ticket: string,
+  assigneeEmail: string,
+  techUser: TechUser | null,
+  opts?: { aiAnalysis?: string },
+): Promise<DispatchResult> {
+  return dispatcher.dispatchDemand(ticket, assigneeEmail, techUser, opts)
 }
 
 /** 這張單目前是否派在某台 worker 上（claim.ts 的 isTicketLocked 遠端對應）。 */

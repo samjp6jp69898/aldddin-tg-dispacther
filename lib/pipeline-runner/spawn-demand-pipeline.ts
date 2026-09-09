@@ -100,11 +100,19 @@ const concurrencyLimiter = createConcurrencyLimiter(DEMAND_CONCURRENCY_LIMIT)
 // 的 spawn choke point 寫 running/rank30，ODKU 的 GREATEST 語意讓寫入順序
 // 不影響最終結果）——與 spawn-create-mr.ts 的 BugPayload 完全對稱。
 // dispatchId（整合修補批次 item 6）：見 spawn-create-mr.ts BugPayload 同名欄位註解。
-export type DemandPayload = { assigneeEmail: string; runId: string; retryOfRunId: string | null; dispatchId: string | null }
+export type DemandPayload = {
+  assigneeEmail: string
+  runId: string
+  retryOfRunId: string | null
+  dispatchId: string | null
+  /** 認領當下 Notion「AI分析」的原始值（待分析／需要重跑），供 tg-monitor
+   * 詳情頁顯示這一輪的起始狀態（見 monitor-db migration 007）。 */
+  aiAnalysis: string | null
+}
 
 function spawnDemandPipelineNow(entry: QueueEntry<DemandPayload>, onExit: () => void): { ok: true; pid: number | undefined } | { ok: false } {
   const { ticket } = entry
-  const { runId, retryOfRunId, dispatchId } = entry.payload
+  const { runId, retryOfRunId, dispatchId, aiAnalysis } = entry.payload
   try {
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-')
     const base = `${ticket}.${timestamp}.demand-pipeline`
@@ -183,6 +191,7 @@ function spawnDemandPipelineNow(entry: QueueEntry<DemandPayload>, onExit: () => 
           runId,
           ticket,
           kind: DEMAND_RUN_KIND,
+          initialAiAnalysis: aiAnalysis,
           lifecycleRank: 30 as const,
           startedAt,
           pid,
@@ -200,6 +209,7 @@ function spawnDemandPipelineNow(entry: QueueEntry<DemandPayload>, onExit: () => 
             runId,
             ticket,
             kind: DEMAND_RUN_KIND,
+            initialAiAnalysis: aiAnalysis,
             lifecycleRank: 30,
             startedAt,
             pid,
@@ -412,14 +422,20 @@ export function tryDispatchDemandQueueFront(attempt: (entry: QueueEntry<DemandPa
  * （stale-lock-reaper 只重試 bug pipeline），這裡仍照通用規則讀取，恆為
  * null，為未來擴充預留、成本為零。
  */
-export function submitDemandPipeline(ticket: string, assigneeEmail: string, triggeredBy?: TechUser, dispatchId?: string): SubmitResult {
+export function submitDemandPipeline(
+  ticket: string,
+  assigneeEmail: string,
+  triggeredBy?: TechUser,
+  dispatchId?: string,
+  aiAnalysis?: string,
+): SubmitResult {
   if (!TICKET_RE.test(ticket)) {
     throw new Error(`拒絕 spawn：ticket 格式不對（${ticket}），可能是注入嘗試`)
   }
   const by: QueueTriggeredBy = triggeredBy ? { name: triggeredBy.notion_user_name, email: triggeredBy.email } : null
   const runId = mintRunId()
   const retryOfRunId = readInheritedRunId()
-  return demandQueue.submit(ticket, by, { assigneeEmail, runId, retryOfRunId, dispatchId: dispatchId ?? null })
+  return demandQueue.submit(ticket, by, { assigneeEmail, runId, retryOfRunId, dispatchId: dispatchId ?? null, aiAnalysis: aiAnalysis ?? null })
 }
 
 /** 只給 server.ts 啟動時呼叫一次（CLI 短命行程絕不能呼叫，見 pipeline-queue.ts
