@@ -32,7 +32,7 @@ export const AI_ANALYSIS_TO_MODE: Readonly<Record<string, BugMode>> = Object.fre
   全部重跑: 'full',
   '只做問題分析（不改程式）': 'analysis',
   '產出修復程式碼並開 MR': 'fix',
-  '依補充留言重新分析（仍不改程式）': 'reanalyze',
+  '依留言重新分析（不改程式）': 'reanalyze',
 })
 
 // 2026-09-08 實測：Notion `select.equals` filter 帶**目前不存在**的 option 名稱
@@ -50,7 +50,7 @@ export const WANTED_AI_ANALYSIS: readonly string[] = [
   '全部重跑',
   '只做問題分析（不改程式）',
   '產出修復程式碼並開 MR',
-  '依補充留言重新分析（仍不改程式）',
+  '依留言重新分析（不改程式）',
 ]
 
 export type CandidateTicket = { ticket: string; aiAnalysis: string; mode: BugMode }

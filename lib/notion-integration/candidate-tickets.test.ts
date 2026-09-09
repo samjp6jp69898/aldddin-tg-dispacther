@@ -23,14 +23,14 @@ describe('AI_ANALYSIS_TO_MODE / buildFilter（plan-pipeline-modes-v1 §2.1）', 
   })
 
   test('對照表涵蓋 Notion 現存五個可認領值', () => {
-    for (const v of ['一鍵分析＋修復＋開 MR', '全部重跑', '只做問題分析（不改程式）', '產出修復程式碼並開 MR', '依補充留言重新分析（仍不改程式）']) {
+    for (const v of ['一鍵分析＋修復＋開 MR', '全部重跑', '只做問題分析（不改程式）', '產出修復程式碼並開 MR', '依留言重新分析（不改程式）']) {
       expect(AI_ANALYSIS_TO_MODE[v]).toBeDefined()
     }
   })
 
   test('WANTED_AI_ANALYSIS（給仍用 API filter 的 ops-ui）是對照表 key 的子集，且只含 Notion 當下存在的選項', () => {
     for (const v of WANTED_AI_ANALYSIS) expect(AI_ANALYSIS_TO_MODE[v]).toBeDefined()
-    expect([...WANTED_AI_ANALYSIS]).toEqual(['一鍵分析＋修復＋開 MR', '全部重跑', '只做問題分析（不改程式）', '產出修復程式碼並開 MR', '依補充留言重新分析（仍不改程式）'])
+    expect([...WANTED_AI_ANALYSIS]).toEqual(['一鍵分析＋修復＋開 MR', '全部重跑', '只做問題分析（不改程式）', '產出修復程式碼並開 MR', '依留言重新分析（不改程式）'])
   })
 
   test('pipeline 自己設的終態值不在候選集合（問題分析完成，待確認 / 分析成功 / 待釐清 / 分析失敗）', () => {

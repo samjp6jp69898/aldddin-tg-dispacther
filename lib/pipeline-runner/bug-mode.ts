@@ -5,7 +5,7 @@
 //   full      ：一鍵——分析 → 修復 → 三審 → MR（既有行為）
 //   analysis  ：只做到根因分析報告就停（新出口 analysis_done）
 //   fix       ：產出修復程式碼並開 MR——有既有分析產物就接續（帶新留言重跑根因），沒有就等同 full
-//   reanalyze ：依補充留言重新分析，仍停在 analysis_done
+//   reanalyze ：依留言重新分析，仍停在 analysis_done
 //
 // 值域**封閉**：這個字串會進到 `claude -p` 的 prompt 位置參數與 ps 命令列掃描
 // 契約（spawn-create-mr.ts WRAPPER_SCRIPT 的 $3），任何來自網路/argv 的值都要
@@ -31,5 +31,5 @@ export const BUG_MODE_LABEL: Readonly<Record<BugMode, string>> = Object.freeze({
   full: '一鍵分析＋修復＋開 MR',
   analysis: '只做問題分析',
   fix: '產出修復程式碼並開 MR',
-  reanalyze: '依補充留言重新分析',
+  reanalyze: '依留言重新分析',
 })
