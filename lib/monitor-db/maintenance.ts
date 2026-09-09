@@ -21,6 +21,7 @@ import { reclaimSpoolFiles } from './spool/reaper.ts'
 import { acquireReplayerLock, releaseReplayerLock } from './spool/replayer-lock.ts'
 import { SPOOL_DIR } from './spool/types.ts'
 import { defaultIsPidAlive, sweepDeadLocalRuns, sweepLostOnRestart } from './local-sweep.ts'
+import { readPendingSpoolRunIds } from './spool/pending-run-ids.ts'
 
 /** 沒有計畫明文規定的固定值——比照長駐行程既有的週期排程器慣例
  * （心跳 60 秒、tunnel 健康檢查 60 秒）取一個同量級、足夠即時又不過度打
@@ -33,7 +34,9 @@ export interface MonitorMaintenanceOpts {
    * 自己已經建好的實例，本模組不重建一份。 */
   isTicketActive: (ticket: string) => boolean
   /** 本機是否有這個 run_id 的待重放 spool 條目（§6.6 降噪跳過條件）；
-   * 不提供時視同永遠沒有。 */
+   * 選填——不提供時 tick() 每輪自己用 readPendingSpoolRunIds() 掃一次
+   * spool 目錄當預設實作（2026-09-09 起，見 pending-run-ids.ts 檔頭），不是
+   * 「視同永遠沒有」。只有測試需要精準控制回傳值時才需要顯式傳入覆寫。 */
   hasPendingSpoolEntry?: (runId: string) => boolean
   /** 測試專用覆寫；production 呼叫端不傳，一律用 SPOOL_DIR。 */
   spoolDir?: string
@@ -94,11 +97,27 @@ function startMonitorMaintenanceUnsafe(opts: MonitorMaintenanceOpts): MonitorMai
       }
     }
 
+    // hasPendingSpoolEntry：呼叫端可顯式覆寫（測試用途）；production 沒傳時
+    // 每輪自己重掃一次 spool 目錄建一個 Set（見 pending-run-ids.ts 檔頭
+    // 2026-09-09 事故說明——這個保護原本要 server.ts／worker-agent.ts 各自
+    // 手動接線，兩處都漏接，一直是死碼，ALDREQ-812 因此被 sweeper 誤標成
+    // unknown_no_writer，其實 spool 裡明明還有一筆待重放、內容正確的
+    // success 條目）。掃描本身失敗只讓這一輪沒有這層保護，不阻斷 sweep。
+    let hasPendingSpoolEntry = opts.hasPendingSpoolEntry
+    if (!hasPendingSpoolEntry) {
+      try {
+        const pending = readPendingSpoolRunIds(dir)
+        hasPendingSpoolEntry = runId => pending.has(runId)
+      } catch (err) {
+        console.error(`monitor-db maintenance: readPendingSpoolRunIds 失敗（本輪不做 pending-spool 保護）: ${err}`)
+      }
+    }
+
     try {
       await sweepDeadLocalRuns(pool, {
         isPidAlive: defaultIsPidAlive,
         isTicketActive: opts.isTicketActive,
-        hasPendingSpoolEntry: opts.hasPendingSpoolEntry,
+        hasPendingSpoolEntry,
       })
     } catch (err) {
       console.error(`monitor-db maintenance: sweepDeadLocalRuns 失敗: ${err}`)
