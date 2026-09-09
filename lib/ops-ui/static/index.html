@@ -129,7 +129,7 @@
     try {
       if (tab === 'active') state.active = await api('/active')
       else if (tab === 'pending') state.pending = await api('/pending')
-      else state.history = await api('/history?limit=50&offset=' + state.histOffset + '&ticket=' + encodeURIComponent(state.histFilter))
+      else state.history = await api('/history?limit=20&offset=' + state.histOffset + '&ticket=' + encodeURIComponent(state.histFilter))
     } catch (e) {
       if (e.message !== 'unauthenticated') state.error = e.message
     } finally {
@@ -291,7 +291,7 @@
   function bind() {
     document.querySelectorAll('[data-tab]').forEach(b => b.onclick = () => { state.tab = b.dataset.tab; localStorage.setItem('ops.tab', state.tab); render(); loadTab(state.tab) })
     document.querySelectorAll('[data-start]').forEach(b => b.onclick = () => start(b.dataset.start))
-    document.querySelectorAll('[data-page]').forEach(b => b.onclick = () => { state.histOffset = Math.max(0, state.histOffset + (b.dataset.page === 'next' ? 50 : -50)); loadTab('history') })
+    document.querySelectorAll('[data-page]').forEach(b => b.onclick = () => { state.histOffset = Math.max(0, state.histOffset + (b.dataset.page === 'next' ? 20 : -20)); loadTab('history') })
     const f = document.getElementById('filter'); if (f) f.oninput = () => { state.filter = f.value; const card = document.querySelector('.card'); card.innerHTML = tablePending(state.pending); bind() }
     const hf = document.getElementById('histFilter'); if (hf) { hf.onkeydown = e => { if (e.key === 'Enter') { state.histFilter = hf.value; state.histOffset = 0; loadTab('history') } } }
     const hs = document.getElementById('histSearch'); if (hs) hs.onclick = () => { state.histFilter = document.getElementById('histFilter').value; state.histOffset = 0; loadTab('history') }
