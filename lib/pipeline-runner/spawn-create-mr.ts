@@ -220,6 +220,13 @@ const BUG_LOCK_SH = '/Users/user/aladdin/scripts/bug-lock.sh'
 // 這條 spawn 鏈上不可靠，直接把「用哪個 claude」從環境問題變成常數。
 const CLAUDE_BIN = '/Users/user/.local/bin/claude'
 
+// 2026-09-14：-p 呼叫本身改走 claude-p-rate-watch.sh（透明包裝，額外監控 -p
+// 呼叫的 5hr/weekly rate limit；stdout/exit code/訊號轉送對呼叫端完全透通，見
+// aladdin_ai/scripts/claude-p-rate-watch.sh 檔頭說明）。上面的 CLAUDE_BIN 保留
+// 給 241 行診斷用的 --version 檢查，維持原本「不透過 PATH、鎖死真正 binary」
+// 的用意不變，不受這次改動影響。
+const CLAUDE_P_WRAPPER = '/Users/user/aladdin/scripts/claude-p-rate-watch.sh'
+
 // 模型必須明確指定 --model opus（alias，由 CLI 解析成當下最新的 Opus 正式
 // 版），不能省略讓它吃 ~/.claude/settings.json 的使用者預設：settings.json
 // 殘留已下架的舊 model ID 時同樣直接 404。alias 而非寫死完整 ID，正是為了
@@ -239,7 +246,7 @@ trap '
 ' EXIT
 unset CLAUDE_EFFORT
 { echo "diag PATH=$PATH"; echo "diag which claude: $(which -a claude 2>&1 | tr '\\n' ' ')"; echo "diag version: $(${CLAUDE_BIN} --version 2>&1)"; } >&2
-timeout 10800 ${CLAUDE_BIN} -p "/create-mr:create-mr $1 $3 $4" --model opus --permission-mode bypassPermissions --output-format stream-json --verbose
+timeout 10800 ${CLAUDE_P_WRAPPER} -p "/create-mr:create-mr $1 $3 $4" --model opus --permission-mode bypassPermissions --output-format stream-json --verbose
 `
 // --output-format 於 2026-08-26 由 json 改為 stream-json（+ -p 模式必帶的
 // --verbose）：舊格式整包 JSON 在行程結束那一刻才 flush，執行中 stdout 永遠

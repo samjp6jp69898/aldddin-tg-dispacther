@@ -6,7 +6,11 @@ import { isMonitorDbEnabled } from '../monitor-db/env.ts'
 
 const execFileAsync = promisify(execFile)
 
-export const CLAUDE_BIN = '/Users/user/.local/bin/claude'
+// 2026-09-14：改指向 claude-p-rate-watch.sh（透明包裝真正的
+// /Users/user/.local/bin/claude，額外監控 -p 呼叫的 5hr/weekly rate limit 並在
+// 逼近門檻時發 TG 通知；stdout/exit code/訊號轉送對呼叫端完全透通，見
+// aladdin_ai/scripts/claude-p-rate-watch.sh 檔頭說明）。
+export const CLAUDE_BIN = '/Users/user/aladdin/scripts/claude-p-rate-watch.sh'
 
 /**
  * 呼叫 claude -p，prompt 走 stdin 而不是 argv（`-p` 後面不帶值）。
