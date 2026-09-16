@@ -11,7 +11,7 @@ import type { TechUser } from '../user-resolution/tech-user.ts'
  *
  * 「真的在跑」用 isTicketLocked 交集掉，不能只看 Notion 欄位：
  * - Bug 票：claim.ts 不改 Notion『狀態』欄位，候選單查詢（狀態=待處理/仍有
- *   問題）在整條 pipeline 跑完前都還會查到同一張單，必須靠鎖目錄才能分辨
+ *   問題/處理中）在整條 pipeline 跑完前都還會查到同一張單，必須靠鎖目錄才能分辨
  *   「還沒認領」跟「正在跑」。
  * - 需求單：demand-claim.ts 認領當下就把 AI分析 改成分析中，若之後 spawn
  *   失敗（全域併發上限/啟動錯誤），欄位不會被復原，光看 AI分析=分析中 會

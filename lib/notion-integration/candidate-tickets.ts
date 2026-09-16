@@ -17,7 +17,9 @@ const EXEC_TIMEOUT_MS = 30_000
 
 // 唯一可認領判準（見 tasks.json architecture_summary / changelog：使用者定案，
 // 不再拿 tracker.sh row 的 pending/rerun 狀態做二次篩選）。
-export const WANTED_STATUSES = ['仍有問題', '待處理']
+// 2026-09-15 使用者定案追加「處理中」：FAQ-5044 案例發現已指派、狀態為
+// 處理中的單完全不會出現在候選清單（跟指派給誰無關），使用者要求納入。
+export const WANTED_STATUSES = ['仍有問題', '待處理', '處理中']
 
 // Bug List「AI分析」值 → pipeline 執行模式（2026-09-08 起，見
 // pipeline-modes-project-docs/plan-pipeline-modes-v1.md §2.1 對照表）。只有
@@ -69,8 +71,8 @@ export function buildFilter(notionUserId: string): object {
 
 /**
  * 輸入 notion_user_id，透過 scripts/notion.sh query-datasource 帶
- * people:{contains:<id>} filter 查該人正向候選單（狀態=仍有問題/待處理 且
- * AI分析=待分析/需要重跑，見上方 WANTED_STATUSES／WANTED_AI_ANALYSIS 註解），
+ * people:{contains:<id>} filter 查該人正向候選單（狀態=仍有問題/待處理/處理中
+ * 且 AI分析=待分析/需要重跑，見上方 WANTED_STATUSES／WANTED_AI_ANALYSIS 註解），
  * 回傳單號集合（如 ["FAQ-4616"]）。全程只呼叫 scripts/notion.sh，禁止自己
  * fetch Notion API 或讀 NOTION_TOKEN。
  *

@@ -12,13 +12,15 @@ export const DATA_SOURCE_ID = '21d87d78-618a-8135-ad4f-000b273e1293'
 // 『技術處理人員』這個 people 欄位最貼近 Bug List 的『當前指派』（抽樣裡填的
 // 人 100% 是真技術），狀態則對齊 Bug List 的『仍有問題/待處理』精神，取
 // 『文件完成待處理』（下一步該輪到技術接手）與『需求仍有問題』兩個值。
+// 2026-09-16 使用者定案追加『技術處理中』——同樣是技術該接手/持續處理的
+// 階段，不該被排除在候選清單外。
 //
 // 注意：這個 database 的『狀態』屬性型別是 Notion 的 status 型（不是 Bug
 // List 那種 select 型），filter 語法要用 { status: { equals } } 而不是
 // candidate-tickets.ts 的 { select: { equals } }——已用 notion.sh
 // query-datasource 實測驗證過兩者回傳格式不同，混用會讓 Notion API 直接
 // 回錯誤，不是猜測。
-export const WANTED_STATUSES = ['文件完成待處理', '需求仍有問題']
+export const WANTED_STATUSES = ['文件完成待處理', '需求仍有問題', '技術處理中']
 
 // 可認領判準之二（使用者 2026-08-27 定案）：『AI分析』欄位（select 型，跟
 // Bug List 共用同一組選項）也要限定，只有『待分析』（人工已標記可分析）與

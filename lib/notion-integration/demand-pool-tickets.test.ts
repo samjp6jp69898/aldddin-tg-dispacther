@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import { buildFilter, buildInAnalysisFilter, queryDemandPoolTickets, queryDemandTicketsInAnalysis } from './demand-pool-tickets.ts'
 
-// 見 obsidian/commands/create-mr/references/tech-users.csv：KHH Evelyn Lin
+// 見 tech_users 名冊（已退役的 tech-users.csv 對應列）：KHH Evelyn Lin
 // 的真實 notion_user_id，用真的值而非隨便編一個——T23 調查（2026-08-17）
 // 實測過這個帳號在需求池狀態=文件完成待處理下有真實候選單（ALDREQ-741、
 // ALDREQ-733），用來驗證 filter 邏輯真的能查到東西，不是查詢語法本身有
@@ -9,7 +9,7 @@ import { buildFilter, buildInAnalysisFilter, queryDemandPoolTickets, queryDemand
 const REAL_TECH_NOTION_USER_ID = '9208f5e1-d4ab-4a54-9ce6-80d62b174e93'
 
 describe('buildFilter — 純邏輯，不打真實 API', () => {
-  test('組出 and(技術處理人員 contains, or(狀態 status.equals 文件完成待處理/需求仍有問題), or(AI分析 select.equals 待分析/需要重跑))', () => {
+  test('組出 and(技術處理人員 contains, or(狀態 status.equals 文件完成待處理/需求仍有問題/技術處理中), or(AI分析 select.equals 待分析/需要重跑))', () => {
     const filter = buildFilter('some-notion-user-id') as any
 
     expect(filter.and).toHaveLength(3)
@@ -20,6 +20,7 @@ describe('buildFilter — 純邏輯，不打真實 API', () => {
     expect(filter.and[1].or).toEqual([
       { property: '狀態', status: { equals: '文件完成待處理' } },
       { property: '狀態', status: { equals: '需求仍有問題' } },
+      { property: '狀態', status: { equals: '技術處理中' } },
     ])
     expect(filter.and[2].or).toEqual([
       { property: 'AI分析', select: { equals: '待分析' } },
