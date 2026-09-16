@@ -80,7 +80,7 @@ describe('POST /cluster/retry — 輸入驗證（不觸及真正的派工）', (
     expect(res.status).toBe(400)
   })
 
-  test('triggeredByEmail 帶了但 tech-users.csv 查無此人 → 400，不靜默丟掉發起人', async () => {
+  test('triggeredByEmail 帶了但 tech_users 名冊查無此人 → 400，不靜默丟掉發起人', async () => {
     const res = await post({ ticket: 'FAQ-1', triggeredByEmail: 'definitely-not-a-real-tech-user@example.invalid' })
     expect(res.status).toBe(400)
     const body = (await res.json()) as { ok: boolean; reason: string }

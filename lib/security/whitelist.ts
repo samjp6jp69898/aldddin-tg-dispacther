@@ -50,10 +50,10 @@ export function registerHandlers(bot: Bot): void {
 
   bot.on('message', async ctx => {
     const chatId = String(ctx.chat.id)
-    const techUser = resolveTechUserByChatId(chatId)
+    const techUser = await resolveTechUserByChatId(chatId)
     if (techUser === null) {
       // 對外行為不變（仍是靜默 return，不回覆、不做重放判斷）；只在本機留一筆
-      // chat_id/first_name/username 供 tg-chatid-sync 事後對映回 tech-users.csv
+      // chat_id/first_name/username 供 tg-chatid-sync 事後對映回 tech_users 名冊
       // ——getUpdates 跟本服務的 webhook 互斥打不通，這是目前唯一能持續發現
       // 「誰 DM 過本 bot」的管道，見 unknown-sender-log.ts 檔頭註解。
       //
@@ -122,7 +122,7 @@ export function registerHandlers(bot: Bot): void {
 
   bot.on('callback_query:data', async ctx => {
     const chatId = String(ctx.chat?.id ?? ctx.from.id)
-    const techUser = resolveTechUserByChatId(chatId)
+    const techUser = await resolveTechUserByChatId(chatId)
     if (techUser === null) {
       // 理論上白名單外的人永遠收不到 inline keyboard，這裡是防禦性重驗。
       // 仍要 answer 消掉 Telegram 端的 loading 圈，但不做任何查詢或分流。

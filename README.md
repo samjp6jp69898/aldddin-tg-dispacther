@@ -133,8 +133,7 @@ curl http://localhost:8787/health
 ## 在另一台機器部署
 
 這支服務**不是獨立可攜的服務**：它觸發的 `/create-mr` pipeline 依賴整個
-aladdin/obsidian 生態系（`obsidian/commands/create-mr/references/tech-users.csv`、
-`scripts/bug-lock.sh`／`notion.sh`／`pipeline-status.sh`／`setup-worktree.sh`、
+aladdin/obsidian 生態系（`scripts/bug-lock.sh`／`notion.sh`／`pipeline-status.sh`／`setup-worktree.sh`、
 `.claude/commands/create-mr` 這支指令本身、以及 `agrabah`／`abu`／`lago`／`rajah`
 等子專案的 git checkout），換機器等於要把整個 aladdin 開發環境搬過去，不是
 只複製 `telegram-dispatcher/` 這個資料夾就好。
@@ -393,10 +392,14 @@ head 端比對是否等於 `origin/main`。
 
 ## Telegram 端使用方式（技術人員視角）
 
-前提：使用者的 `tg_chat_id` 必須已登記在
-`obsidian/commands/create-mr/references/tech-users.csv`（新技術第一次 DM bot
-之後，用 `/tg-chatid-sync` skill 把 chat_id 回填 CSV）；白名單外的 chat_id
+前提：使用者的 `tg_chat_id` 必須已登記在監控 DB 的 `tech_users` 表（新技術第一次
+DM bot 之後，用 `/tg-chatid-sync` skill 把 chat_id 連接上去）；白名單外的 chat_id
 發什麼都會被**靜默忽略**（不回覆、不報錯，見 T3）。
+
+> 2026-09-16（Phase 6）：名冊來源 `aladdin_ai/commands/create-mr/references/tech-users.csv`
+> 已刪檔退役，`tech_users` 表是唯一來源。名冊增修走
+> `bun lib/registry/tech-users-sync.ts --upsert-user <email> <name> <notion_user_id> [pushed_repos]`
+> ／`--remove-user <email>`，查詢走 `--list-roster`。
 
 1. 對 bot（`@bug_analyst_bot`）發送斜線指令（T30，大小寫不敏感；2026-08-17
    改為指令必須帶 `/`，裸文字 `bug`/`req` 不再觸發，避免閒聊訊息剛好整句
@@ -660,7 +663,7 @@ route dns` 建立 DNS route，不會因為 tunnel 重啟而變），所以正常
      `CF-Connecting-IP`；未設定＝全部拒絕（fail-closed），被拒的來源 IP 會記在
      `logs/launchd-server.err.log`（`ops-ui: 來源 IP 不在 OPS_ALLOWED_CIDRS 內 …`），要加白名單就從那裡抄。
   2. Telegram 身分：頁面用 Telegram Login Widget，回呼由 bot token 驗簽後比對
-     `tech-users.csv` 的 `tg_chat_id`——只有 bot 白名單內的人登得進來，登入有效 24 小時，server 重啟即失效。
+     `tech_users` 的 `tg_chat_id`——只有 bot 白名單內的人登得進來，登入有效 24 小時，server 重啟即失效。
 - **一次性設定（人工）**：到 BotFather 對 dispatcher bot 執行 `/setdomain`，填 `mcp.aladdin-assistant.cc`，
   否則 widget 會顯示 *Bot domain invalid*。`OPS_PUBLIC_ORIGIN` 通常不用填（經 tunnel 時由 Host 推導）。
 - **啟動規則**：跟 TG bot 完全同一條決策核心（`lib/locking/claim.ts` 的 `claimBugTicket`／

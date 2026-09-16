@@ -10,7 +10,7 @@ import { createHash, createHmac, timingSafeEqual } from 'node:crypto'
 //   hash 必須等於 hex(HMAC_SHA256(secret_key, data_check_string))
 // 另外 auth_date 不能太舊（防重放：拿到一條舊的回呼網址不能無限期登入）。
 //
-// 只有驗簽過的 id 才拿去比對 tech-users.csv 的 tg_chat_id——私訊 chat 的
+// 只有驗簽過的 id 才拿去比對 tech_users 的 tg_chat_id——私訊 chat 的
 // chat_id 就是使用者的 Telegram user id，兩者同值，不需要另外對映表。
 // 本模組純函式、零 I/O、不印任何欄位（bot token 只在 HMAC 裡用到）。
 

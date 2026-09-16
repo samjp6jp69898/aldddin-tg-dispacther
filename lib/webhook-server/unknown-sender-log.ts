@@ -5,7 +5,7 @@ import { dirname, join } from 'node:path'
 // 而 tg-chatid-sync 原本靠 Telegram getUpdates 讀「誰 DM 過本 bot」，但
 // getUpdates 跟本服務的 webhook 互斥（Telegram 409 Conflict，二選一，不是
 // 設定問題），webhook 開著就永遠讀不到。這裡補上本機這份 log，讓「新同事
-// 第一次 DM」也能被 tg-chatid-sync 事後對映回 tech-users.csv，不必為了讀
+// 第一次 DM」也能被 tg-chatid-sync 事後對映回 tech_users 名冊，不必為了讀
 // getUpdates 去停用正式在跑的 webhook。
 export const DEFAULT_UNKNOWN_SENDERS_LOG = join('/Users/user/aladdin/telegram-dispatcher/logs', 'unknown-senders.jsonl')
 

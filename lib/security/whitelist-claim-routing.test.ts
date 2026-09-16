@@ -1,4 +1,8 @@
-import { describe, expect, mock, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
+import { installTechUserFixture, resetTechUserFixture } from './test-support/tech-user-fixture.ts'
+
+beforeEach(installTechUserFixture)
+afterEach(resetTechUserFixture)
 
 // review 發現的測試空白：whitelist.test.ts 完全沒測到 `claim:` 前綴的路由。
 // 不能直接用真的 handleClaim（claim.ts）——它有真實副作用（bug-lock.sh
@@ -25,7 +29,7 @@ mock.module('../locking/demand-claim.ts', () => ({ handleDemandClaim: handleDema
 
 const { registerHandlers } = await import('./whitelist.ts')
 
-const REAL_TECH_CHAT_ID = 5022865804 // 同 whitelist.test.ts，見 tech-users.csv
+const REAL_TECH_CHAT_ID = 5022865804 // 見 test-support/tech-user-fixture.ts
 
 function captureHandlers() {
   const handlers: Record<string, (ctx: any) => Promise<void>> = {}

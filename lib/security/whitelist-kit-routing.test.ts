@@ -1,6 +1,10 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
 import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { installTechUserFixture, resetTechUserFixture } from './test-support/tech-user-fixture.ts'
+
+beforeEach(installTechUserFixture)
+afterEach(resetTechUserFixture)
 
 // /kit 路由測試（見 whitelist.ts /^\/kit(\s|$)/i 分支）。跟
 // whitelist-claim-routing.test.ts 同一個理由：mock.module 必須在第一次
@@ -17,8 +21,10 @@ mock.module(SPAWN_KIT_SCRIPT_PATH, () => ({ runKitScript: runKitScriptMock }))
 
 const { registerHandlers } = await import('./whitelist.ts')
 
-const KIT_ADMIN_CHAT_ID = 5022865804 // Landon，見 tech-users.csv／.env TG_KIT_ADMIN_CHAT_ID 真實值
-const OTHER_TECH_CHAT_ID = 2095624031 // 另一位真實白名單內技術（Eden Li KHH，見 tech-users.csv），非 kit admin
+const KIT_ADMIN_CHAT_ID = 5022865804 // Landon，見 test-support/tech-user-fixture.ts／.env TG_KIT_ADMIN_CHAT_ID 真實值
+// 另一位真實白名單內技術（Blast，非 kit admin）。原本用 Eden Li KHH，
+// 2026-09-15 使用者告知她已離職、CSV 已無她的 tg_chat_id，改用仍在職的人。
+const OTHER_TECH_CHAT_ID = 515546393
 const KIT_DIST_DIR = '/Users/user/aladdin/aladdin_mcps/aladdin-ai-assistant-kit/dist'
 
 function captureHandlers() {

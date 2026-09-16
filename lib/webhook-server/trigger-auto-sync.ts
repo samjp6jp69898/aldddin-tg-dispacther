@@ -2,7 +2,7 @@ import { join } from 'node:path'
 import { spawnDetachedProcess } from '../pipeline-runner/spawn-create-mr.ts'
 
 // 收到「第一次見過」的白名單外私聊訊息時，fire-and-forget 觸發
-// aladdin_ai/scripts/tg-auto-sync.sh：HIGH confidence 自動寫回 tech-users.csv、
+// aladdin_ai/scripts/tg-auto-sync.sh：HIGH confidence 自動寫回 tech_users 名冊、
 // ASK confidence 通知維運者手動用 /tg-chatid-sync 決定（該腳本自己的邏輯與
 // 紀律見其檔頭註解）。複用 spawn-create-mr.ts 的 spawnDetachedProcess——同一
 // 套 detached+unref／stdout-stderr 落地 log／'error' event 防炸 server 的

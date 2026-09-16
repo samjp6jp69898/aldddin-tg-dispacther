@@ -22,7 +22,7 @@ const POST_RUN_LOG = join(LOG_DIR, 'post-run-notify.log')
 // 該 detached bash 行程會無上界地不結束、累積在背景——加 execFileSync 的
 // timeout 讓最壞情況有限，逾時視同呼叫失敗（既有 catch 分支已處理）。
 const EXEC_TIMEOUT_MS = 30_000
-// timeout 分類（exitCode 124）的強制升級對象：Landon（tech-users.csv 的
+// timeout 分類（exitCode 124）的強制升級對象：Landon（tech_users 名冊的
 // 「KHH Landon Lo」列）。跟下面 resolveAssigneeEmail 抓到的「當前指派」是
 // 兩件事、互不取代——指派 tech 可能換人或查無資料，2026-08-25 使用者定案
 // 「遇到 timeout 一定要發 TG 通知到 landon」，不能讓這條路徑跟著指派解析

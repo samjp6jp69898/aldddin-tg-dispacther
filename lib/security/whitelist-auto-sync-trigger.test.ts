@@ -1,7 +1,11 @@
-import { afterAll, describe, expect, mock, test } from 'bun:test'
+import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { installTechUserFixture, resetTechUserFixture } from './test-support/tech-user-fixture.ts'
+
+beforeEach(installTechUserFixture)
+afterEach(resetTechUserFixture)
 
 // 只 mock triggerTgAutoSync（trigger-auto-sync.ts 沒有自己的真實邏輯單元
 // 測試，mock 掉不會跟其他測試檔搶同一個 module registry）。logUnknownSender
@@ -26,7 +30,7 @@ const { logUnknownSender } = await import('../webhook-server/unknown-sender-log.
 
 const NOT_TECH_CHAT_ID = 111222333444
 const ALREADY_SEEN_CHAT_ID = 222333444555
-const REAL_TECH_CHAT_ID = 5022865804 // 同 whitelist.test.ts，見 tech-users.csv
+const REAL_TECH_CHAT_ID = 5022865804 // 見 test-support/tech-user-fixture.ts
 
 let updateIdCounter = 0
 function captureHandlers() {

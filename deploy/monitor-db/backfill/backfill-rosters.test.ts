@@ -1,29 +1,27 @@
 // backfill/backfill-rosters.test.ts — Phase 6 名冊回填單元測試。
 //
+// 2026-09-16：`tech-users.csv → tech_users` 的來源已從腳本整段移除（見
+// backfill-rosters.ts 檔頭），對應的格式防呆／mapping／49 列規模三組測試
+// 隨之刪除。
+//
 // 不需要 MySQL：mapping/加密路徑用假金鑰實跑 encryptField/blindIndex；DB 寫入
 // 抽象成 RosterExecutor 注入假物件（見 backfill-rosters.ts 的 makePoolExecutor
 // 對照組）。tokens 白名單一律用 fixture 覆寫（RunBackfillOptions.tokensFiles），
 // 絕不在測試中讀取 aladdin_mcps 底下的真實 tokens*.json。
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { randomBytes } from 'node:crypto'
-import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   deriveServerEnv,
-  mapTechUserRow,
   mapTokenRow,
   mapUnknownSenderRow,
   parseJsonlLine,
-  parseTechUsersCsv,
   readTokensFile,
   runBackfill,
-  TECH_USER_BIDX_SCOPE,
   MCP_TOKEN_BIDX_SCOPE,
   type McpTokenDbRow,
   type RosterExecutor,
-  type TechUserDbRow,
   type UnknownSenderDbRow,
 } from './backfill-rosters.ts'
 import { blindIndex } from '../../../lib/crypto/field-crypto.ts'
@@ -52,22 +50,15 @@ afterEach(() => {
 // ---------- fake executor ----------
 
 interface RecordedCall {
-  table: 'tech_users' | 'mcp_tokens' | 'tg_unknown_senders'
+  table: 'mcp_tokens' | 'tg_unknown_senders'
   key: string
-  row: TechUserDbRow | McpTokenDbRow | UnknownSenderDbRow
+  row: McpTokenDbRow | UnknownSenderDbRow
 }
 
 function makeFakeExecutor(): { executor: RosterExecutor; calls: RecordedCall[] } {
   const calls: RecordedCall[] = []
   const seen = new Set<string>()
   const executor: RosterExecutor = {
-    insertTechUser: async (row) => {
-      const key = `tech_users:${row.email}`
-      calls.push({ table: 'tech_users', key, row })
-      if (seen.has(key)) return false
-      seen.add(key)
-      return true
-    },
     insertMcpToken: async (row) => {
       const key = `mcp_tokens:${row.server}:${row.env}:${row.token_id}`
       calls.push({ table: 'mcp_tokens', key, row })
@@ -85,136 +76,6 @@ function makeFakeExecutor(): { executor: RosterExecutor; calls: RecordedCall[] }
   }
   return { executor, calls }
 }
-
-// ---------- tech-users.csv 格式防呆 ----------
-
-describe('parseTechUsersCsv 格式防呆（m6）', () => {
-  test('值含逗號 → 中止（欄位數非 5）', () => {
-    const content = readFileSync(join(FIXTURES, 'tech-users-bad-comma.csv'), 'utf8')
-    expect(() => parseTechUsersCsv(content)).toThrow()
-  })
-
-  test('值含雙引號 → 中止', () => {
-    const content = readFileSync(join(FIXTURES, 'tech-users-bad-quote.csv'), 'utf8')
-    expect(() => parseTechUsersCsv(content)).toThrow()
-  })
-
-  test('tg_chat_id 非空且非數字 → 中止', () => {
-    const content = readFileSync(join(FIXTURES, 'tech-users-bad-chatid.csv'), 'utf8')
-    expect(() => parseTechUsersCsv(content)).toThrow()
-  })
-
-  test('正常樣本檔可解析，列數與欄位正確', () => {
-    const content = readFileSync(join(FIXTURES, 'tech-users-sample.csv'), 'utf8')
-    const rows = parseTechUsersCsv(content)
-    expect(rows.length).toBe(3)
-    expect(rows[0]!.email).toBe('fake_one@example.test')
-    expect(rows[1]!.tg_chat_id).toBe('')
-    expect(rows[2]!.pushed_repos).toBe('')
-  })
-
-  test('tg_chat_id 可為負數（^-?\\d+$ 允許負號）', () => {
-    const content =
-      'notion_user_name,notion_user_id,email,pushed_repos,tg_chat_id\n' +
-      'Neg User,fake-id,neg@example.test,abu,-12345\n'
-    const rows = parseTechUsersCsv(content)
-    expect(rows[0]!.tg_chat_id).toBe('-12345')
-  })
-})
-
-describe('mapTechUserRow', () => {
-  test('tg_chat_id 空 → enc/bidx/key_ver 皆 NULL', () => {
-    const row = mapTechUserRow({
-      notion_user_name: 'X',
-      notion_user_id: 'id',
-      email: 'x@example.test',
-      pushed_repos: 'abu',
-      tg_chat_id: '',
-    })
-    expect(row.tg_chat_id_enc).toBeNull()
-    expect(row.tg_chat_id_bidx).toBeNull()
-    expect(row.bidx_key_ver).toBeNull()
-  })
-
-  test('tg_chat_id 非空 → enc 帶 enc:v1: 前綴，bidx 32 bytes，key_ver=1', () => {
-    const row = mapTechUserRow({
-      notion_user_name: 'X',
-      notion_user_id: 'id',
-      email: 'x@example.test',
-      pushed_repos: 'abu',
-      tg_chat_id: '123456789',
-    })
-    expect(row.tg_chat_id_enc).toMatch(/^enc:v1:/)
-    expect(row.tg_chat_id_bidx).not.toBeNull()
-    expect(row.tg_chat_id_bidx!.length).toBe(32)
-    expect(row.bidx_key_ver).toBe(1)
-  })
-
-  test('bidx 與直接呼叫 blindIndex(scope,...) 一致（scope 定案字串正確）', () => {
-    const row = mapTechUserRow({
-      notion_user_name: 'X',
-      notion_user_id: 'id',
-      email: 'x@example.test',
-      pushed_repos: 'abu',
-      tg_chat_id: '999',
-    })
-    const expected = blindIndex(TECH_USER_BIDX_SCOPE, '999')
-    expect(row.tg_chat_id_bidx!.equals(expected!)).toBe(true)
-  })
-})
-
-// ---------- 49 列規模（MAJOR-D7：全部成功，32 列空值） ----------
-
-describe('49 列規模 CSV（程式生成，32 列空 tg_chat_id）', () => {
-  function generateCsv(): string {
-    const header = 'notion_user_name,notion_user_id,email,pushed_repos,tg_chat_id'
-    const lines = [header]
-    for (let i = 1; i <= 49; i++) {
-      const chatId = i <= 32 ? '' : String(600000000 + i)
-      lines.push(`Fake User ${i},fake-id-${i},fake_user_${i}@example.test,abu;rajah,${chatId}`)
-    }
-    return lines.join('\n') + '\n'
-  }
-
-  test('全部 49 列成功解析與 mapping，32 列 enc/bidx 為 NULL、17 列非 NULL', () => {
-    const rows = parseTechUsersCsv(generateCsv())
-    expect(rows.length).toBe(49)
-    const mapped = rows.map(mapTechUserRow)
-    const nullCount = mapped.filter((r) => r.tg_chat_id_enc === null).length
-    const nonNullCount = mapped.filter((r) => r.tg_chat_id_enc !== null).length
-    expect(nullCount).toBe(32)
-    expect(nonNullCount).toBe(17)
-    for (const r of mapped) {
-      if (r.tg_chat_id_enc !== null) {
-        expect(r.tg_chat_id_enc).toMatch(/^enc:v1:/)
-        expect(r.tg_chat_id_bidx!.length).toBe(32)
-      }
-    }
-  })
-
-  test('經 runBackfill 以假 executor 寫入：49 列全數 inserted（首次跑無重複）', async () => {
-    const csvPath = join(tmpdir(), `backfill-rosters-test-49-${process.pid}-${Date.now()}.csv`)
-    writeFileSync(csvPath, generateCsv())
-    try {
-      const { executor, calls } = makeFakeExecutor()
-      const reports = await runBackfill({
-        csvPath,
-        jsonlPath: join(FIXTURES, 'unknown-senders-fake.jsonl'),
-        tokensFiles: [join(FIXTURES, 'tokens-fake.json')],
-        dryRun: false,
-        executor,
-      })
-      const techReport = reports.find((r) => r.source.includes('tech_users'))!
-      expect(techReport.sourceRows).toBe(49)
-      expect(techReport.attempted).toBe(49)
-      expect(techReport.inserted).toBe(49)
-      expect(techReport.ignored).toBe(0)
-      expect(calls.filter((c) => c.table === 'tech_users').length).toBe(49)
-    } finally {
-      rmSync(csvPath, { force: true })
-    }
-  })
-})
 
 // ---------- mcp_tokens ----------
 
@@ -293,7 +154,6 @@ describe('unknown-senders.jsonl → tg_unknown_senders', () => {
   test('全 fixture 檔跑 runBackfill：5 行中 2 成功、3 skip', async () => {
     const { executor } = makeFakeExecutor()
     const reports = await runBackfill({
-      csvPath: join(FIXTURES, 'tech-users-sample.csv'),
       jsonlPath: join(FIXTURES, 'unknown-senders-fake.jsonl'),
       tokensFiles: [join(FIXTURES, 'tokens-fake.json')],
       dryRun: false,
@@ -313,10 +173,6 @@ describe('runBackfill dry-run', () => {
   test('dry-run：inserted/ignored 恆 0，attempted＝將寫入數，不呼叫 executor', async () => {
     let executorCalled = false
     const executor: RosterExecutor = {
-      insertTechUser: async () => {
-        executorCalled = true
-        return true
-      },
       insertMcpToken: async () => {
         executorCalled = true
         return true
@@ -327,7 +183,6 @@ describe('runBackfill dry-run', () => {
       },
     }
     const reports = await runBackfill({
-      csvPath: join(FIXTURES, 'tech-users-sample.csv'),
       jsonlPath: join(FIXTURES, 'unknown-senders-fake.jsonl'),
       tokensFiles: [join(FIXTURES, 'tokens-fake.json')],
       dryRun: true,
@@ -339,8 +194,6 @@ describe('runBackfill dry-run', () => {
       expect(r.ignored).toBe(0)
       expect(r.dryRun).toBe(true)
     }
-    const techReport = reports.find((r) => r.source.includes('tech_users'))!
-    expect(techReport.attempted).toBe(3)
     const tokensReport = reports.find((r) => r.source.includes('mcp_tokens'))!
     expect(tokensReport.attempted).toBe(2)
     const jsonlReport = reports.find((r) => r.source.includes('tg_unknown_senders'))!
@@ -353,7 +206,6 @@ describe('runBackfill dry-run', () => {
 describe('冪等性：重跑對 executor 的唯一鍵參數穩定', () => {
   test('同一輸入跑 runBackfill 兩次，bidx 值逐列相同（第二次全數 ignored）', async () => {
     const opts = {
-      csvPath: join(FIXTURES, 'tech-users-sample.csv'),
       jsonlPath: join(FIXTURES, 'unknown-senders-fake.jsonl'),
       tokensFiles: [join(FIXTURES, 'tokens-fake.json')],
       dryRun: false,
@@ -364,13 +216,6 @@ describe('冪等性：重跑對 executor 的唯一鍵參數穩定', () => {
     // 用同一組 seen（跨兩次呼叫）模擬「DB 裡已經有第一次寫入的列」。
     const seen = new Set(run1.calls.map((c) => c.key))
     const executor2: RosterExecutor = {
-      insertTechUser: async (row) => {
-        const key = `tech_users:${row.email}`
-        run2.calls.push({ table: 'tech_users', key, row })
-        if (seen.has(key)) return false
-        seen.add(key)
-        return true
-      },
       insertMcpToken: async (row) => {
         const key = `mcp_tokens:${row.server}:${row.env}:${row.token_id}`
         run2.calls.push({ table: 'mcp_tokens', key, row })
@@ -416,8 +261,7 @@ describe('安全邊界：token/chat_id 明文不得出現在 console 輸出', ()
     try {
       const { executor } = makeFakeExecutor()
       const reports = await runBackfill({
-        csvPath: join(FIXTURES, 'tech-users-sample.csv'),
-        jsonlPath: join(FIXTURES, 'unknown-senders-fake.jsonl'),
+          jsonlPath: join(FIXTURES, 'unknown-senders-fake.jsonl'),
         tokensFiles: [join(FIXTURES, 'tokens-fake.json')],
         dryRun: false,
         executor,

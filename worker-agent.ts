@@ -411,7 +411,7 @@ app.post('/maintenance', guard, async c => {
 })
 
 // body 欄位驗證（值會流進 tg-notify.sh 參數與落盤的 queue.json）：head 端
-// 這些值來自 tech-users.csv，worker 端對等地上一道廉價格式閘——不含控制
+// 這些值來自 tech_users 名冊，worker 端對等地上一道廉價格式閘——不含控制
 // 字元、長度有界；email 另驗基本樣式。
 const SAFE_TEXT_RE = /^[^\x00-\x1f\x7f]{1,128}$/
 const EMAIL_RE = /^[^\s@\x00-\x1f\x7f]{1,64}@[^\s@\x00-\x1f\x7f]{1,190}$/

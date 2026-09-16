@@ -30,7 +30,7 @@ function build(overrides: Partial<OpsDeps> = {}) {
     botUsername: 'aladdin_dispatch_bot',
     allowedCidrs: parseCidrList(`${OFFICE_IP}/32`),
     sessions: createSessionStore({ ttlMs: 3600_000, now: () => NOW }),
-    resolveTechUserByChatId: chatId => (chatId === '987654321' ? USER : null),
+    resolveTechUserByChatId: async chatId => (chatId === '987654321' ? USER : null),
     claimBug: async (u, t) => {
       calls.push(`bug:${u.email}:${t}`)
       return { code: 'started', text: `已開始處理 ${t}` }
@@ -127,7 +127,7 @@ describe('登入頁與 Telegram 回呼', () => {
     expect((await req(`/ops/auth/telegram?${signedQuery('987654321', -3600)}`)).status).toBe(401)
     expect((await req('/ops/auth/telegram?id=1')).status).toBe(400)
   })
-  test('驗簽通過但 chat_id 不在 tech-users.csv → 403，不設 cookie', async () => {
+  test('驗簽通過但 chat_id 不在 tech_users 名冊 → 403，不設 cookie', async () => {
     const { req } = build()
     const res = await req(`/ops/auth/telegram?${signedQuery('555')}`)
     expect(res.status).toBe(403)

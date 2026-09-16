@@ -7,7 +7,7 @@ import { isMonitorDbEnabled } from '../monitor-db/env.ts'
 const CLOUDFLARED_METRICS_URL = 'http://127.0.0.1:20241/ready'
 const TG_NOTIFY_SH = '/Users/user/aladdin/scripts/tg-notify.sh'
 // 見 cron/bug-report-run.sh 同一套維運告警慣例：維運對象（Landon）的
-// chat_id 直接寫死，不透過 tech-users.csv 查——這是給「人」的維運告警，不是
+// chat_id 直接寫死，不透過 tech_users 名冊查——這是給「人」的維運告警，不是
 // 給某張 ticket 的技術指派，跟 T13 補發通知的判準（Notion 當前指派）不同。
 const OPERATOR_CHAT_ID = '5022865804'
 const FETCH_TIMEOUT_MS = 5000

@@ -28,10 +28,11 @@ import { applyRemoteTrackerRow, parseTrackerRow, readTrackerFile } from '../pipe
 import { resolveTechUserByEmail } from '../user-resolution/tech-user.ts'
 import type { TechUser } from '../user-resolution/tech-user.ts'
 
-// retry（task 2）只支援 bug 單——tg-monitor `/api/pipelines/retry` 本來就只
-// 接受 `FAQ-\d+`（見該端點註解「需求單 ALDREQ 目前不提供這個按鈕」），這裡
-// 收斂同一個限制，不接受 ALDREQ- 混進來。
-const RETRY_TICKET_RE = /^FAQ-\d+$/
+// retry 同時支援 bug／demand 單（tg-monitor `/api/pipelines/retry` 對稱擴充
+// 後兩種前綴都會打進來，見該端點註解）。demand 沒有 --resume 語意（沒有跨輪
+// 續跑的中間狀態），只是把整個 run-demand-pipeline.ts 重新跑一次。
+const RETRY_TICKET_RE = /^(FAQ|ALDREQ)-\d+$/
+const RETRY_BUG_TICKET_RE = /^FAQ-\d+$/
 
 // head 端多機派工的 production 接線（唯一入口）。dispatch.ts / remote-sweeper.ts
 // 是純邏輯，這裡負責把真實依賴（worker-client、spawn 模組、registry 檔案
@@ -298,9 +299,9 @@ export function registerClusterRoutes(app: Hono): void {
   // 自己，比照 tg-monitor 既有的 worker 名冊管理三個動作（disable/enable/
   // remove）同一種模式——同一個 process、同一份記憶體狀態，不會有雙份登記表。
   //
-  // 只接受 FAQ-（bug）：tg-monitor 的重試按鈕本來就只給 bug 單用（需求單
-  // ALDREQ 沒有這個按鈕，見 tg-monitor server.ts /api/pipelines/retry 註解），
-  // demand 沒有 resume 機制，這裡不開放。
+  // FAQ（bug）走 --resume 續跑；ALDREQ（demand）沒有 resume 機制，是整支
+  // run-demand-pipeline.ts 重新跑一次（見 tg-monitor server.ts
+  // /api/pipelines/retry 對兩種 ticket 的分派註解）。
   app.post('/cluster/retry', guard, async c => {
     const body = (await c.req.json().catch(() => null)) as { ticket?: string; triggeredByEmail?: string } | null
     if (!body || typeof body.ticket !== 'string' || !RETRY_TICKET_RE.test(body.ticket)) {
@@ -308,12 +309,25 @@ export function registerClusterRoutes(app: Hono): void {
     }
     let techUser: TechUser | null = null
     if (typeof body.triggeredByEmail === 'string' && body.triggeredByEmail !== '') {
-      techUser = resolveTechUserByEmail(body.triggeredByEmail)
+      techUser = await resolveTechUserByEmail(body.triggeredByEmail)
       // 帶了 email 卻查不到：明確拒絕，不要靜默丟掉發起人（比照
       // spawn-create-mr.ts CLI `--triggered-by-email` 既有的同款紀律）。
-      if (!techUser) return c.json({ ok: false, reason: `triggeredByEmail 在 tech-users.csv 查無此 email：${body.triggeredByEmail}` }, 400)
+      if (!techUser) return c.json({ ok: false, reason: `triggeredByEmail 在 tech_users 名冊查無此 email：${body.triggeredByEmail}` }, 400)
     }
-    const result = await dispatchBug(body.ticket, techUser, { resume: true })
+
+    if (RETRY_BUG_TICKET_RE.test(body.ticket)) {
+      const result = await dispatchBug(body.ticket, techUser, { resume: true })
+      return c.json(result, result.ok ? 200 : 500)
+    }
+
+    // demand 分支：submitDemandPipeline 需要 assigneeEmail 這個必要參數（見
+    // spawn-demand-pipeline.ts 檔頭），沒有 techUser 就沒有 email 可用，不像
+    // bug 分支可以 techUser=null 照跑——直接拒絕，不產出一筆沒有認領人的 run
+    // （比照 spawn-demand-pipeline.ts CLI 入口同一條紀律）。
+    if (!techUser) {
+      return c.json({ ok: false, reason: '缺少 triggeredByEmail（demand pipeline 重跑必須知道認領人）' }, 400)
+    }
+    const result = await dispatchDemand(body.ticket, techUser.email, techUser)
     return c.json(result, result.ok ? 200 : 500)
   })
 

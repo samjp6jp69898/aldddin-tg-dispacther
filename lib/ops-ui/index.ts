@@ -56,7 +56,7 @@ async function buildPending(user: TechUser): Promise<PendingPayload> {
   return { bug: mark(bug), demand: mark(demand), fetchedAt: new Date().toISOString() }
 }
 
-/** 大小寫不敏感比對（tech-users.csv 的 email 大小寫不保證與 monitor DB
+/** 大小寫不敏感比對（名冊 email 的大小寫不保證與 monitor DB
  * triggered_by_email／routes.ts 登入者 email 一致）。 */
 function sameEmail(a: string | null, b: string): boolean {
   return a !== null && a.trim().toLowerCase() === b.trim().toLowerCase()

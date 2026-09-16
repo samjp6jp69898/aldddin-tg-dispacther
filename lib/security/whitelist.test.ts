@@ -1,11 +1,14 @@
-import { describe, expect, mock, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
 import { registerHandlers } from './whitelist.ts'
+import {
+  installTechUserFixture,
+  NOT_TECH_CHAT_ID,
+  REAL_TECH_CHAT_ID,
+  resetTechUserFixture,
+} from './test-support/tech-user-fixture.ts'
 
-// 見 obsidian/commands/create-mr/references/tech-users.csv：Landon 的真實
-// tg_chat_id，白名單內；用真的值而非隨便編一個，才能真的測到
-// resolveTechUserByChatId 命中的那條分支。
-const REAL_TECH_CHAT_ID = 5022865804
-const NOT_TECH_CHAT_ID = 111222333444
+beforeEach(installTechUserFixture)
+afterEach(resetTechUserFixture)
 
 // T29：Telegram callback_query 的 callback_query_id 沒辦法偽造（真實 API 會
 // 拒絕），也無法在本機測試 webhook 尚未登記到 Telegram（T22 閘門）的情況下

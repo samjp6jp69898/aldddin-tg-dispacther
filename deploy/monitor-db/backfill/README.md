@@ -1,3 +1,9 @@
+> **2026-09-16 更新**：`tech-users.csv → tech_users` 這條來源已從 `backfill-rosters.ts`
+> 整段移除。該段在 2026-09-03 的正式回填就已跑完（tasklist #8），名冊自此以 DB 為
+> 權威；CSV 本身於 2026-09-16 刪檔退役，名冊增修改走
+> `lib/registry/tech-users-sync.ts --upsert-user／--remove-user`。本文件下方凡提到
+> 名冊「三表／三來源」之處，現況皆為兩表兩來源。
+
 # Phase 6 歷史回填（plan-db-as-truth v3 §11.2 ＋ v3.2 修訂）
 
 一次性、離線、單執行緒、**可重跑（冪等）**的歷史資料回填。「先開發＋測試，後執行」：
@@ -9,7 +15,7 @@
 | 腳本 | 來源 | 目標 | 冪等機制 |
 |---|---|---|---|
 | `backfill-sqlite.ts` | `tg-monitor/data/monitor.sqlite`（WAL-aware 快照） | `runs` / `agent_runs` / `mcp_usage` / `service_status_log` | 確定性 UUIDv5 PK + INSERT IGNORE；`service_status_log` 用 NOT EXISTS 守衛（無唯一鍵） |
-| `backfill-rosters.ts` | `tech-users.csv`、9 份 `tokens*.json` 白名單、`unknown-senders.jsonl` | `tech_users` / `mcp_tokens` / `tg_unknown_senders` | PK / UNIQUE + INSERT IGNORE（bidx 是確定性 HMAC） |
+| `backfill-rosters.ts` | 9 份 `tokens*.json` 白名單、`unknown-senders.jsonl` | `mcp_tokens` / `tg_unknown_senders` | PK / UNIQUE + INSERT IGNORE（bidx 是確定性 HMAC） |
 | `backfill-logs-vl.ts` | `telegram-dispatcher/logs/*.log`、`aladdin_mcps/*/logs/audit*.jsonl` | VictoriaLogs（127.0.0.1:9428） | workdir manifest（best-effort；manifest 遺失重跑會重複，VL 是副本、重複可接受、缺口不可接受） |
 
 統一入口：`bash run-backfill.sh [--dry-run] [--schema <name>] [--only sqlite|rosters|logs]`。
@@ -25,7 +31,6 @@
   （回填的是 timeout 改 180 分之前的歷史單），不得改 10800。
 - **`issued_at` byte-exact 原字串**（CHAR(24)，MAJOR-D5），不經任何 Date 轉換。
 - **加密 ctx / 盲索引 scope 字串定案**（Phase 5 投影必須沿用同一組，否則解密/等值查詢對不上）：
-  - `tech_users.tg_chat_id:<email>`（AAD）／`tech_users.tg_chat_id`（bidx scope）
   - `mcp_tokens.token_enc:<token_id>`（AAD）／`mcp_tokens.token`（bidx scope）
   - `tg_unknown_senders.chat_id_enc:<hex(bidx)>`、`tg_unknown_senders.sender_profile_enc:<hex(bidx)>`（AAD）
     ／`tg_unknown_senders.chat_id`（bidx scope）

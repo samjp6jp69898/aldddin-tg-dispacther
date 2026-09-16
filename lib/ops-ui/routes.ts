@@ -22,7 +22,7 @@ import type { HistoryQuery, RunRow } from './runs-read.ts'
 //   2. 額度：獨立 token bucket，不跟 webhook 共用（UI 輪詢不該吃掉 Telegram
 //      的額度，反之亦然）
 //   3. 身分：/ops/api/* 需要有效 session cookie；session 只由
-//      /ops/auth/telegram（Telegram Login Widget 驗簽 + tech-users.csv
+//      /ops/auth/telegram（Telegram Login Widget 驗簽 + tech_users 名冊
 //      tg_chat_id 對映）建立
 //   4. 寫入（POST /ops/api/start）另要求自訂 header X-Ops-Ui（瀏覽器跨站表單
 //      送不出自訂 header，配合 SameSite=Lax cookie 擋 CSRF）＋ 單號格式檢查
@@ -73,7 +73,7 @@ export type OpsDeps = {
   botUsername: string
   allowedCidrs: Cidr[]
   sessions: SessionStore
-  resolveTechUserByChatId: (chatId: string) => TechUser | null
+  resolveTechUserByChatId: (chatId: string) => Promise<TechUser | null>
   claimBug: (user: TechUser, ticket: string) => Promise<ClaimOutcome>
   claimDemand: (user: TechUser, ticket: string) => Promise<ClaimOutcome>
   listPending: (user: TechUser) => Promise<PendingPayload>
@@ -155,7 +155,7 @@ export function registerOpsRoutes(app: Hono, deps: OpsDeps): void {
   })
 
   // Telegram Login Widget 回呼（redirect 模式，參數在 query string）。
-  app.get(`${OPS_PREFIX}/auth/telegram`, c => {
+  app.get(`${OPS_PREFIX}/auth/telegram`, async c => {
     const verified = verifyTelegramLogin(c.req.query(), deps.botToken, { now: now() })
     if (!verified.ok) {
       log(`telegram 登入驗簽失敗 reason=${verified.reason}`)
@@ -165,11 +165,11 @@ export function registerOpsRoutes(app: Hono, deps: OpsDeps): void {
           : 'Telegram 登入資料驗證失敗（簽章不符或欄位缺漏），請回登入頁重試。'
       return plainPage(c, verified.reason === 'missing_fields' ? 400 : 401, msg)
     }
-    const user = deps.resolveTechUserByChatId(verified.id)
+    const user = await deps.resolveTechUserByChatId(verified.id)
     if (!user) {
-      // 不印 Telegram id 以外的個資；id 本身是對映 tech-users.csv 需要的鍵，
+      // 不印 Telegram id 以外的個資；id 本身是對映 tech_users 名冊需要的鍵，
       // 讓維運者能用 tg-chatid-sync 補上。
-      log(`telegram 登入成功但 chat_id=${verified.id} 不在 tech-users.csv 白名單`)
+      log(`telegram 登入成功但 chat_id=${verified.id} 不在 tech_users 白名單`)
       return plainPage(c, 403, `這個 Telegram 帳號（id ${verified.id}）尚未綁定技術人員名冊。請先私訊 bot 任一訊息，並請維運人員用 tg-chatid-sync 完成對映後再登入。`)
     }
     const session = deps.sessions.create(verified.id, user, verified.displayName)

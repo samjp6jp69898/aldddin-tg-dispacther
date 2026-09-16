@@ -89,6 +89,11 @@ ALTER USER 'mon_exec'@'%' IDENTIFIED BY '${MON_EXEC_PW}';
 
 -- mon_head：server.ts、head 上的名冊 CLI、回填腳本。SELECT/INSERT/UPDATE，不含 DELETE/DDL。
 GRANT SELECT, INSERT, UPDATE ON pipeline_monitor.* TO 'mon_head'@'%';
+-- 2026-09-16（Phase 6，使用者核准）：唯一的 DELETE 例外——tech-users.csv 刪檔退役後，
+-- 「把離職者從名冊移除」沒有其他對等管道（以前是刪 CSV 一行）。不開的話離職者會
+-- 永遠留在白名單裡。範圍刻意收到最小：只有這一張表、只有這一個帳號，其餘表仍無
+-- DELETE（見 lib/registry/tech-users-sync.ts 的 --remove-user）。
+GRANT DELETE ON pipeline_monitor.tech_users TO 'mon_head'@'%';
 
 -- mon_ui：tg-monitor 讀取面 ＋ cancel 旗標欄位級寫入（裁定 3，v3.2）。
 GRANT SELECT ON pipeline_monitor.runs TO 'mon_ui'@'%';

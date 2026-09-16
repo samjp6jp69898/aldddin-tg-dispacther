@@ -769,7 +769,7 @@ if (import.meta.main) {
   }
   // `--triggered-by-email <email>`（2026-09-01）：非 Telegram 觸發的重跑（人工
   // CLI、tg-monitor 重試）預設不會寫 triggered-by sidecar，tg-monitor「發起人」
-  // 欄會空白。呼叫端可帶原認領人的 email，這裡查 tech-users.csv 換成 TechUser
+  // 欄會空白。呼叫端可帶原認領人的 email，這裡查 tech_users 名冊換成 TechUser
   // 後走與 Telegram 認領完全相同的 submit 路徑（sidecar 由 spawnCreateMrNow 寫）。
   // 查不到就直接拒絕 spawn（exit 1）而不是靜默丟掉發起人——寧可讓呼叫端拿掉
   // 這個旗標重來，也不要打錯字後產出一筆看起來正常、實際發起人為空的 run。
@@ -777,9 +777,9 @@ if (import.meta.main) {
   const emailFlagIdx = process.argv.indexOf('--triggered-by-email')
   if (emailFlagIdx !== -1) {
     const email = process.argv[emailFlagIdx + 1] ?? ''
-    const user = /^[^\s@]+@[^\s@]+$/.test(email) ? resolveTechUserByEmail(email) : null
+    const user = /^[^\s@]+@[^\s@]+$/.test(email) ? await resolveTechUserByEmail(email) : null
     if (!user) {
-      console.log(JSON.stringify({ ok: false, reason: `--triggered-by-email 在 tech-users.csv 查無此 email：${email || '(空)'}` }))
+      console.log(JSON.stringify({ ok: false, reason: `--triggered-by-email 在 tech_users 名冊查無此 email：${email || '(空)'}` }))
       process.exit(1)
     }
     triggeredBy = user

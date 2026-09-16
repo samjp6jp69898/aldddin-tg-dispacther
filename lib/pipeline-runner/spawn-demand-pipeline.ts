@@ -6,7 +6,7 @@ import { DEMAND_CONCURRENCY_LIMIT, createConcurrencyLimiter } from './concurrenc
 import { createPipelineQueue, type QueueEntry, type QueueTriggeredBy, type RecoverFromDiskResult, type SubmitResult } from './pipeline-queue.ts'
 import { markPipelineActive, clearPipelineActive } from './active-pipeline-marker.ts'
 import { getDemandTicketNotionUrl } from '../notion-integration/demand-pool-tickets.ts'
-import type { TechUser } from '../user-resolution/tech-user.ts'
+import { resolveTechUserByEmail, type TechUser } from '../user-resolution/tech-user.ts'
 import { mintRunId, readInheritedRunId } from './demand-monitor-writes.ts'
 import { writeRunProgress, writeRunOutcomeAuthoritative } from '../monitor-db/writes.ts'
 import type { RunKind } from '../monitor-db/types.ts'
@@ -442,4 +442,47 @@ export function submitDemandPipeline(
  * recoverFromDisk 註解）。 */
 export function recoverDemandQueue(): RecoverFromDiskResult {
   return demandQueue.recoverFromDisk()
+}
+
+/**
+ * CLI 進入點（`bun spawn-demand-pipeline.ts <ticket> --triggered-by-email <email>`）：
+ * 比照 spawn-create-mr.ts 的同名 CLI 入口（見該檔案檔頭「行程邊界呼叫」的完整
+ * 理由——tg-monitor 是獨立 repo，用 CLI 而非跨 repo import，避免耦合到本模組
+ * 的內部型別與 concurrencyLimiter 這種行程級 singleton），給 tg-monitor 的
+ * `/api/pipelines/retry` ALDREQ 分支用。
+ *
+ * `--triggered-by-email` 這裡是必填（跟 spawn-create-mr.ts CLI 選填不同）：
+ * demand pipeline 的 submitDemandPipeline() 需要 assigneeEmail 這個必要參數
+ * （見上面函式簽名），沒有認領人 email 這張需求單無法背景執行——正常認領流程
+ * 裡 assigneeEmail 恆等於 triggeredBy.email（demand-claim.ts:145
+ * `dispatchDemand(ticket, techUser.email, techUser, ...)`），重跑沿用同一個
+ * email 當兩者，語意一致。查不到就直接拒絕 spawn（exit 1），不靜默留空
+ * assigneeEmail——寧可讓呼叫端（tg-monitor）拿掉這次重試，也不要產出一筆
+ * 沒有認領人的 run。
+ */
+if (import.meta.main) {
+  const ticket = process.argv[2] ?? ''
+  let triggeredBy: TechUser | undefined
+  const emailFlagIdx = process.argv.indexOf('--triggered-by-email')
+  if (emailFlagIdx !== -1) {
+    const email = process.argv[emailFlagIdx + 1] ?? ''
+    const user = /^[^\s@]+@[^\s@]+$/.test(email) ? await resolveTechUserByEmail(email) : null
+    if (!user) {
+      console.log(JSON.stringify({ ok: false, reason: `--triggered-by-email 在 tech_users 名冊查無此 email：${email || '(空)'}` }))
+      process.exit(1)
+    }
+    triggeredBy = user
+  }
+  if (!triggeredBy) {
+    console.log(JSON.stringify({ ok: false, reason: '缺少 --triggered-by-email（demand pipeline 重跑必須知道認領人）' }))
+    process.exit(1)
+  }
+  let result: { ok: boolean; reason?: string } & Record<string, unknown>
+  try {
+    result = submitDemandPipeline(ticket, triggeredBy.email, triggeredBy)
+  } catch (err) {
+    result = { ok: false, reason: String(err) }
+  }
+  console.log(JSON.stringify(result))
+  process.exit(result.ok ? 0 : 1)
 }

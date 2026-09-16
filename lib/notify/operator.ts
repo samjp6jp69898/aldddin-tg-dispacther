@@ -3,7 +3,7 @@ import { execFileSync } from 'node:child_process'
 const TG_NOTIFY_SH = '/Users/user/aladdin/scripts/tg-notify.sh'
 const EXEC_TIMEOUT_MS = 10_000
 
-// 維運對象（Landon）的 Telegram chat_id，直接寫死、不透過 tech-users.csv
+// 維運對象（Landon）的 Telegram chat_id，直接寫死、不透過 tech_users 名冊
 // 查——這是給「人」的維運告警，不是給某張 ticket 的技術指派（後者走
 // email/notion_user_id 查表，見 candidate-tickets.ts／post-run-notify.ts
 // 既有的 resolveAssigneeEmail）。原本只在 health-monitor.ts 內部定義，2026-

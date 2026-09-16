@@ -1,4 +1,8 @@
-import { afterEach, describe, expect, mock, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
+import { installTechUserFixture, resetTechUserFixture } from './test-support/tech-user-fixture.ts'
+
+beforeEach(installTechUserFixture)
+afterEach(resetTechUserFixture)
 
 // /bugreport 路由測試（見 whitelist.ts bugReportAdmin 分支）。跟
 // whitelist-kit-routing.test.ts 同一個理由：mock.module 必須在第一次 import
@@ -13,8 +17,10 @@ mock.module(RUN_SCRIPT_PATH, () => ({ runBugAssigneeReportScript: runScriptMock 
 
 const { registerHandlers } = await import('./whitelist.ts')
 
-const BUG_REPORT_ADMIN_CHAT_ID = 5022865804 // Landon，見 tech-users.csv／.env TG_BUG_REPORT_ADMIN_CHAT_ID 真實值
-const OTHER_TECH_CHAT_ID = 2095624031 // 另一位真實白名單內技術（Eden Li KHH，見 tech-users.csv），非 bug report admin
+const BUG_REPORT_ADMIN_CHAT_ID = 5022865804 // Landon，見 test-support/tech-user-fixture.ts／.env TG_BUG_REPORT_ADMIN_CHAT_ID 真實值
+// 另一位真實白名單內技術（Blast，非 bug report admin）。原本用 Eden Li KHH，
+// 2026-09-15 使用者告知她已離職、CSV 已無她的 tg_chat_id，改用仍在職的人。
+const OTHER_TECH_CHAT_ID = 515546393
 
 function captureHandlers() {
   const handlers: Record<string, (ctx: any) => Promise<void>> = {}

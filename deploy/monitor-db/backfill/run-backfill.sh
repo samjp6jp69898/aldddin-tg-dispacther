@@ -72,7 +72,7 @@ run_one() {
 }
 
 [ -z "$ONLY" ] || [ "$ONLY" = "sqlite" ]  && run_one "monitor.sqlite → runs/agent_runs/mcp_usage/service_status_log" backfill-sqlite.ts
-[ -z "$ONLY" ] || [ "$ONLY" = "rosters" ] && run_one "tech-users.csv / tokens*.json / unknown-senders.jsonl → 名冊三表" backfill-rosters.ts
+[ -z "$ONLY" ] || [ "$ONLY" = "rosters" ] && run_one "tokens*.json / unknown-senders.jsonl → 名冊兩表" backfill-rosters.ts
 [ -z "$ONLY" ] || [ "$ONLY" = "logs" ]    && run_one "舊 log → VictoriaLogs（best-effort）" backfill-logs-vl.ts
 
 echo "=== 回填完成（各來源對數見上方 BACKFILL_REPORT_JSON 行） ==="

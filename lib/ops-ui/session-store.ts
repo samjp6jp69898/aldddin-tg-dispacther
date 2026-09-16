@@ -4,7 +4,7 @@ import type { TechUser } from '../user-resolution/tech-user.ts'
 // ops-ui 的瀏覽器 session（2026-09-08）：純記憶體、process 重啟即失效（技術
 // 同事重新按一次 Telegram 登入即可，不落地任何可被撿走的 session 檔）。
 // id 是 32 bytes 隨機 hex，只存在 HttpOnly cookie 裡；這裡不存任何 Telegram
-// 個資以外的東西——TechUser 本來就是 tech-users.csv 內的公開名冊欄位。
+// 個資以外的東西——TechUser 本來就是 tech_users 表內的公開名冊欄位。
 
 export type OpsSession = {
   id: string
