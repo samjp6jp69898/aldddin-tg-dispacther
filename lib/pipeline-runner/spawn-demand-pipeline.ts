@@ -261,6 +261,29 @@ const NOTION_SH = '/Users/user/aladdin/scripts/notion.sh'
  * 佇列移除/啟動失敗這種低頻路徑觸發，且被 pipeline-queue 的 safeHook 包住，
  * 例外不會外洩。
  */
+/**
+ * 把需求單的『AI分析』欄位改成『分析中』（原本只在 demand-claim.ts 的正常
+ * 認領流程裡做，2026-09-16 對稱擴充 tg-monitor 重跑按鈕時發現：submitDemandPipeline
+ * /dispatchDemand 本身完全不碰這個欄位，只有 claimDemandTicket 會在呼叫它
+ * 們之前先做——bug pipeline 沒有對應的 Notion 狀態機制，照抄 bug retry 的
+ * CLI/端點模式時漏了 demand pipeline 特有的這一步，導致 tg-monitor 重跑後
+ * Notion 停在舊狀態（如「待分析」），這張單會繼續出現在候選清單、有被誤
+ * 重複認領的風險（實測 ALDREQ-881：重跑確實在背景正常跑，但 Notion 沒有
+ * 同步顯示「分析中」）。搬到這裡（與同語意的 resetAiAnalysisForReclaim 同
+ * 檔）並 export，供 demand-claim.ts 的正常認領路徑與 CLI 入口／
+ * cluster-head.ts 的 /cluster/retry demand 分支三處共用，不再各自維護一份。
+ *
+ * 找不到頁面（ticket 格式不對或查無此單）視為失敗，讓呼叫端決定怎麼回覆，
+ * 不在這裡吞掉。
+ */
+export function markAiAnalysisInProgress(ticket: string): void {
+  const url = getDemandTicketNotionUrl(ticket)
+  if (url === null) {
+    throw new Error(`找不到 ${ticket} 對應的 Notion 頁面，無法更新 AI分析`)
+  }
+  execFileSync('bash', [NOTION_SH, 'update-prop', url, 'AI分析', 'select', '分析中'], { encoding: 'utf8' })
+}
+
 export function resetAiAnalysisForReclaim(ticket: string): boolean {
   try {
     const url = getDemandTicketNotionUrl(ticket)
@@ -475,6 +498,18 @@ if (import.meta.main) {
   }
   if (!triggeredBy) {
     console.log(JSON.stringify({ ok: false, reason: '缺少 --triggered-by-email（demand pipeline 重跑必須知道認領人）' }))
+    process.exit(1)
+  }
+  // 2026-09-16（ALDREQ-881 實測發現）：submitDemandPipeline 本身不碰 Notion
+  // AI分析 欄位（正常認領流程裡這一步是 demand-claim.ts 的 claimDemandTicket
+  // 自己做的），這裡是繞過那條路徑的重跑入口，要自己補上，否則 Notion 會停在
+  // 舊狀態（如「待分析」），這張單繼續出現在候選清單、有被誤重複認領的風險。
+  // Notion 標記失敗就不 spawn——比起背景真的在跑但 Notion 顯示不同步，直接
+  // 拒絕、讓呼叫端知道要處理 Notion 問題更安全。
+  try {
+    markAiAnalysisInProgress(ticket)
+  } catch (err) {
+    console.log(JSON.stringify({ ok: false, reason: `更新 Notion AI分析 失敗，取消重跑：${err}` }))
     process.exit(1)
   }
   let result: { ok: boolean; reason?: string } & Record<string, unknown>

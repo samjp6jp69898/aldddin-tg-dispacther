@@ -1,7 +1,7 @@
 import { execFileSync } from 'node:child_process'
 import type { Context } from 'grammy'
-import { queryDemandPoolTicketsWithAiAnalysis, getDemandTicketNotionUrl } from '../notion-integration/demand-pool-tickets.ts'
-import { resetAiAnalysisForReclaim } from '../pipeline-runner/spawn-demand-pipeline.ts'
+import { queryDemandPoolTicketsWithAiAnalysis } from '../notion-integration/demand-pool-tickets.ts'
+import { resetAiAnalysisForReclaim, markAiAnalysisInProgress } from '../pipeline-runner/spawn-demand-pipeline.ts'
 import { dispatchDemand, getRemoteEntry, describeRemoteProgress, isMaintenanceModeOn } from '../cluster/cluster-head.ts'
 import { DEMAND_CONCURRENCY_LIMIT } from '../pipeline-runner/concurrency-limiter.ts'
 import { describeTicketProgress, isTicketLocked } from '../pipeline-runner/ticket-progress.ts'
@@ -10,7 +10,6 @@ import type { TechUser } from '../user-resolution/tech-user.ts'
 import type { ClaimOutcome } from './claim.ts'
 
 const BUG_LOCK_SH = '/Users/user/aladdin/scripts/bug-lock.sh'
-const NOTION_SH = '/Users/user/aladdin/scripts/notion.sh'
 
 // 沿用同一支 bug-lock.sh（不另開 demand-lock.sh）——ticket 格式 ALDREQ-xxx
 // 跟 Bug 的 FAQ-xxx 天然是不同的鎖目錄名稱，不會互相碰撞，見 tasks.json
@@ -44,20 +43,11 @@ function releaseLock(ticket: string): void {
   }
 }
 
-/**
- * 把需求單的『AI分析』欄位改成『分析中』（使用者 2026-08-17 定案，見
- * tasks.json T33 changelog：只動 AI分析，不動『狀態』欄位——『狀態』欄位是
- * 需求池自己的處理階段追蹤，不該由 claim 這個動作代管）。
- * 找不到頁面（ticket 格式不對或查無此單）視為失敗，讓呼叫端決定怎麼回覆
- * 使用者，不在這裡吞掉。
- */
-function markAiAnalysisInProgress(ticket: string): void {
-  const url = getDemandTicketNotionUrl(ticket)
-  if (url === null) {
-    throw new Error(`找不到 ${ticket} 對應的 Notion 頁面，無法更新 AI分析`)
-  }
-  execFileSync('bash', [NOTION_SH, 'update-prop', url, 'AI分析', 'select', '分析中'], { encoding: 'utf8' })
-}
+// markAiAnalysisInProgress（使用者 2026-08-17 定案：只動 AI分析，不動『狀態』
+// 欄位——『狀態』欄位是需求池自己的處理階段追蹤，不該由 claim 這個動作代管）
+// 2026-09-16 搬到 spawn-demand-pipeline.ts 並 export，供這裡與 tg-monitor
+// 重跑路徑（CLI 入口／cluster-head.ts /cluster/retry）共用，理由見該檔案
+// 對應函式的註解。
 
 /**
  * 需求單認領的決策核心（2026-09-08 從 handleDemandClaim 抽出，讓 Web UI

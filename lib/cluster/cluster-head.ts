@@ -21,6 +21,7 @@ import {
   getDemandQueueStats,
   hasDemandTicketActive,
   resetAiAnalysisForReclaim,
+  markAiAnalysisInProgress,
   tryDispatchDemandQueueFront,
 } from '../pipeline-runner/spawn-demand-pipeline.ts'
 import { notifyOperator } from '../notify/operator.ts'
@@ -326,6 +327,15 @@ export function registerClusterRoutes(app: Hono): void {
     // （比照 spawn-demand-pipeline.ts CLI 入口同一條紀律）。
     if (!techUser) {
       return c.json({ ok: false, reason: '缺少 triggeredByEmail（demand pipeline 重跑必須知道認領人）' }, 400)
+    }
+    // 2026-09-16（ALDREQ-881 實測發現，見 spawn-demand-pipeline.ts
+    // markAiAnalysisInProgress 註解）：這裡跟 CLI 入口一樣繞過
+    // demand-claim.ts 的正常認領流程，要自己補上 Notion AI分析 標記，否則
+    // 重跑成功但 Notion 停在舊狀態，這張單會繼續出現在候選清單。
+    try {
+      markAiAnalysisInProgress(body.ticket)
+    } catch (err) {
+      return c.json({ ok: false, reason: `更新 Notion AI分析 失敗，取消重跑：${err}` }, 500)
     }
     const result = await dispatchDemand(body.ticket, techUser.email, techUser)
     return c.json(result, result.ok ? 200 : 500)
