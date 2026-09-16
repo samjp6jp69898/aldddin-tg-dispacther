@@ -83,6 +83,15 @@ describe('buildSynthesizePrompt', () => {
       expect(prompt).toContain(section)
     }
   })
+
+  // 2026-09-16：使用者反映 pipeline 產出文件「沒有重點、難以閱讀」。plan.md
+  // 開頭的需求摘要必須是白話、含影響範圍與風險，讓沒看過需求單的人 30 秒抓到重點。
+  test('需求摘要要求白話、影響範圍與風險先行', () => {
+    const prompt = buildSynthesizePrompt('ALDREQ-1', '規格', [], [], [])
+    expect(prompt).toContain('白話')
+    expect(prompt).toContain('影響範圍')
+    expect(prompt).toContain('風險與待確認')
+  })
 })
 
 describe('buildClassifyPrompt', () => {

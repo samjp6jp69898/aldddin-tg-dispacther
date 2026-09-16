@@ -91,7 +91,16 @@ export function classifyAiAnalysis(outcome: DemandOutcome): DemandAiAnalysisValu
   }
 }
 
-/** Notion 留言純文字（不含連結——連結由呼叫端用 notion.sh comment-text 的 link 參數另外帶）。 */
+/**
+ * Notion 留言純文字（不含連結——連結由呼叫端用 notion.sh comment-text 的
+ * link 參數另外帶）。
+ *
+ * 2026-09-16 使用者定案：三種技術性失敗（setup-failed / implementer-error /
+ * unexpected-error）的 reason / detail 是 head/worker 本機的執行錯誤（含本機
+ * 路徑、指令行），**不得**貼進 Notion——同事看到也無從處理，只會洩漏本機
+ * 環境細節。Notion 只留「內部錯誤、本次結果無效、排除後會重跑」一句話；
+ * 完整錯誤照舊由 buildTelegramText 帶給維運者本人。
+ */
 export function buildNotionCommentText(ticket: string, outcome: DemandOutcome): string {
   switch (outcome.kind) {
     case 'plan':
@@ -101,11 +110,9 @@ export function buildNotionCommentText(ticket: string, outcome: DemandOutcome): 
     case 'insufficient-spec':
       return `${ticket} AI 判定規格不足，無法自動分析：${outcome.missing}\n\n請在 Notion 補充規格後重新認領。`
     case 'setup-failed':
-      return `${ticket} AI 分析環境建置失敗：${outcome.reason}\n請聯絡維運人員或自行處理。`
     case 'implementer-error':
-      return `${ticket} AI 分析執行異常：${outcome.detail}`
     case 'unexpected-error':
-      return `${ticket} AI 分析 pipeline 發生未預期錯誤：${outcome.detail}`
+      return `${ticket} AI 分析因執行環境內部錯誤中止，本次結果無效；詳細錯誤已另行通知維運人員，排除後會重新分析，這張單不需要因此做任何處理。`
   }
 }
 

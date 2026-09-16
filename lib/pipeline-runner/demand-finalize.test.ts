@@ -89,6 +89,27 @@ describe('buildNotionCommentText', () => {
     expect(text).toContain('plan.md')
     expect(text).toContain('人工複核')
   })
+
+  // 2026-09-16 使用者要求：head/worker 本機的執行錯誤（本機路徑、指令行、
+  // stack）不得出現在 Notion 留言——同事只需要知道「環境內部錯誤、本次結果
+  // 無效、維運排除後會重跑」。完整錯誤照舊走 Telegram（buildTelegramText）
+  // 通知維運者本人。實例：ALDREQ-881 曾把整段 claude-p-rate-watch.sh 指令行
+  // 與 Error: Command failed 貼上 Notion。
+  test('技術性失敗（setup/implementer/unexpected）留言不得洩漏本機錯誤細節', () => {
+    const detail = 'Error: Command failed: /Users/user/aladdin/scripts/claude-p-rate-watch.sh -p --model sonnet\nError: Input must be provided either through stdin'
+    const outcomes = [
+      { kind: 'setup-failed', reason: detail },
+      { kind: 'implementer-error', detail },
+      { kind: 'unexpected-error', detail },
+    ] as const
+    for (const outcome of outcomes) {
+      const text = buildNotionCommentText('ALDREQ-881', outcome)
+      expect(text).toContain('ALDREQ-881')
+      expect(text).not.toContain('/Users/user')
+      expect(text).not.toContain('Command failed')
+      expect(text).not.toContain('claude-p-rate-watch')
+    }
+  })
 })
 
 describe('buildTelegramText', () => {
