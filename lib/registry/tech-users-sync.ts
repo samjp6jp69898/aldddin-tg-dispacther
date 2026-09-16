@@ -628,7 +628,17 @@ async function main(): Promise<void> {
   let executor: MonitorDbExecutor | null = null
   if (!args.dryRun && args.mode !== null) {
     const { createMonitorPool } = await import('../monitor-db/pool.ts')
-    pool = createMonitorPool('mon_head', { connectionLimit: 1 })
+    // 2026-09-16 修正（FAQ-5094 事故：與 ALDREQ-834 同一種錯誤——見
+    // env.ts declareMonitorRoleFromLocalEnv 的說明）：本檔原本寫死
+    // createMonitorPool('mon_head', ...)，假設這支 CLI 只會在 head 上跑；
+    // 但 resolve-reviewer.sh（/create-mr Step 0.5）會在 worker 上呼叫本
+    // CLI 讀名冊，worker 的 .env 是 MON_DB_USER=mon_exec，寫死值必然觸發
+    // loadMonitorEnv() 的角色不符斷言。改用 declareMonitorRoleFromLocalEnv()
+    // + monitorRoleForThisHost()，讓角色由呼叫端機器的 .env 自己決定。
+    const { declareMonitorRoleFromLocalEnv } = await import('../monitor-db/env.ts')
+    const { monitorRoleForThisHost } = await import('../monitor-db/runtime.ts')
+    declareMonitorRoleFromLocalEnv()
+    pool = createMonitorPool(monitorRoleForThisHost(), { connectionLimit: 1 })
     executor = pool
   }
 

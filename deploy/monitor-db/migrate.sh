@@ -111,7 +111,7 @@ GRANT SELECT ON pipeline_monitor.ticket_artifact_sync TO 'mon_ui'@'%';
 GRANT INSERT (run_id, host, ticket, kind, lifecycle_rank, cancel_requested_at, cancel_resolved_by, legacy_key, created_at, review_rounds, final_review_rounds) ON pipeline_monitor.runs TO 'mon_ui'@'%';
 GRANT UPDATE (cancel_requested_at, cancel_resolved_by, outcome, outcome_source, review_rounds, final_review_rounds) ON pipeline_monitor.runs TO 'mon_ui'@'%';
 
--- mon_exec：每一台 worker（逐表最小權限，不含 mcp_tokens/tech_users/tg_unknown_senders/mcp_usage/dispatch_attempts）。
+-- mon_exec：每一台 worker（逐表最小權限，不含 mcp_tokens/tg_unknown_senders/mcp_usage/dispatch_attempts）。
 GRANT SELECT, INSERT, UPDATE ON pipeline_monitor.runs TO 'mon_exec'@'%';
 GRANT SELECT, INSERT, UPDATE ON pipeline_monitor.agent_runs TO 'mon_exec'@'%';
 GRANT SELECT, INSERT, UPDATE ON pipeline_monitor.file_offsets TO 'mon_exec'@'%';
@@ -121,6 +121,12 @@ GRANT SELECT, INSERT, UPDATE ON pipeline_monitor.worker_status_log TO 'mon_exec'
 -- ticket_artifact_sync 只有 head 寫，worker 唯讀（Phase 4 的產物存在性檢查會查它）。
 GRANT SELECT, INSERT, UPDATE ON pipeline_monitor.ticket_stages TO 'mon_exec'@'%';
 GRANT SELECT ON pipeline_monitor.ticket_artifact_sync TO 'mon_exec'@'%';
+-- 2026-09-16（Phase 6 收尾，使用者核准，FAQ-5094 事故修復）：tech-users.csv 退役後
+-- resolve-reviewer.sh（/create-mr Step 0.5）在 worker 上改成呼叫 tech-users-sync.ts
+-- --list-roster 查 DB，但 worker 用 mon_exec 帳號，原本刻意不含 tech_users，導致
+-- Step 0.5 在 worker 上必然 SELECT 被拒。改為僅 SELECT（不含 UPDATE/DELETE，
+-- tg_chat_id_enc/_bidx 仍只有 mon_head 能寫）。
+GRANT SELECT ON pipeline_monitor.tech_users TO 'mon_exec'@'%';
 
 FLUSH PRIVILEGES;
 SQL
