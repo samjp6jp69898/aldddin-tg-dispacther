@@ -100,8 +100,18 @@ ${EXHAUSTIVENESS_LESSONS}
 7. 整體信心評分＋針對排除清單的獨立檢查`
 }
 
-/** Review agent prompt：3 個角度各自獨立看兩份 draft，見 REVIEW_LENSES。 */
-export function buildReviewPrompt(lens: ReviewLens, ticket: string, specText: string, drafts: { label: string; text: string }[]): string {
+/**
+ * Review agent prompt：3 個角度各自獨立看兩份 draft，見 REVIEW_LENSES。
+ *
+ * 2026-09-16 起也帶入留言（含 notion.sh comments-resolved 下載回來的附件
+ * 全文）。實證動機：ALDREQ-865 的技術人員把整份規格設計寫在留言附件裡，
+ * 修好 fetchComments 之後 draft 讀得到、review/synthesize 卻讀不到，該次
+ * 產出的 plan.md 裡 synthesize 自己就寫了「在原始草稿的外部附件中如何具體
+ * 實作，本次彙整環境無法交叉核對」——審查階段只能靠 draft 轉述，等於放棄
+ * 對最權威那份規格的獨立查證。代價是 prompt 變長（附件上限 60000 字元），
+ * 換到的是 reviewer 能直接拿附件原文打臉 draft 的誤讀。
+ */
+export function buildReviewPrompt(lens: ReviewLens, ticket: string, specText: string, comments: string[], drafts: { label: string; text: string }[]): string {
   const lensInfo = REVIEW_LENSES.find(l => l.lens === lens)
   if (!lensInfo) throw new Error(`未知的 review lens: ${lens}`)
 
@@ -115,6 +125,9 @@ export function buildReviewPrompt(lens: ReviewLens, ticket: string, specText: st
 
 **需求單內容**：
 ${specText.trim() || '（頁面內文是空的）'}
+
+**留言**（可能含技術人員貼的附件全文，那往往是比需求單本文更具體的規格來源；draft 對它的轉述若與原文不符，以原文為準）：
+${comments.length > 0 ? comments.join('\n') : '（沒有留言）'}
 
 **兩份獨立草稿**：
 ${draftsText}
@@ -130,6 +143,7 @@ ${draftsText}
 export function buildSynthesizePrompt(
   ticket: string,
   specText: string,
+  comments: string[],
   drafts: { label: string; text: string }[],
   reviews: { label: string; text: string }[],
 ): string {
@@ -142,6 +156,9 @@ export function buildSynthesizePrompt(
 
 **需求單內容**：
 ${specText.trim() || '（頁面內文是空的）'}
+
+**留言**（可能含技術人員貼的附件全文；彙整時以附件原文為準，不要只依賴 draft 對它的轉述）：
+${comments.length > 0 ? comments.join('\n') : '（沒有留言）'}
 
 **兩份獨立草稿**：
 ${draftsText}

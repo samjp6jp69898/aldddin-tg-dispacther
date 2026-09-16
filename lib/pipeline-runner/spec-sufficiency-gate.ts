@@ -24,6 +24,9 @@ const MAX_BLOCK_DEPTH = 3
 // pipeline 的 7200 秒（性質不同：那是允許多輪工具呼叫＋改檔的完整 pipeline，
 // 這裡只是唯讀探索後的一次性文字分類）。
 const NOTION_EXEC_TIMEOUT_MS = 30_000
+// comments-resolved 除了打 Notion comments API，還要逐份下載留言附件（每份
+// 自己有 20 秒上限），一則留言掛好幾份文件時 30 秒會不夠，給它獨立的寬鬆上限。
+const NOTION_COMMENTS_TIMEOUT_MS = 90_000
 const CLAUDE_EXEC_TIMEOUT_MS = 300_000
 // 2026-08-21 使用者定案新增：codebase 根目錄，讓 askClaude 的 explorer agent
 // 能讀到 agrabah／abu／rajah／lago 全部 repo（哪個 repo 都可能跟需求單有關，
@@ -96,22 +99,61 @@ async function fetchBlocksText(blockOrPageId: string, depth = 0): Promise<string
   return parts.join('\n')
 }
 
+export type ResolvedAttachment = { name?: string; kind?: string; content?: string; note?: string }
+export type ResolvedComment = { author?: string; created_time?: string; text?: string; attachments?: ResolvedAttachment[] }
+
+/**
+ * 把 notion.sh comments-resolved 的一則留言攤平成一段文字給 LLM 讀。
+ *
+ * 2026-09-16 實測回報的缺口（ALDREQ-865）：Notion 留言可以完全沒有文字、只
+ * 有附件（rich_text 空陣列，檔案在 attachments）。舊版只讀 rich_text，再用
+ * 「結尾是『：』就丟掉」濾掉空留言，結果同事貼的整份規格文件連『存在』都
+ * 沒進到 gate／repo-scope／draft 三段 prompt。現在：有文字或有附件就保留，
+ * 文字類附件內容直接內嵌（notion.sh 已下載好），讀不到的附件至少留檔名 +
+ * 原因，讓判斷者知道有這份文件而不是以為沒有。
+ *
+ * 回傳 null 代表這則留言真的完全沒有資訊量（沒文字也沒附件），照舊濾掉。
+ */
+function formatResolvedComment(c: ResolvedComment): string | null {
+  const author = c.author ?? '未知使用者'
+  const text = c.text ?? ''
+  const attachments = Array.isArray(c.attachments) ? c.attachments : []
+  if (text.trim() === '' && attachments.length === 0) return null
+
+  const parts = [`${author}：${text}`]
+  for (const a of attachments) {
+    const name = a.name ?? '（檔名不明）'
+    if (typeof a.content === 'string' && a.content !== '') {
+      parts.push(`[附件 ${name}${a.note ? `（${a.note}）` : ''}]`, a.content, `[附件結束 ${name}]`)
+    } else {
+      parts.push(`[附件 ${name}（${a.note ?? '未載入內容'}）]`)
+    }
+  }
+  return parts.join('\n')
+}
+
+/** export 供測試直接驗證解析行為，不需要真的打 Notion API。 */
+export function formatResolvedComments(results: ResolvedComment[]): string[] {
+  return results.map(formatResolvedComment).filter((s): s is string => s !== null)
+}
+
+/**
+ * 留言內容（含附件）一律走 notion.sh comments-resolved：附件下載與文字/二進位
+ * 判定都在該子命令內完成，這裡只負責排版。注意附件內容是外部文件，跟留言文字
+ * 一樣屬於不可信輸入——餵給的 agent 工具集刻意維持最小（見 askClaude 註解）。
+ * comments-resolved 抓不到留言時會 exit 1（execFileAsync 直接 reject），不會
+ * 靜默回空陣列讓下游以為這張單沒人留言。
+ */
 async function fetchComments(pageUrl: string): Promise<string[]> {
-  const { stdout } = await execFileAsync('bash', [NOTION_SH, 'comments', pageUrl], {
+  const { stdout } = await execFileAsync('bash', [NOTION_SH, 'comments-resolved', pageUrl], {
     encoding: 'utf8',
     maxBuffer: 10 * 1024 * 1024,
-    timeout: NOTION_EXEC_TIMEOUT_MS,
+    timeout: NOTION_COMMENTS_TIMEOUT_MS,
   })
   const parsed = JSON.parse(stdout)
   if (!Array.isArray(parsed.results)) return []
 
-  return parsed.results
-    .map((c: any) => {
-      const text = Array.isArray(c.rich_text) ? c.rich_text.map((r: any) => r?.plain_text ?? '').join('') : ''
-      const author = c.display_name?.resolved_name ?? '未知使用者'
-      return `${author}：${text}`
-    })
-    .filter((s: string) => !s.endsWith('：')) // 過濾掉留言文字本身是空的（author：後面沒內容）
+  return formatResolvedComments(parsed.results)
 }
 
 // export 供測試驗證 prompt 有沒有正確帶進內文/留言，不需要真的呼叫

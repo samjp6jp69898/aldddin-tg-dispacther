@@ -239,13 +239,13 @@ export async function runDemandPlanPipeline(ticket: string, specText: string, co
 
     log(`${ticket} plan pipeline：review 階段開始（3 個角度平行）`)
     const reviewTexts = await Promise.all(
-      REVIEW_LENSES.map(({ lens }) => runFreeformAgent(buildReviewPrompt(lens, ticket, specText, drafts), worktreeRoot, { ticket, stage: `review-${lens}` })),
+      REVIEW_LENSES.map(({ lens }) => runFreeformAgent(buildReviewPrompt(lens, ticket, specText, comments, drafts), worktreeRoot, { ticket, stage: `review-${lens}` })),
     )
     const reviews = REVIEW_LENSES.map(({ label }, i) => ({ label, text: reviewTexts[i]! }))
     log(`${ticket} plan pipeline：review 階段完成`)
 
     log(`${ticket} plan pipeline：synthesize 階段開始`)
-    const planContent = await runFreeformAgent(buildSynthesizePrompt(ticket, specText, drafts, reviews), worktreeRoot, { ticket, stage: 'synthesize' })
+    const planContent = await runFreeformAgent(buildSynthesizePrompt(ticket, specText, comments, drafts, reviews), worktreeRoot, { ticket, stage: 'synthesize' })
     log(`${ticket} plan pipeline：synthesize 階段完成`)
 
     const planPath = join(PLAN_DIR, `${ticket}-plan.md`)
