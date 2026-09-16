@@ -25,14 +25,25 @@ TG_BUG_REPORT_ADMIN_CHAT_ID=$(grep '^TG_BUG_REPORT_ADMIN_CHAT_ID=' "$ENV_FILE" |
 CLUSTER_SHARED_SECRET=$(grep '^CLUSTER_SHARED_SECRET=' "$ENV_FILE" | cut -d= -f2- | tr -d '\r\n')
 # pipeline 監控 DB 化（2026-09-02，Phase 0）——只匯出開關本身，不是必要變數，
 # 缺了／非 '1' 一律視同關閉（isMonitorDbEnabled()），行為與遷移前相同。
-# 其餘 MON_DB_*／MON_FIELD_KEY_*／MON_BIDX_KEY 等憑證要等 Phase 1/2 實際
-# 程式碼落地、真的需要時才加進本白名單（lazy import，見 plan §9.0(B)）。
 MON_DB_ENABLED=$(grep '^MON_DB_ENABLED=' "$ENV_FILE" | cut -d= -f2- | tr -d '\r\n')
+# 2026-09-15（使用者決定 DB 為 tg_chat_id 唯一權威）：resolveTechUserByChatId
+# 白名單查詢改查 monitor DB（lib/user-resolution/tech-user.ts），這是本檔白
+# 名單第一次真的需要 MON_DB_* 連線憑證與 MON_BIDX_KEY（先前的註記「等
+# Phase 1/2 真的需要時才加」，現在就是那個時候）。不需要 MON_FIELD_KEY_V1
+# ——白名單查詢只比對盲索引，不解密。缺任一個 → loadMonitorEnv() fail-loud
+# 丟例外，getLongLivedMonitorPool() 接住只留 WARN、視為 DB 不可用（白名單查
+# 詢 fail closed，找不到而非整支炸掉）。
+MON_DB_HOST=$(grep '^MON_DB_HOST=' "$ENV_FILE" | cut -d= -f2- | tr -d '\r\n')
+MON_DB_PORT=$(grep '^MON_DB_PORT=' "$ENV_FILE" | cut -d= -f2- | tr -d '\r\n')
+MON_DB_SCHEMA=$(grep '^MON_DB_SCHEMA=' "$ENV_FILE" | cut -d= -f2- | tr -d '\r\n')
+MON_DB_USER=$(grep '^MON_DB_USER=' "$ENV_FILE" | cut -d= -f2- | tr -d '\r\n')
+MON_DB_PASSWORD=$(grep '^MON_DB_PASSWORD=' "$ENV_FILE" | cut -d= -f2- | tr -d '\r\n')
+MON_BIDX_KEY=$(grep '^MON_BIDX_KEY=' "$ENV_FILE" | cut -d= -f2- | tr -d '\r\n')
 # ops-ui（lib/ops-ui/，2026-09-08）：/ops 的公司網路白名單與對外 origin——不是
 # 必要變數，缺了只是 /ops 對所有來源拒絕（fail-closed），不擋伺服器啟動。
 OPS_ALLOWED_CIDRS=$(grep '^OPS_ALLOWED_CIDRS=' "$ENV_FILE" | cut -d= -f2- | tr -d '\r\n')
 OPS_PUBLIC_ORIGIN=$(grep '^OPS_PUBLIC_ORIGIN=' "$ENV_FILE" | cut -d= -f2- | tr -d '\r\n')
-export TG_DISPATCH_BOT_TOKEN TG_WEBHOOK_PATH TG_WEBHOOK_SECRET TG_KIT_ADMIN_CHAT_ID TG_BUG_REPORT_ADMIN_CHAT_ID CLUSTER_SHARED_SECRET MON_DB_ENABLED OPS_ALLOWED_CIDRS OPS_PUBLIC_ORIGIN
+export TG_DISPATCH_BOT_TOKEN TG_WEBHOOK_PATH TG_WEBHOOK_SECRET TG_KIT_ADMIN_CHAT_ID TG_BUG_REPORT_ADMIN_CHAT_ID CLUSTER_SHARED_SECRET MON_DB_ENABLED MON_DB_HOST MON_DB_PORT MON_DB_SCHEMA MON_DB_USER MON_DB_PASSWORD MON_BIDX_KEY OPS_ALLOWED_CIDRS OPS_PUBLIC_ORIGIN
 # 跟 launchd/run-tunnel.sh 的 ngrok 目標 port 保持同一個明確值，不依賴
 # server.ts 自己的預設值（8787）——兩支獨立 wrapper 各自隱含同一個預設，
 # 未來任一邊改動容易悄悄漂移，這裡明講掉。
