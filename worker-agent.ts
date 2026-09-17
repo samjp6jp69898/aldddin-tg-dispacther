@@ -396,6 +396,11 @@ app.get('/capacity', guard, c => {
     worker: workerName,
     bug: effectiveStats('bug'),
     demand: effectiveStats('demand'),
+    // 2026-09-17：把本機維護模式現況也搭這班既有的 capacity 探測（head 派工前
+    // 本來就會呼叫這支）一起帶回去，讓 dispatch.ts 在挑選候選 worker 時能直接
+    // 排除維護中的機器，不必為此另外多打一輪 /maintenance（見 dispatch.ts
+    // candidates 篩選處的呼叫端註解）。
+    maintenance: maintenanceMode.isOn(),
     ...(ticket !== null ? { ticket: { ticket, active: localActivity.isActive(ticket) } } : {}),
   })
 })

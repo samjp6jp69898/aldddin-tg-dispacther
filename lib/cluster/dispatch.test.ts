@@ -18,8 +18,8 @@ function stats(running: number, queued = 0, limit = 5): QueueStats {
 function worker(name: string): WorkerInfo {
   return { name, url: `http://10.0.0.${name.length}:8801`, registeredAt: 'x' }
 }
-function cap(bug: QueueStats, demand: QueueStats = idle): CapacityReport {
-  return { worker: 'w', bug, demand }
+function cap(bug: QueueStats, demand: QueueStats = idle, maintenance?: boolean): CapacityReport {
+  return { worker: 'w', bug, demand, ...(maintenance !== undefined ? { maintenance } : {}) }
 }
 
 /** 全假件 harness：不打網路、不 spawn。localSubmit 預設回 started。 */
@@ -194,6 +194,43 @@ describe('createDispatcher — 名額選擇', () => {
     expect(r).toEqual({ ok: true, status: 'started', pid: 99 }) // 本機 submit（額滿時實際會回 queued，這裡假件回 started）
     expect(h.postedJobs).toEqual([])
     expect(h.registry.get('FAQ-1')).toBe(null)
+    h.cleanup()
+  })
+
+  test('2026-09-17：維護中的 worker 不列入候選，即使它名額比別台多——優先派給其他還在正常受理的機器', async () => {
+    const h = makeHarness({
+      workers: [worker('w1'), worker('w22')],
+      // w1 剩 4 格（名額比 w22 多），但在維護中；w22 只剩 1 格、不在維護 → 應該選 w22
+      capacities: { w1: cap(stats(1), idle, true), w22: cap(stats(4)) },
+      localBugStats: full,
+    })
+    const r = await h.dispatcher.dispatchBug('FAQ-1', USER)
+    expect(r).toEqual({ ok: true, status: 'remote_started', worker: 'w22' })
+    expect(h.postedJobs.map(p => p.worker)).toEqual(['w22'])
+    h.cleanup()
+  })
+
+  test('2026-09-17：全部 worker 都在維護中 → 視同全滿，退回本機佇列，不會派給任何一台', async () => {
+    const h = makeHarness({
+      workers: [worker('w1'), worker('w22')],
+      capacities: { w1: cap(idle, idle, true), w22: cap(idle, idle, true) },
+      localBugStats: full,
+    })
+    const r = await h.dispatcher.dispatchBug('FAQ-1', USER)
+    expect(r).toEqual({ ok: true, status: 'started', pid: 99 })
+    expect(h.postedJobs).toEqual([])
+    expect(h.registry.get('FAQ-1')).toBe(null)
+    h.cleanup()
+  })
+
+  test('2026-09-17：舊版 worker 回應不帶 maintenance 欄位（滾動部署中）→ fail-open，視同不在維護，不被誤排除', async () => {
+    const h = makeHarness({
+      workers: [worker('w1')],
+      capacities: { w1: cap(stats(1)) }, // 不帶 maintenance 欄位
+      localBugStats: full,
+    })
+    const r = await h.dispatcher.dispatchBug('FAQ-1', USER)
+    expect(r).toEqual({ ok: true, status: 'remote_started', worker: 'w1' })
     h.cleanup()
   })
 })

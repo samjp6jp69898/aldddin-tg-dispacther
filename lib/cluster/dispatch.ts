@@ -17,8 +17,9 @@ import type { BugMode } from '../pipeline-runner/bug-mode.ts'
 //      active**（out-of-band run：timeout 自動重試、reaper 重跑、人工觸發，
 //      C-1 的失明面）→ 就地把登記表回填成 confirmed 指向那台，回
 //      already_running_remote，絕不再起新 run。
-//   5. 候選 = 本機剩餘名額 vs 各 worker 剩餘名額（佇列有單視同滿）；本機
-//      ≥ 最佳 worker（含平手）→ 本機（不用走網路、監控最完整）。
+//   5. 候選 = 本機剩餘名額 vs 各 worker 剩餘名額（佇列有單視同滿，維護中的
+//      worker 直接不列入候選，見下方 candidates 篩選處，2026-09-17 新增）；
+//      本機 ≥ 最佳 worker（含平手）→ 本機（不用走網路、監控最完整）。
 //   6. 遠端只試「最佳一台」（M-2：不輪詢多台，把最壞耗時鎖在 2.5+6 秒，
 //      留在 grammy webhook 10 秒預算內）；該台失敗（full/rejected/
 //      unreachable＝確定沒接單）→ 清佔位、退回本機 submit（額滿走既有
@@ -318,8 +319,15 @@ export function createDispatcher(deps: DispatchDeps) {
         return { ok: true, status: 'already_running_remote', worker: activeOn.worker.name }
       }
 
+      // 2026-09-17：維護中的 worker 不列入候選——`fetchCapacity` 現在會順帶
+      // 帶回該台自己的維護模式現況（worker-agent.ts /capacity），這裡在名額
+      // 排序之前先濾掉，讓派工優先落到其他還在正常受理的機器，而不是等
+      // POST /jobs 被 503 拒絕後才發現、退回本機執行（見下方 (6) 的既有
+      // fallback 注解）。`cap.maintenance !== true`（不是 `=== false`）：
+      // 舊版 worker 尚未部署這次更新時回應不帶這個欄位，`undefined` 視同
+      // 「不在維護」，不因為滾動部署期間漏一台就誤排除正常機器。
       const candidates = capacities
-        .filter(c => c.cap !== null)
+        .filter(c => c.cap !== null && c.cap.maintenance !== true)
         .map(c => ({ worker: c.worker, free: freeSlots(c.cap![kind]) }))
         .filter(c => c.free > 0)
         .sort((a, b) => b.free - a.free)

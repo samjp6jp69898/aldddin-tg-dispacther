@@ -26,6 +26,12 @@ export type CapacityReport = {
    * 鎖 ∪ ps，見 local-activity.ts）。head 派工前靠這個發現 out-of-band 的
    * run 並就地回填登記表（C-1 修正）。 */
   ticket?: { ticket: string; active: boolean }
+  /** 2026-09-17 新增：該 worker 自己的維護模式現況（worker-agent.ts /capacity
+   * 順帶回報，不另開一輪探測）。`dispatch.ts` 的候選篩選用它排除維護中的
+   * worker，優先派給其他還在正常受理的機器。舊版 worker（尚未部署這次更新）
+   * 回應不帶這個欄位，`undefined` 視同「不在維護」（fail-open，不因為滾動
+   * 部署期間漏一台的舊回應就誤把正常機器當成維護中排除掉）。 */
+  maintenance?: boolean
 }
 
 export type JobRequest = {
