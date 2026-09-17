@@ -10,6 +10,9 @@
 //                       拒絕新單，見 lib/maintenance/mode-store.ts 檔頭——
 //                       獨立於 head 的旗標，不經 head 轉發，tg-monitor 直接
 //                       打這台）
+//   GET  /rate-limit-status  本機 Claude 用量偵測快照（2026-09-17 新增，
+//                       tg-monitor overview 顯示用；資料來源見
+//                       aladdin_ai/scripts/rate-limit-notify.sh）
 //   POST /jobs          接單：直接走本機既有的 submitCreateMr/
 //                       submitDemandPipeline（佇列、併發上限、去重、
 //                       stale-lock 回收全部沿用單機機制，一行不改）
@@ -44,6 +47,7 @@
 // MCP proxy 都只該有一份）。worker 只跑這支 + 它自己的 launchd plist。
 
 import { Hono } from 'hono'
+import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { getClusterSecret, WORKER_NAME_RE, WORKER_URL_RE } from './lib/cluster/cluster-env.ts'
 import { createClusterAuthGuard, CLUSTER_TOKEN_HEADER } from './lib/cluster/cluster-auth.ts'
@@ -408,6 +412,21 @@ app.post('/maintenance', guard, async c => {
   maintenanceMode.setOn(body.on)
   console.error(`worker-agent: 維護模式已${body.on ? '開啟' : '關閉'}（${workerName}）`)
   return c.json({ ok: true, on: body.on })
+})
+
+// Claude 用量偵測快照（2026-09-17，tg-monitor overview 顯示用）：唯讀，本機
+// aladdin_ai/scripts/rate-limit-notify.sh 每次偵測到用量時順手寫下的檔案
+// （互動 session／headless pipeline 呼叫 claude 時都會觸發，見該腳本「持久化
+// 快照」段落）。跟 /maintenance 同一種「worker 在遠端機器，tg-monitor 直接
+// 打這台」設計，不經 head 轉發。檔案不存在／壞掉（含這台從未偵測過任何一次
+// 用量）回 ok:false，呼叫端據此顯示「尚未偵測到」，不是「用量是 0」。
+const RATE_LIMIT_SNAPSHOT_FILE = '/Users/user/.claude/rate-limit-notify-state/latest.json'
+app.get('/rate-limit-status', guard, c => {
+  try {
+    return c.json({ ok: true, snapshot: JSON.parse(readFileSync(RATE_LIMIT_SNAPSHOT_FILE, 'utf8')) })
+  } catch {
+    return c.json({ ok: false })
+  }
 })
 
 // body 欄位驗證（值會流進 tg-notify.sh 參數與落盤的 queue.json）：head 端
