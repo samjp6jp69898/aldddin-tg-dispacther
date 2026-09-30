@@ -259,7 +259,10 @@ export function classifyPipelineResult(exitCode: number, stdoutContent: string):
   // 被誤判成 unknown_failure 補發了假警報。regex 對 `**` 與 backtick 做
   // 選配容忍（星號在冒號前後都可能出現，如「status:**」的寫法），值本身
   // 收斂到 \w（i18n_manual_handoff 含數字，不能用純字母類），行首錨定不變。
-  const statusMatch = /^-\s*\*{0,2}Pipeline status\*{0,2}\s*:\s*\*{0,2}\s*`?(\w+)/m.exec(result)
+  // 2026-09-30（FAQ-5161）：manager 也會把完成報告排成 markdown 表格
+  // 「| Pipeline status | analysis_done |」，行首改容忍「- 」或「| 」，
+  // 分隔符容忍「:」或「|」。
+  const statusMatch = /^(?:-\s*|\|\s*)\*{0,2}Pipeline status\*{0,2}\s*[:|]\s*\*{0,2}\s*`?(\w+)/m.exec(result)
   if (statusMatch) {
     const status = statusMatch[1]
     if (status === 'success' || status === 'already_fixed' || status === 'i18n_manual_handoff') return 'success'
@@ -290,12 +293,12 @@ export function classifyPipelineResult(exitCode: number, stdoutContent: string):
 export function extractFailureReason(stdoutContent: string): string | null {
   const resultEvent = extractResultEvent(stdoutContent)
   const result = typeof resultEvent?.result === 'string' ? resultEvent.result : stdoutContent
-  const match = /^-\s*\*{0,2}Failure reason\*{0,2}\s*:\s*(.+)$/m.exec(result)
+  const match = /^(?:-\s*|\|\s*)\*{0,2}Failure reason\*{0,2}\s*[:|]\s*(.+)$/m.exec(result)
   if (!match) return null
   // 值本身是自由文字（不像 pipeline_status 只有 \w token 好界定），這裡只
   // 剝除「整個值」外層包一層的 markdown 裝飾（**粗體**／`反引號`），不動
   // 值內部可能出現的星號/反引號。
-  const value = match[1]!.trim().replace(/^\*{1,2}(.*)\*{1,2}$/, '$1').replace(/^`(.*)`$/, '$1').trim()
+  const value = match[1]!.trim().replace(/\s*\|$/, '').replace(/^\*{1,2}(.*)\*{1,2}$/, '$1').replace(/^`(.*)`$/, '$1').trim()
   if (!value || value === 'N/A') return null
   // runs.failure_reason 是 VARCHAR(500)（migration 006）：截斷但保留可讀性，
   // 不讓過長訊息讓寫入失敗。

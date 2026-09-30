@@ -59,6 +59,13 @@ describe('classifyPipelineResult — 七種分類（T12 acceptance criteria）',
     expect(classifyPipelineResult(0, fakeStdout({ result: '- Pipeline status: `analysis_done`' }))).toBe('analysis_done')
   })
 
+  // 2026-09-30（FAQ-5161 真實誤判案例）：manager 把完成報告排成 markdown 表格。
+  test('表格列寫法「| Pipeline status | analysis_done |」也要命中', () => {
+    const table = ['| 項目 | 內容 |', '|---|---|', '| Pipeline status | analysis_done |', '| Failure reason | N/A |'].join('\n')
+    expect(classifyPipelineResult(0, fakeStdout({ result: table }))).toBe('analysis_done')
+    expect(classifyPipelineResult(0, fakeStdout({ result: '| **Pipeline status** | `failed` |' }))).toBe('failed')
+  })
+
   test('failed', () => {
     expect(classifyPipelineResult(0, fakeStdout({ result: '- Pipeline status: failed' }))).toBe('failed')
   })
@@ -130,6 +137,12 @@ describe('extractFailureReason（2026-09-09，tracker.md 退役後續：保留�
   test('容忍 markdown 裝飾（粗體標籤、反引號包值），比照 pipeline_status 同一套規則', () => {
     const result = '- **Failure reason**: `Step 1 無法產出 analytics.md`'
     expect(extractFailureReason(fakeStdout({ result }))).toBe('Step 1 無法產出 analytics.md')
+  })
+
+  test('表格列寫法「| Failure reason | 原因 |」→ 抓值且去掉尾端 |', () => {
+    const result = ['| Pipeline status | failed |', '| Failure reason | step5 fixer 超過重試上限 |'].join('\n')
+    expect(extractFailureReason(fakeStdout({ result }))).toBe('step5 fixer 超過重試上限')
+    expect(extractFailureReason(fakeStdout({ result: '| Failure reason | N/A |' }))).toBeNull()
   })
 
   test('非 failed 出口的模板保留字 N/A → null，不硬填假值', () => {
