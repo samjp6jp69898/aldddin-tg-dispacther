@@ -213,6 +213,23 @@ function extractResultEvent(stdoutContent: string): ResultEvent | null {
   return (resultEvent as ResultEvent | undefined) ?? null
 }
 
+/**
+ * 從完成報告抓 pipeline_status 的值。兩條來源，機器可讀行優先：
+ *   1. `PIPELINE_RESULT=<值>` 獨立一行（2026-10-05 起 create-mr.md Step 8 報告
+ *      尾端固定輸出，格式刻意不含任何標點/裝飾，不受 LLM 排版漂移影響）。
+ *   2. 舊的「Pipeline status」人類可讀行（相容歷史 log 與 manager 漏印機器行
+ *      的情況）。regex 容忍：行首「- 」或「| 」、粗體 `**`、反引號，分隔符
+ *      「:」「：」（全形，FAQ-5362 2026-10-05 真實誤判：manager 輸出
+ *      「- **Pipeline status：** success」）或「|」。
+ * 都抓不到回 null。
+ */
+function extractPipelineStatus(result: string): string | null {
+  const machine = /^PIPELINE_RESULT=(\w+)[ \t]*$/m.exec(result)
+  if (machine) return machine[1]!
+  const human = /^(?:-\s*|\|\s*)\*{0,2}Pipeline status\*{0,2}\s*[:：|]\s*\*{0,2}\s*`?(\w+)/m.exec(result)
+  return human ? human[1]! : null
+}
+
 export function classifyPipelineResult(exitCode: number, stdoutContent: string): Classification {
   if (exitCode === 124) return 'timeout' // GNU timeout 逾時把 claude -p 中途砍掉，stdout 通常是空的（來不及 flush）
   if (exitCode !== 0) {
@@ -262,9 +279,8 @@ export function classifyPipelineResult(exitCode: number, stdoutContent: string):
   // 2026-09-30（FAQ-5161）：manager 也會把完成報告排成 markdown 表格
   // 「| Pipeline status | analysis_done |」，行首改容忍「- 」或「| 」，
   // 分隔符容忍「:」或「|」。
-  const statusMatch = /^(?:-\s*|\|\s*)\*{0,2}Pipeline status\*{0,2}\s*[:|]\s*\*{0,2}\s*`?(\w+)/m.exec(result)
-  if (statusMatch) {
-    const status = statusMatch[1]
+  const status = extractPipelineStatus(result)
+  if (status) {
     if (status === 'success' || status === 'already_fixed' || status === 'i18n_manual_handoff') return 'success'
     if (status === 'needs_qa_clarification') return 'needs_qa_clarification'
     if (status === 'analysis_done') return 'analysis_done'
@@ -293,7 +309,7 @@ export function classifyPipelineResult(exitCode: number, stdoutContent: string):
 export function extractFailureReason(stdoutContent: string): string | null {
   const resultEvent = extractResultEvent(stdoutContent)
   const result = typeof resultEvent?.result === 'string' ? resultEvent.result : stdoutContent
-  const match = /^(?:-\s*|\|\s*)\*{0,2}Failure reason\*{0,2}\s*[:|]\s*(.+)$/m.exec(result)
+  const match = /^(?:-\s*|\|\s*)\*{0,2}Failure reason\*{0,2}\s*[:：|]\s*\*{0,2}\s*(.+)$/m.exec(result)
   if (!match) return null
   // 值本身是自由文字（不像 pipeline_status 只有 \w token 好界定），這裡只
   // 剝除「整個值」外層包一層的 markdown 裝飾（**粗體**／`反引號`），不動

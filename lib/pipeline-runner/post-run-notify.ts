@@ -324,6 +324,64 @@ ${stderrPath}`
   }
 }
 
+/**
+ * pipeline 自己的正常出口（create-mr.md Step 7）寫到 Notion「AI分析」的終態值
+ * （分析失敗另計：它同時是 NEEDS_NOTIFY 補寫的值，無法區分是誰寫的）。
+ * 認領後欄位保持使用者設的觸發值（「一鍵分析＋修復＋開 MR」等），只有 pipeline
+ * 走到出口才會改成下列值，所以出現這些值＝這輪 pipeline 確實跑到自己的出口。
+ */
+const PIPELINE_OWN_TERMINAL_AI_STATUSES: ReadonlySet<string> = new Set(['分析成功', '待釐清', '問題分析完成，待確認'])
+
+/**
+ * 2026-10-05（FAQ-5362 假警報根因）：classification==='unknown_failure' 只代表
+ * 「分類器看不懂完成報告」，不代表流程失敗——FAQ-5362 實際全部成功（MR 已開、
+ * Notion 已寫「分析成功」），只因報告冒號是全形而被判 unknown，之後補發流程
+ * 又把 Notion 覆寫成「分析失敗」並發了假失敗通知。這裡在補發流程動手前先查
+ * Notion 目前的 AI分析：已是 pipeline 自己的終態值 → 回 true（呼叫端應跳過
+ * 覆寫與通知），並通知維運者（Landon）分類器格式漂移，方便修 regex；
+ * 否則回 false（照舊走補發）。
+ *
+ * 只針對 unknown_failure：其他 NEEDS_NOTIFY 分類（timeout/cli_failure/...）
+ * 是 CLI 層級異常，Notion 即使有終態值也可能是上一輪殘留，不在本守衛範圍。
+ * 查詢失敗（Notion 掛掉等）回 false——寧可補發也不吞掉真失敗。
+ * deps 可覆寫（測試用）。
+ */
+export function suppressFalseUnknownFailure(
+  ticket: string,
+  classification: Classification,
+  stdoutPath: string,
+  deps: { getAiAnalysisStatus?: (ticket: string) => string | null; notify?: (text: string) => boolean } = {},
+): boolean {
+  if (classification !== 'unknown_failure') return false
+
+  const getAiAnalysisStatus = deps.getAiAnalysisStatus ?? getTicketAiAnalysisStatus
+  const notify = deps.notify ?? notifyOperator
+
+  let aiStatus: string | null
+  try {
+    aiStatus = getAiAnalysisStatus(ticket)
+  } catch (err) {
+    log(`${ticket} unknown_failure 守衛查詢 Notion AI分析 失敗，照舊補發: ${err}`)
+    return false
+  }
+  if (aiStatus === null || !PIPELINE_OWN_TERMINAL_AI_STATUSES.has(aiStatus)) return false
+
+  log(`${ticket} classification=unknown_failure 但 Notion AI分析=${aiStatus}（pipeline 已走到自己的出口），判定為分類器誤判，不覆寫 Notion、不補發失敗通知`)
+  const text = `⚠️ [分類器未認出報告] ${ticket}
+dispatcher 把這輪判成 unknown_failure，但 Notion「AI分析」已是「${aiStatus}」（pipeline 自己寫的終態），所以沒有覆寫、也沒發失敗通知給指派人。請檢查完成報告的「Pipeline status」格式是否又漂移：
+${stdoutPath}`
+  try {
+    if (notify(text)) {
+      log(`${ticket} 已通知 Landon（分類器誤判）`)
+    } else {
+      log(`${ticket} 通知 Landon 失敗（分類器誤判）`)
+    }
+  } catch (err) {
+    log(`${ticket} 通知 Landon 例外（分類器誤判）: ${err}`)
+  }
+  return true
+}
+
 const MONITOR_WRITE_BUDGET_MS = SHORT_LIVED_WRITE_BUDGET_MS // §6.7：短命行程總預算（await，不是 fire-and-forget）
 const BUG_RUN_KIND: RunKind = 'bug'
 
@@ -680,6 +738,14 @@ async function main(): Promise<void> {
   checkPushMismatch(ticket, classification, stdoutPath, stderrPath)
 
   if (!shouldNotify(classification)) return
+
+  // 分類器誤判守衛（見 suppressFalseUnknownFailure 檔頭）：Notion 已是 pipeline
+  // 自己的終態值就不覆寫、不補發。例外一律當「不抑制」處理，不擋後續補發。
+  try {
+    if (suppressFalseUnknownFailure(ticket, classification, stdoutPath)) return
+  } catch (err) {
+    log(`${ticket} suppressFalseUnknownFailure 例外（照舊補發）: ${err}`)
+  }
 
   // 2026-09-09：CLI 崩潰也要留下 Notion 記錄（見 markNotionAnalysisFailed
   // 檔頭註解）。獨立包 try/catch，排在自動重試/TG 通知之前——這裡失敗不能

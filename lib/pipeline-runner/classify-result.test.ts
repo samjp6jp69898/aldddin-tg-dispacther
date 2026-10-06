@@ -168,3 +168,55 @@ describe('extractFailureReason（2026-09-09，tracker.md 退役後續：保留�
     expect(extracted!.endsWith('...')).toBe(true)
   })
 })
+
+describe('全形冒號與機器可讀行 — FAQ-5362（2026-10-05）真實誤判案例', () => {
+  // FAQ-5362 實際輸出的報告節錄：標籤加粗、冒號是全形「：」且在粗體內。
+  const faq5362Report = [
+    '## FAQ-5362 /create-mr Pipeline 完成',
+    '- **Pipeline status：** success',
+    '- **Failure reason：** N/A',
+    '- **Mode：** full',
+  ].join('\n')
+
+  test('「- **Pipeline status：** success」→ success（原本落到 unknown_failure）', () => {
+    expect(classifyPipelineResult(0, fakeStdout({ result: faq5362Report }))).toBe('success')
+  })
+
+  test('全形冒號搭配各種裝飾都要命中', () => {
+    expect(classifyPipelineResult(0, fakeStdout({ result: '- Pipeline status： analysis_done' }))).toBe('analysis_done')
+    expect(classifyPipelineResult(0, fakeStdout({ result: '- **Pipeline status**： `failed`' }))).toBe('failed')
+    expect(classifyPipelineResult(0, fakeStdout({ result: '| Pipeline status ： needs_qa_clarification |' }))).toBe('needs_qa_clarification')
+  })
+
+  test('PIPELINE_RESULT= 機器可讀行 → 直接採用，不依賴人類可讀行', () => {
+    expect(classifyPipelineResult(0, fakeStdout({ result: '完成了。\nPIPELINE_RESULT=success' }))).toBe('success')
+    expect(classifyPipelineResult(0, fakeStdout({ result: 'PIPELINE_RESULT=needs_qa_clarification' }))).toBe('needs_qa_clarification')
+    expect(classifyPipelineResult(0, fakeStdout({ result: 'PIPELINE_RESULT=failed  ' }))).toBe('failed')
+  })
+
+  test('機器行與人類可讀行不一致時以機器行為準', () => {
+    const result = ['- Pipeline status: success', 'PIPELINE_RESULT=failed'].join('\n')
+    expect(classifyPipelineResult(0, fakeStdout({ result }))).toBe('failed')
+  })
+
+  test('機器行值不是已知狀態 → unknown_failure（不誤判成功）', () => {
+    expect(classifyPipelineResult(0, fakeStdout({ result: 'PIPELINE_RESULT=weird' }))).toBe('unknown_failure')
+  })
+
+  test('PIPELINE_RESULT 出現在行中間（例如引用說明文字）不算數', () => {
+    expect(classifyPipelineResult(0, fakeStdout({ result: '報告尾端會輸出 PIPELINE_RESULT=success 這一行' }))).toBe('unknown_failure')
+  })
+
+  test('extractFailureReason：全形冒號 + 粗體收尾也能抓值，N/A 仍回 null', () => {
+    expect(extractFailureReason(fakeStdout({ result: '- **Failure reason：** step5 fixer 超過重試上限' }))).toBe('step5 fixer 超過重試上限')
+    expect(extractFailureReason(fakeStdout({ result: faq5362Report }))).toBeNull()
+  })
+
+  test('真實 FAQ-5362 stdout 形狀（JSONL，最後一行 result event）→ success', () => {
+    const jsonl = [
+      JSON.stringify({ type: 'system', subtype: 'init' }),
+      JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: faq5362Report }),
+    ].join('\n')
+    expect(classifyPipelineResult(0, jsonl)).toBe('success')
+  })
+})

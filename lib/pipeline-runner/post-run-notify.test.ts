@@ -2,7 +2,7 @@ import { describe, expect, mock, test } from 'bun:test'
 import { unlinkSync, writeFileSync, mkdtempSync, readFileSync, rmSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { checkPushMismatch, shouldNotify, parseRunningBugTickets, writeAuthoritativeOutcome, buildNotifyText, notifyAssigneeOrEscalate } from './post-run-notify.ts'
+import { checkPushMismatch, suppressFalseUnknownFailure, shouldNotify, parseRunningBugTickets, writeAuthoritativeOutcome, buildNotifyText, notifyAssigneeOrEscalate } from './post-run-notify.ts'
 import type { Classification } from './classify-result.ts'
 import { FakeRunsDb } from '../monitor-db/test-support/fake-runs-db.ts'
 import { __resetDeclaredMonitorRoleForTest, declareMonitorRoleFromLocalEnv, getDeclaredMonitorRole } from '../monitor-db/env.ts'
@@ -327,6 +327,57 @@ describe('checkPushMismatch — 2026-08-23：pipeline 回報 success 但 Notion 
     const notify = mock((_t: string) => true)
     checkPushMismatch('FAQ-1', 'success', 'out.log', 'err.log', { getAiAnalysisStatus, notify })
     expect(notify).not.toHaveBeenCalled()
+  })
+})
+
+describe('suppressFalseUnknownFailure — 2026-10-05 FAQ-5362：分類器誤判 unknown_failure 時不覆寫 Notion、不發假失敗通知', () => {
+  test.each(['分析成功', '待釐清', '問題分析完成，待確認'])('unknown_failure 但 Notion 已是 pipeline 終態「%s」→ 抑制，並通知 Landon 分類器漂移', status => {
+    const getAiAnalysisStatus = mock((_t: string) => status)
+    const notify = mock((_t: string) => true)
+    expect(suppressFalseUnknownFailure('FAQ-5362', 'unknown_failure', '/tmp/x.stdout.log', { getAiAnalysisStatus, notify })).toBe(true)
+    expect(notify).toHaveBeenCalledTimes(1)
+    const text = notify.mock.calls[0]![0]
+    expect(text).toContain('FAQ-5362')
+    expect(text).toContain(status)
+    expect(text).toContain('/tmp/x.stdout.log')
+  })
+
+  test.each(['一鍵分析＋修復＋開 MR', '分析失敗', '分析中', ''])('unknown_failure 且 Notion=「%s」（非終態/無法證明已成功）→ 不抑制，照舊補發', status => {
+    const getAiAnalysisStatus = mock((_t: string) => status)
+    const notify = mock((_t: string) => true)
+    expect(suppressFalseUnknownFailure('FAQ-1', 'unknown_failure', 'o.log', { getAiAnalysisStatus, notify })).toBe(false)
+    expect(notify).not.toHaveBeenCalled()
+  })
+
+  test('查無 AI分析（null）→ 不抑制', () => {
+    const notify = mock((_t: string) => true)
+    expect(suppressFalseUnknownFailure('FAQ-1', 'unknown_failure', 'o.log', { getAiAnalysisStatus: () => null, notify })).toBe(false)
+    expect(notify).not.toHaveBeenCalled()
+  })
+
+  test('查詢 Notion 丟例外 → 不抑制（寧可補發也不吞掉真失敗），且不炸穿', () => {
+    const notify = mock((_t: string) => true)
+    const getAiAnalysisStatus = () => {
+      throw new Error('Notion API 掛了')
+    }
+    expect(suppressFalseUnknownFailure('FAQ-1', 'unknown_failure', 'o.log', { getAiAnalysisStatus, notify })).toBe(false)
+    expect(notify).not.toHaveBeenCalled()
+  })
+
+  test.each<Classification>(['success', 'failed', 'cli_failure', 'infra_failure', 'timeout', 'session_limit', 'skipped'])('classification=%s → 完全不查 Notion、不抑制（守衛只管 unknown_failure）', cls => {
+    const getAiAnalysisStatus = mock((_t: string) => '分析成功')
+    const notify = mock((_t: string) => true)
+    expect(suppressFalseUnknownFailure('FAQ-1', cls, 'o.log', { getAiAnalysisStatus, notify })).toBe(false)
+    expect(getAiAnalysisStatus).not.toHaveBeenCalled()
+    expect(notify).not.toHaveBeenCalled()
+  })
+
+  test('通知 Landon 本身失敗/丟例外 → 仍然抑制（不能因維運通知失敗而回頭覆寫 Notion）', () => {
+    expect(suppressFalseUnknownFailure('FAQ-1', 'unknown_failure', 'o.log', { getAiAnalysisStatus: () => '分析成功', notify: () => false })).toBe(true)
+    const boom = () => {
+      throw new Error('tg 掛了')
+    }
+    expect(suppressFalseUnknownFailure('FAQ-1', 'unknown_failure', 'o.log', { getAiAnalysisStatus: () => '分析成功', notify: boom })).toBe(true)
   })
 })
 
