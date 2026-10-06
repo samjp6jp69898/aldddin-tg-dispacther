@@ -36,6 +36,17 @@ function minutesSince(mtimeMs: number, now: number): number {
   return Math.floor((now - mtimeMs) / 60_000)
 }
 
+// 本次執行的起點＝鎖目錄 mtime（bug-lock.sh claim 時建立）。重跑同一張票時
+// Debug/{ticket}/ 還留著上一輪的產物（mtime 可能差數月），不濾掉會把舊
+// solution.md 當成「最後完成的 stage」，算出 253295 分鐘這種數字。
+function runStartMs(ticket: string, lockDir: string): number {
+  try {
+    return statSync(join(lockDir, ticket)).mtimeMs
+  } catch {
+    return 0
+  }
+}
+
 const BUG_STAGE_FILES: { key: string; label: string }[] = [
   { key: 'analytics', label: 'Step1 analyst' },
   { key: 'spec', label: 'Step2 spec' },
@@ -59,7 +70,8 @@ const BUG_NEXT_STEP: Record<string, string> = {
  * 唯讀 CLI 腳本。兩邊的判斷依據刻意保持一致：任何一邊改了 stage 定義都要
  * 記得同步另一邊。
  */
-function describeBugProgress(ticket: string, now: number, debugDir: string, worktreeDir: string): string {
+function describeBugProgress(ticket: string, now: number, debugDir: string, worktreeDir: string, lockDir: string): string {
+  const startMs = runStartMs(ticket, lockDir)
   const dir = join(debugDir, ticket)
   if (!existsSync(dir)) {
     return `${ticket} 正在執行中：Debug 目錄尚未建立（Step1 analyst 進行中或剛開始）。`
@@ -71,11 +83,13 @@ function describeBugProgress(ticket: string, now: number, debugDir: string, work
   for (const { key, label } of BUG_STAGE_FILES) {
     const f = join(dir, `${ticket}-${key}.md`)
     if (!existsSync(f)) continue
+    const mtimeMs = statSync(f).mtimeMs
+    if (mtimeMs < startMs) continue
     doneLabels.push(label)
     latestLabel = label
-    latestMs = statSync(f).mtimeMs
+    latestMs = mtimeMs
   }
-  const reviewerFile = readdirSync(dir).find(name => name.toLowerCase().includes('reviewer'))
+  const reviewerFile = readdirSync(dir).find(name => name.toLowerCase().includes('reviewer') && statSync(join(dir, name)).mtimeMs >= startMs)
   if (reviewerFile) {
     doneLabels.push('Step6 reviewer')
     latestLabel = 'Step6 reviewer'
@@ -132,7 +146,7 @@ export function describeTicketProgress(ticket: string, opts: ProgressOpts = {}):
   if (ticket.startsWith('ALDREQ-')) {
     return describeDemandProgress(ticket, now, opts.demandLogPath ?? DEFAULT_DEMAND_LOG, opts.planDir ?? DEFAULT_PLAN_DIR)
   }
-  return describeBugProgress(ticket, now, opts.debugDir ?? DEFAULT_DEBUG_DIR, opts.worktreeDir ?? DEFAULT_WORKTREE_DIR)
+  return describeBugProgress(ticket, now, opts.debugDir ?? DEFAULT_DEBUG_DIR, opts.worktreeDir ?? DEFAULT_WORKTREE_DIR, opts.lockDir ?? DEFAULT_LOCK_DIR)
 }
 
 // ---- 結構化版本（供 worker /jobs/:ticket 回給 head 監控台畫表格用，2026-09-01）----
@@ -142,16 +156,19 @@ export function describeTicketProgress(ticket: string, opts: ProgressOpts = {}):
 
 export type ProgressStage = { key: string; label: string; done: boolean; current: boolean; at: string | null }
 
-function bugProgressStages(ticket: string, debugDir: string, worktreeDir: string): ProgressStage[] {
+function bugProgressStages(ticket: string, debugDir: string, worktreeDir: string, lockDir: string): ProgressStage[] {
+  const startMs = runStartMs(ticket, lockDir)
   const dir = join(debugDir, ticket)
   if (!existsSync(dir)) return []
   const stages: ProgressStage[] = []
   for (const { key, label } of BUG_STAGE_FILES) {
     const f = join(dir, `${ticket}-${key}.md`)
     if (!existsSync(f)) continue
-    stages.push({ key, label, done: true, current: false, at: new Date(statSync(f).mtimeMs).toISOString() })
+    const mtimeMs = statSync(f).mtimeMs
+    if (mtimeMs < startMs) continue
+    stages.push({ key, label, done: true, current: false, at: new Date(mtimeMs).toISOString() })
   }
-  const reviewerFile = readdirSync(dir).find(name => name.toLowerCase().includes('reviewer'))
+  const reviewerFile = readdirSync(dir).find(name => name.toLowerCase().includes('reviewer') && statSync(join(dir, name)).mtimeMs >= startMs)
   if (reviewerFile) {
     stages.push({ key: 'reviewer', label: 'Step6 reviewer', done: true, current: false, at: new Date(statSync(join(dir, reviewerFile)).mtimeMs).toISOString() })
   }
@@ -179,5 +196,5 @@ export function getTicketProgressStages(ticket: string, opts: ProgressOpts = {})
   if (ticket.startsWith('ALDREQ-')) {
     return demandProgressStages(ticket, opts.demandLogPath ?? DEFAULT_DEMAND_LOG, opts.planDir ?? DEFAULT_PLAN_DIR)
   }
-  return bugProgressStages(ticket, opts.debugDir ?? DEFAULT_DEBUG_DIR, opts.worktreeDir ?? DEFAULT_WORKTREE_DIR)
+  return bugProgressStages(ticket, opts.debugDir ?? DEFAULT_DEBUG_DIR, opts.worktreeDir ?? DEFAULT_WORKTREE_DIR, opts.lockDir ?? DEFAULT_LOCK_DIR)
 }

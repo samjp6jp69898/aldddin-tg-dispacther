@@ -44,6 +44,21 @@ describe('describeTicketProgress — Bug 票（FAQ-），比照 pipeline-status.
     expect(text).toContain('Debug 目錄尚未建立')
   })
 
+  test('重跑：上一輪遺留的舊產物（mtime 早於鎖建立時間）不計入進度，不算出離譜分鐘數', () => {
+    const debugDir = makeDebugDir('FAQ-103', {
+      'FAQ-103-analytics.md': '2026-08-27T11:50:00Z',
+      'FAQ-103-solution.md': '2026-04-13T06:02:48Z',
+    })
+    const lockDir = makeLockDir(['FAQ-103'])
+    const lockTime = new Date('2026-08-27T11:40:00Z')
+    utimesSync(join(lockDir, 'FAQ-103'), lockTime, lockTime)
+    const worktreeDir = mkdtempSync(join(tmpdir(), 'ticket-progress-wt-'))
+    const text = describeTicketProgress('FAQ-103', { now: NOW, debugDir, worktreeDir, lockDir })
+    expect(text).not.toContain('solution')
+    expect(text).toContain('Step2 spec')
+    expect(text).toContain('已 10 分鐘')
+  })
+
   test('只有 analytics.md（Step1 完成）→ 目前指向 Step2 spec，附經過分鐘數', () => {
     const debugDir = makeDebugDir('FAQ-101', { 'FAQ-101-analytics.md': '2026-08-27T11:50:00Z' })
     const worktreeDir = mkdtempSync(join(tmpdir(), 'ticket-progress-wt-'))
