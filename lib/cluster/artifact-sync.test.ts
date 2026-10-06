@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test'
 import {
   ARTIFACT_HOST_FROM_STAGES_SQL,
   ARTIFACT_HOST_FROM_SYNC_SQL,
+  LATEST_ARTIFACT_RUN_HOST_SQL,
   PENDING_ARTIFACT_PULL_SQL,
   SSH_TRANSPORT,
   analysisNotesPath,
@@ -199,5 +200,98 @@ describe('artifact-sync — 待重試清單與重試迴圈（§4.1）', () => {
       },
     }
     expect(await retryPendingArtifactPulls({ pool: throwing, listWorkers: () => [worker('landon2')] })).toBe(0)
+  })
+})
+
+describe('retryPendingArtifactPulls — 過時待拉取紀錄的出口（2026-10-06 FAQ-5297：每 10 分鐘空拉 landon2）', () => {
+  type Rec = Parameters<NonNullable<Parameters<typeof retryPendingArtifactPulls>[0]['record']>>[0]
+  function setup(opts: { latestHost?: string | null; headHas?: boolean }) {
+    const f = fakePool({
+      [PENDING_ARTIFACT_PULL_SQL]: [{ ticket: 'FAQ-5297', source_host: 'landon2' }],
+      [LATEST_ARTIFACT_RUN_HOST_SQL]: opts.latestHost ? [{ host: opts.latestHost }] : [],
+    })
+    const pulled: string[] = []
+    const recorded: Rec[] = []
+    const run = () =>
+      retryPendingArtifactPulls({
+        pool: f.pool,
+        listWorkers: () => [worker('landon2'), worker('A140')],
+        selfHost: 'head',
+        headHas: () => opts.headHas ?? false,
+        record: r => void recorded.push(r),
+        pull: async (w, t) => {
+          pulled.push(`${w.name}:${t}`)
+          return { ok: true, fileCount: 1 }
+        },
+      })
+    return { f, pulled, recorded, run }
+  }
+
+  test('最近一次產出在 head 且 head 有產物 → 結案（source=head、head_synced_at 有值、無錯誤），不再拉 worker', async () => {
+    const t = setup({ latestHost: 'head', headHas: true })
+    expect(await t.run()).toBe(0)
+    expect(t.pulled).toEqual([])
+    expect(t.recorded).toHaveLength(1)
+    expect(t.recorded[0]).toMatchObject({ ticket: 'FAQ-5297', sourceHost: 'head', lastError: null })
+    expect(t.recorded[0]!.headSyncedAt).not.toBeNull()
+  })
+
+  test('查詢只認會留下產物的終態，且帶 ticket 參數', async () => {
+    const t = setup({ latestHost: 'head', headHas: true })
+    await t.run()
+    expect(LATEST_ARTIFACT_RUN_HOST_SQL).toContain("outcome IN ('success','analysis_done','needs_qa_clarification','failed')")
+    expect(LATEST_ARTIFACT_RUN_HOST_SQL).not.toContain('session_limit')
+    const call = t.f.calls.find(c => c.sql === LATEST_ARTIFACT_RUN_HOST_SQL)
+    expect(call?.params).toEqual(['FAQ-5297'])
+  })
+
+  test('最近一次產出在 head、但 head 其實沒有產物 → 不結案，照舊去拉（不能憑 DB 說法就放棄）', async () => {
+    const t = setup({ latestHost: 'head', headHas: false })
+    expect(await t.run()).toBe(1)
+    expect(t.pulled).toEqual(['landon2:FAQ-5297'])
+    expect(t.recorded).toEqual([])
+  })
+
+  test('最近一次產出在另一台 worker → 來源改指向它並保持待拉取（head_synced_at=null），本輪不拉', async () => {
+    const t = setup({ latestHost: 'A140' })
+    expect(await t.run()).toBe(0)
+    expect(t.pulled).toEqual([])
+    expect(t.recorded[0]).toMatchObject({ ticket: 'FAQ-5297', sourceHost: 'A140', headSyncedAt: null })
+  })
+
+  test('最近一次產出就是登記的來源 → 照舊拉取', async () => {
+    const t = setup({ latestHost: 'landon2' })
+    expect(await t.run()).toBe(1)
+    expect(t.pulled).toEqual(['landon2:FAQ-5297'])
+    expect(t.recorded).toEqual([])
+  })
+
+  test('查無任何產出 run → 照舊拉取', async () => {
+    const t = setup({ latestHost: null })
+    expect(await t.run()).toBe(1)
+    expect(t.pulled).toEqual(['landon2:FAQ-5297'])
+  })
+
+  test('查 runs 丟例外 → 照舊拉取，不讓整輪中斷', async () => {
+    const pulled: string[] = []
+    const pool = {
+      async execute<T>(sql: string): Promise<[T, unknown]> {
+        if (sql === LATEST_ARTIFACT_RUN_HOST_SQL) throw new Error('runs 表查詢失敗')
+        return [(sql === PENDING_ARTIFACT_PULL_SQL ? [{ ticket: 'FAQ-5297', source_host: 'landon2' }] : []) as T, null]
+      },
+    }
+    const n = await retryPendingArtifactPulls({
+      pool,
+      listWorkers: () => [worker('landon2')],
+      selfHost: 'head',
+      headHas: () => true,
+      record: () => {},
+      pull: async (w, tk) => {
+        pulled.push(`${w.name}:${tk}`)
+        return { ok: true, fileCount: 1 }
+      },
+    })
+    expect(n).toBe(1)
+    expect(pulled).toEqual(['landon2:FAQ-5297'])
   })
 })

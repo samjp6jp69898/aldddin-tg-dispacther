@@ -29,6 +29,7 @@ import { promisify } from 'node:util'
 import type { RowDataPacket } from 'mysql2/promise'
 import { dispatchMonitorWrite } from '../monitor-db/runtime.ts'
 import { isoToMysqlDatetime3OrNull } from '../monitor-db/mysql-datetime.ts'
+import { MON_HOST } from '../monitor-db/env.ts'
 import { upsertTicketArtifactSync, type MonitorDbExecutor } from '../monitor-db/writes.ts'
 import type { WorkerInfo } from './worker-registry.ts'
 
@@ -240,15 +241,40 @@ export async function queryPendingArtifactPulls(pool: MonitorDbExecutor, beforeI
 }
 
 /**
+ * 這張票「最近一次有產出分析產物的 run」跑在哪台（過時紀錄偵測用）。只看會留下
+ * `Debug/<ticket>/` 的終態（success／analysis_done／needs_qa_clarification／failed）；
+ * session_limit、infra_failure 這類在產出任何檔案前就中止的 run 不算，否則它們會
+ * 把來源誤指到一台空手的機器。
+ */
+export const LATEST_ARTIFACT_RUN_HOST_SQL = `SELECT host FROM runs WHERE ticket = ? AND finished_at IS NOT NULL AND outcome IN ('success','analysis_done','needs_qa_clarification','failed') ORDER BY started_at DESC LIMIT 1`
+
+export async function queryLatestArtifactRunHost(pool: MonitorDbExecutor, ticket: string): Promise<string | null> {
+  const [rows] = await pool.execute<RowDataPacket[]>(LATEST_ARTIFACT_RUN_HOST_SQL, [ticket])
+  const v = ((rows as RowDataPacket[] | null)?.[0] as Record<string, unknown> | undefined)?.host
+  return typeof v === 'string' && v !== '' ? v : null
+}
+
+/**
  * §4.1 的重試：remote sweeper 每輪（10 分鐘）順便對「head 沒有完整副本、且距上次
  * 嘗試超過 10 分鐘」的票再拉一次。不新增 timer——掛在既有 sweep 週期上。
  * 回傳實際嘗試的張數（測試/log 用）。DB 關閉（pool=null）或任何例外都回 0。
+ *
+ * 2026-10-06 修復（FAQ-5297 每 10 分鐘空拉 landon2 一整天）：待拉取紀錄原本沒有
+ * 「已過時」的出口。FAQ-5297 先派到 landon2、7 秒就 session_limit（沒產出任何
+ * 檔案）被登記成待拉取，之後 head 自己重跑成功、產物已在 head，那筆紀錄卻永遠
+ * 不會被結掉。現在拉取前先查最近一次有產出的 run 跑在哪：
+ *   - 跑在 head 且 head 確實有產物 → 結案（source_host=head、head_synced_at=now）
+ *   - 跑在另一台 worker（≠ 登記的來源）→ 來源改指向那台，下一輪從對的地方拉
+ *   - 查不到／跟登記一致／查詢出錯 → 照舊拉（不改變原行為）
  */
 export async function retryPendingArtifactPulls(deps: {
   pool: MonitorDbExecutor | null
   listWorkers: () => WorkerInfo[]
   now?: () => number
   pull?: (worker: WorkerInfo, ticket: string) => Promise<PullResult>
+  selfHost?: string
+  headHas?: (ticket: string) => boolean
+  record?: typeof recordSync
 }): Promise<number> {
   if (deps.pool === null) return 0
   try {
@@ -257,8 +283,31 @@ export async function retryPendingArtifactPulls(deps: {
     if (pending.length === 0) return 0
     const workers = deps.listWorkers()
     const pull = deps.pull ?? pullTicketArtifacts
+    const selfHost = deps.selfHost ?? MON_HOST
+    const headHas = deps.headHas ?? headHasArtifacts
+    const record = deps.record ?? recordSync
     let attempted = 0
     for (const p of pending) {
+      let latestHost: string | null = null
+      try {
+        latestHost = await queryLatestArtifactRunHost(deps.pool, p.ticket)
+      } catch (err) {
+        console.error(`artifact-sync: ${p.ticket} 查最近產出 run 的 host 失敗，照舊拉取: ${err}`)
+      }
+      if (latestHost !== null && latestHost !== p.sourceHost) {
+        const now = new Date().toISOString()
+        if (latestHost === selfHost) {
+          if (headHas(p.ticket)) {
+            console.error(`artifact-sync: ${p.ticket} 最近一次產出在 head 本機（登記來源 ${p.sourceHost} 已過時），結案不再拉取`)
+            record({ ticket: p.ticket, sourceHost: selfHost, lastAttemptAt: now, headSyncedAt: now, lastError: null, fileCount: countLocalFiles(p.ticket) })
+            continue
+          }
+        } else {
+          console.error(`artifact-sync: ${p.ticket} 最近一次產出在 ${latestHost}（登記來源 ${p.sourceHost} 已過時），來源改指向 ${latestHost}，下一輪再拉`)
+          record({ ticket: p.ticket, sourceHost: latestHost, lastAttemptAt: now, headSyncedAt: null, lastError: `來源由 ${p.sourceHost} 改指向 ${latestHost}`, fileCount: null })
+          continue
+        }
+      }
       const w = workers.find(x => x.name === p.sourceHost)
       if (!w) continue // 產物所在機器已不在名冊（退役/停用）：這輪跳過，不改任何狀態
       attempted += 1
