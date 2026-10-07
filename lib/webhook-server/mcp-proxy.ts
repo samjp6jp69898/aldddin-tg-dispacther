@@ -168,8 +168,8 @@ export function isAuthenticatedUpstreamStatus(status: number): boolean {
 // capacity 訂在 10 而非更貼近下限的 5——已知一次 MCP 冷啟動握手
 // （initialize + notifications/initialized + tools/list 三個 POST）就吃掉
 // 3 顆，訂太緊握手都做不完就先被 429。
-const MCP_ROUTE_CAPACITY = 30
-const MCP_ROUTE_REFILL_PER_SECOND = 30 / 60 // 每分鐘 30 次
+const MCP_ROUTE_CAPACITY = 150
+const MCP_ROUTE_REFILL_PER_SECOND = 150 / 60 // 每分鐘 150 次（2026-10-07 由 30 調高：批次寫入約 46 筆就撞限，被誤報成 Authorization 被拒）
 const TOOLSMITH_CAPACITY = 10
 const TOOLSMITH_REFILL_PER_SECOND = 5 / 60 // 每分鐘 5 次
 
@@ -190,15 +190,16 @@ export const PROXY_ROUTE_LIMITS: Record<string, BucketLimit> = {
 // 它的職責只有一個：擋住「持續高速灌流量、每一發都要 proxy 幫忙 fetch 到本機
 // 後端」的洪水，讓後端不用為每一發假 token 做一次名冊讀取與比對。它不是業務
 // 配額（業務配額是上面那顆），所以刻意訂得比任何合理使用量高一個量級：
-// 每分鐘 120 次、瞬間爆發 120 次。
+// 每分鐘 600 次、瞬間爆發 600 次（2026-10-07 隨業務額度 150 同步由 120 調高，
+// 須恆高於業務額度，否則轉發閘會先成為瓶頸）。
 //
-// 為什麼是 120 而不是沿用 30：M4 的攻擊之所以「便宜又隱形」，正是因為 30/分鐘
-// 這種業務級數字用 1 req/2s 就能長期壓在底部。把轉發閘拉到 2 req/s，攻擊者要
+// 為什麼不沿用業務級數字：M4 的攻擊之所以「便宜又隱形」，正是因為業務級數字
+// 用低速請求就能長期壓在底部。把轉發閘拉到 10 req/s，攻擊者要
 // 觸發它就必須持續打出 tunnel 供應商流量統計上看得見的量（現為 Cloudflare，先前為 ngrok），而且觸發之後拿到的仍是跟
 // 猜錯前綴一模一樣的 401——他既問不出新資訊，也拿不到「悄悄讓別人被擋」的
 // 效果（合法使用者的額度另計，見下方 quota gate）。
-const FORWARD_CAPACITY = 120
-const FORWARD_REFILL_PER_SECOND = 120 / 60 // 每分鐘 120 次
+const FORWARD_CAPACITY = 600
+const FORWARD_REFILL_PER_SECOND = 600 / 60 // 每分鐘 600 次
 
 // 未認證的巨大 body 會被 proxy 串流轉發到 localhost（認證是在 hosted server
 // 那端才發生），這一層要擋在 proxy，跟 webhook 的量級一致。
