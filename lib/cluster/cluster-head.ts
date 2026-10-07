@@ -25,6 +25,7 @@ import {
   tryDispatchDemandQueueFront,
 } from '../pipeline-runner/spawn-demand-pipeline.ts'
 import { notifyOperator } from '../notify/operator.ts'
+import { relayNotify } from './notify-relay.ts'
 import { applyRemoteTrackerRow, parseTrackerRow, readTrackerFile } from '../pipeline-runner/tracker-sync.ts'
 import { resolveTechUserByEmail } from '../user-resolution/tech-user.ts'
 import type { TechUser } from '../user-resolution/tech-user.ts'
@@ -339,6 +340,19 @@ export function registerClusterRoutes(app: Hono): void {
     }
     const result = await dispatchDemand(body.ticket, techUser.email, techUser)
     return c.json(result, result.ok ? 200 : 500)
+  })
+
+  // worker 通知代發（2026-10-07，見 notify-relay.ts 檔頭）：worker 解不開
+  // chat_id 密文（金鑰只在 head），把收件人＋文字交 head 代發。
+  app.post('/cluster/notify', guard, async c => {
+    const body = (await c.req.json().catch(() => null)) as Parameters<typeof relayNotify>[0]
+    try {
+      const result = await relayNotify(body)
+      if (result === null) return c.json({ ok: false }, 400)
+      return c.json({ ok: true, result })
+    } catch {
+      return c.json({ ok: false }, 500)
+    }
   })
 
   app.post('/cluster/job-done', guard, async c => {
