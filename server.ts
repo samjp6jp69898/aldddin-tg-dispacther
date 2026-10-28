@@ -74,6 +74,7 @@ const addPerChatCommand = (chatId: string | undefined, command: { command: strin
 }
 addPerChatCommand(process.env.TG_KIT_ADMIN_CHAT_ID, { command: 'kit', description: '核發企劃 starter kit（/kit <id> <name>）' })
 addPerChatCommand(process.env.TG_BUG_REPORT_ADMIN_CHAT_ID, { command: 'bugreport', description: '推送 Bug 指派人員統計報表' })
+addPerChatCommand(process.env.TG_BUG_REPORT_ADMIN_CHAT_ID, { command: 'changelog', description: '產生 changelog HTML（/changelog <repo> <branch> <tag> ...）' })
 for (const [chatId, extraCommands] of perChatExtraCommands) {
   await bot.api.setMyCommands(
     [
