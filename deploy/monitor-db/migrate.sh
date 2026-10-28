@@ -94,6 +94,9 @@ GRANT SELECT, INSERT, UPDATE ON pipeline_monitor.* TO 'mon_head'@'%';
 -- 永遠留在白名單裡。範圍刻意收到最小：只有這一張表、只有這一個帳號，其餘表仍無
 -- DELETE（見 lib/registry/tech-users-sync.ts 的 --remove-user）。
 GRANT DELETE ON pipeline_monitor.tech_users TO 'mon_head'@'%';
+-- 2026-10-28（migration 008，使用者核准）：changelog 允許群組要能從 tg-monitor dashboard
+-- 刪除（不只停用）。同樣只開這一張表，寫入者只有 lib/registry/changelog-groups-cli.ts。
+GRANT DELETE ON pipeline_monitor.changelog_allowed_groups TO 'mon_head'@'%';
 
 -- mon_ui：tg-monitor 讀取面 ＋ cancel 旗標欄位級寫入（裁定 3，v3.2）。
 GRANT SELECT ON pipeline_monitor.runs TO 'mon_ui'@'%';

@@ -19,6 +19,7 @@ import { promisify } from 'node:util'
 import { InputFile, type Api } from 'grammy'
 import type { Range, RepoCommits } from '/Users/user/aladdin/aladdin_ai/skills/changelog-html/resolve-tag-ranges.ts'
 import { execClaudeWithStdin } from '../pipeline-runner/claude-exec.ts'
+import { computeProgress, createProgressReporter, formatElapsed } from './changelog-progress.ts'
 
 const execFileAsync = promisify(execFile)
 
@@ -27,6 +28,8 @@ const SKILL_MD = '/Users/user/aladdin/aladdin_ai/skills/changelog-html/SKILL.md'
 const RUN_ROOT = '/Users/user/aladdin/telegram-dispatcher/logs/changelog'
 const RESOLVE_TIMEOUT_MS = 5 * 60 * 1000
 const CLAUDE_TIMEOUT_MS = 2 * 60 * 60 * 1000
+/** 「開始產生」訊息的進度更新間隔（見 changelog-progress.ts）。 */
+const PROGRESS_INTERVAL_MS = 5 * 1000
 
 type ResolveResult = { ok: true; ranges: Range[]; repos: RepoCommits; srcRoots: Record<string, string> } | { ok: false; errors: string[] }
 
@@ -48,11 +51,6 @@ async function runResolver(tokens: string[], runDir: string): Promise<ResolveRes
 
 function summarize(ranges: Range[]): string {
   return ranges.map(r => `• ${r.repo} ${r.tag} → ${r.branch}（${r.commits.length} 個 commit）`).join('\n')
-}
-
-/** 同 repo 多組範圍會重疊（common/、rajah 多組 tag），另列去重後的實際數量。 */
-function summarizeRepos(repos: RepoCommits): string {
-  return Object.entries(repos).map(([repo, v]) => `${repo} ${v.commits.length}`).join('、')
 }
 
 function buildPrompt(runDir: string, outputHtml: string): string {
@@ -82,14 +80,28 @@ async function generate(api: Api, chatId: number, tokens: string[], runDir: stri
     await api.sendMessage(chatId, `❌ 檢查未通過：\n${resolved.errors.join('\n')}`)
     return
   }
-  const summary = `${summarize(resolved.ranges)}\n去重後：${summarizeRepos(resolved.repos)}`
+  const summary = summarize(resolved.ranges)
   if (resolved.ranges.every(r => r.commits.length === 0)) {
     await api.sendMessage(chatId, `以下範圍在 tag 之後都沒有新的 commit，不產生 changelog：\n${summary}`)
     return
   }
-  await api.sendMessage(chatId, `開始產生 changelog（約 20–40 分鐘，完成後會傳 HTML 給你）：\n${summary}`)
+  const header = `開始產生 changelog：\n${summary}`
+  const startMsg = await api.sendMessage(chatId, header)
 
   const outputHtml = join(runDir, `changelog-${stamp.slice(0, 10)}.html`)
+  // 進度以 RUN_DIR 內各階段產物是否存在判斷，編輯「開始產生」這一則訊息（使用者 2026-10-28 需求）。
+  const reposWithCommits = Object.entries(resolved.repos).filter(([, v]) => v.commits.length > 0).map(([repo]) => repo)
+  const startedAt = Date.now()
+  const progress = createProgressReporter({
+    api,
+    chatId,
+    messageId: startMsg.message_id,
+    header,
+    progress: () => computeProgress(runDir, reposWithCommits, outputHtml),
+    startedAt,
+  })
+  await progress.tick()
+  const timer = setInterval(() => void progress.tick(), PROGRESS_INTERVAL_MS)
   let execError: string | null = null
   try {
     await execClaudeWithStdin(
@@ -100,12 +112,17 @@ async function generate(api: Api, chatId: number, tokens: string[], runDir: stri
   } catch (err) {
     const e = err as { killed?: boolean; code?: unknown }
     execError = e.killed ? '執行逾時（2 小時）' : `claude 執行失敗（exit ${String(e.code)}）`
+  } finally {
+    clearInterval(timer)
   }
 
+  const elapsed = formatElapsed(Date.now() - startedAt)
   if (existsSync(outputHtml)) {
+    await progress.finish(`✅ 完成（耗時 ${elapsed}），HTML 已傳送`)
     await api.sendDocument(chatId, new InputFile(outputHtml), { caption: `Changelog\n${summary}`.slice(0, 1024) })
     return
   }
+  await progress.finish(`❌ 產生失敗（耗時 ${elapsed}），原因見下一則訊息`)
   const failedMd = join(runDir, 'FAILED.md')
   const reason = existsSync(failedMd) ? readFileSync(failedMd, 'utf8').slice(0, 1500) : (execError ?? '未產生 HTML，原因不明')
   await api.sendMessage(chatId, `❌ changelog 產生失敗：\n${reason}\n\n執行目錄：${runDir}`)
