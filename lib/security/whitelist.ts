@@ -9,7 +9,6 @@ import { sendStatusList } from '../webhook-server/status-list.ts'
 import { createReplayGuard } from './replay-guard.ts'
 import { handleKitCommand, isKitAdminChat } from '../webhook-server/kit-issue.ts'
 import { handleBugReportCommand, isBugReportAdminChat } from '../webhook-server/bug-report-command.ts'
-import { handleChangelogCommand } from '../webhook-server/changelog-command.ts'
 import { logUnknownSender } from '../webhook-server/unknown-sender-log.ts'
 import { triggerTgAutoSync } from '../webhook-server/trigger-auto-sync.ts'
 
@@ -25,8 +24,6 @@ import { triggerTgAutoSync } from '../webhook-server/trigger-auto-sync.ts'
  * status-list.ts） / /menu 頂層選單 / /kit 核發企劃 starter kit
  * （僅 TG_KIT_ADMIN_CHAT_ID，見 kit-issue.ts） / /bugreport 推送 Bug 指派人員
  * 統計 CSV（僅 TG_BUG_REPORT_ADMIN_CHAT_ID，見 bug-report-command.ts） /
- * /changelog 產生 tag 到分支最新的 changelog HTML（同樣僅
- * TG_BUG_REPORT_ADMIN_CHAT_ID，見 changelog-command.ts） /
  * 其他回用法提示，見 handler 內註解）；callback_query 依 callback_data 分流 menu:bug（T29，觸發 T6/T8
  * 查詢列清單）/ reqpool:noop（T9 建立、T32 接上真實需求池清單）/
  * claim:{ticket}（T10）/ demand-claim:{ticket}（T33，上鎖＋更新 Notion
@@ -111,15 +108,10 @@ export function registerHandlers(bot: Bot): void {
         // bug-report-command.ts 檔頭註解。
         await ctx.replyWithChatAction('upload_document')
         await handleBugReportCommand(ctx)
-      } else if (bugReportAdmin && /^\/changelog(\s|$)/i.test(rawText)) {
-        // 沿用 bugreport 管理員（使用者 2026-10-27 定案），非管理員同樣落到
-        // 最下面的 else、不洩漏指令存在，見 changelog-command.ts 檔頭註解。
-        await handleChangelogCommand(ctx, rawText)
       } else {
         const commands = ['/bug（列出可認領 Bug 工單）', '/req（需求池）', '/status（查看你正在執行中的工單）', '/menu（選單）']
         if (kitAdmin) commands.push('/kit <id> <name>（核發企劃 kit）')
         if (bugReportAdmin) commands.push('/bugreport（Bug 指派人員統計報表）')
-        if (bugReportAdmin) commands.push('/changelog <repo> <branch> <tag> ...（產生 changelog HTML）')
         await ctx.reply(`可用指令：${commands.join('、')}`)
       }
     } catch (err) {
